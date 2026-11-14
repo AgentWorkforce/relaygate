@@ -72,6 +72,16 @@ A refused request is answered by relaygate with `403` and
 `{"error":"relaygate_denied","op":"w","resource":"<id>"}`. It is never
 forwarded upstream.
 
+### Errors clients can rely on
+
+- Every `403` from relaygate is final. The same request will be refused again,
+  so clients must not retry it.
+- `503 relaygate_unavailable` means relaygate could not decide (for example
+  the classifier timed out). Nothing was forwarded. Clients may retry with
+  backoff.
+- Other `4xx` and `5xx` responses come from Relaycast or Sessions and keep
+  their usual meaning.
+
 ## Default modes for the pit deployment
 
 These defaults implement the rules "a local agent can message a pit agent, a
@@ -119,8 +129,37 @@ Nothing else is configured per agent.
 
 - Enrollment keys are created by a relaygate admin, one or more per group, and
   can be revoked. Revoking a key stops new registrations, not existing agents.
-- **Open:** how humans bridged from Slack are represented: as principals the
-  bridge registers, or as the bridge itself acting in group 22.
+- An enrollment key can be limited to a name prefix (for example `slack-`).
+  Registering a name outside the prefix answers `403 relaygate_name_scope`, so
+  a leaked key can't create arbitrary agents in its group.
+
+### Registering a name that already exists
+
+Hosts that create agents on demand (one per Slack thread, say) restart and
+need the same identity back. At first registration the client may send a
+`recovery` value: a proof derived from a secret it keeps.
+
+```
+POST /v1/register
+Authorization: Bearer <enrollment key>
+{"name": "slack-c0123-1731600000.123", "recovery": "<proof>"}
+```
+
+A second registration with the same name:
+
+- with the same enrollment key's group and a matching `recovery` proof returns
+  the same `agent_id` and a new token, and revokes the old token;
+- otherwise answers `409 relaygate_name_taken`.
+
+The group never changes on re-registration.
+
+### Humans behind a bridge
+
+Humans don't call relaygate. A bridge (the Slack bridge) acts as its own
+principal in its group and records the human's id (for example the Slack user
+id) as attribution in message metadata. If per-human permissions are needed
+later, the bridge registers a principal per human with the same enrollment
+key.
 
 ## Tokens and the upstream credentials
 
@@ -137,6 +176,14 @@ Nothing else is configured per agent.
 For clients, the change is a base URL. The Slack bridge and the MCP server set
 their Relaycast and Sessions base URLs to relaygate and use the `rg_` token.
 The API paths are unchanged.
+
+### Realtime
+
+Relaycast's realtime path (`POST /v1/agent/node-token`, then the
+`/v1/node/ws` WebSocket) also goes through relaygate. relaygate mints and holds
+the upstream node token, proxies the WebSocket, and drops every pushed event
+the caller may not read. Without this, reads would leak through the event
+stream even with REST filtered.
 
 ## Reads and lists
 
@@ -162,7 +209,7 @@ allowed, and only those that cross a group boundary:
 
 - a write into another group's resource (for example a local agent messaging a
   pit agent);
-- any post to Slack.
+- any post to Slack or another external sink (through `/v1/check`, below).
 
 Request:
 
@@ -176,9 +223,37 @@ Response: `{"decision": "allow" | "deny", "reason": "..."}`.
 
 - A `deny` is answered with `403` and `{"error":"relaygate_classified"}`, and
   nothing reaches upstream.
-- If the classifier errors or times out, the request is denied.
+- If the classifier errors or times out, the request is not forwarded and the
+  answer is `503 relaygate_unavailable`.
 - The classifier is pluggable: a model, rules or both. **Open:** the default
   classifier and its latency budget.
+
+## Egress relaygate doesn't proxy
+
+Some components send data out on paths relaygate never sees: the Slack bridge
+posts with Slack's own API (`chat.postMessage`), and may write to a knowledge
+base. relaygate does not hold Slack or other third-party tokens. Instead these
+components ask relaygate first:
+
+```
+POST /v1/check
+Authorization: Bearer rg_...
+{"op": "w",
+ "resource": {"kind": "chat", "slack": {"team": "T...", "channel": "C...", "thread_ts": "..."}},
+ "content": "<text>"}
+
+200 {"decision": "allow"}
+403 {"error": "relaygate_denied" | "relaygate_classified"}
+503 {"error": "relaygate_unavailable"}
+```
+
+`/v1/check` runs the same mode check and classifier as a proxied request. The
+caller sends only on `allow`; anything else means don't send. Each external
+sink is registered as a resource with a `gid` and `mode` like any other.
+
+`/v1/check` only works if the component calls it, so only trusted components
+in a group may hold third-party credentials, and the deployment's network
+rules allow egress to those services only from those components.
 
 ## Audit
 
@@ -189,7 +264,6 @@ content.
 ## Open questions
 
 - Local agents writing into pit sessions (`662` or `660`).
-- How Slack humans are represented as principals.
 - The Sessions API filter parameter for lists and search.
 - The default classifier and its latency budget.
 - Whether a principal ever needs more than one group.
