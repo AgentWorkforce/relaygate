@@ -409,7 +409,12 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
       if ("authorOnly" in where) {
         // A DM message (or a thread under it) is readable by id only by the two participants. Writes into DM threads
         // aren't modelled (which inbox would they go to?), so they are refused; answer with POST /v1/dm.
-        const mine = op === "r" && (where.author === c.get("agent").name || (await inConversation(c, where.conversationId)));
+        // Reading a DM is reading your own inbox, so the inbox's read bit (and any ceiling) applies too.
+        const me = c.get("agent").name;
+        const mine =
+          op === "r" &&
+          canRead(deps, c.get("principal"), inboxStream(me)) &&
+          (where.author === me || (await inConversation(c, where.conversationId)));
         audit(c, action, op, `relaycast:message/${messageId}`, mine ? "allow" : "deny", "mode", mine ? "dm_author" : "dm_message");
         return mine ? handler(c, messageId, body) : denied(c, op, `relaycast:message/${messageId}`);
       }

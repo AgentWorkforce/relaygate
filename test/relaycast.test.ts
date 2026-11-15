@@ -249,6 +249,17 @@ describe("Relaycast proxy: review regressions", () => {
     expect((await h.call("GET", `/v1/messages/${posted.body.data.id}`, local)).status).toBe(403);
   });
 
+  it("a DM read by id also needs read on the caller's own inbox", async () => {
+    const h = harness();
+    const local = await h.token(KEYS.local, "local-a");
+    const pit = await h.token(KEYS.pit, "pit-a");
+    const dm = await h.call("POST", "/v1/dm", local, { to: "pit-a", text: "hi" });
+    const id = dm.body.data.message.id;
+    expect((await h.call("GET", `/v1/messages/${id}`, pit)).status).toBe(200);
+    (h.deps.policy() as any).streamOverrides.push({ id: "relaycast:inbox/pit-a", gid: 22, mode: "000", classify: false, acl: [] });
+    expect((await h.call("GET", `/v1/messages/${id}`, pit)).status).toBe(403);
+  });
+
   it("never forwards `from` on a DM", async () => {
     const h = harness();
     const local = await h.token(KEYS.local, "local-a");
