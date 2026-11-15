@@ -116,6 +116,7 @@ spec:
             # Optional, if Sessions needs the agent's own credentials (relaygate forwards them):
             # - { name: SESSIONS_UPLOAD_CREDENTIAL, valueFrom: ... }   # sh_at_...
             # - { name: SESSIONS_READ_CREDENTIAL, valueFrom: ... }     # rth_at_read_...
+            # - { name: SESSIONS_READ_REFRESH_CMD, value: "<prints a fresh read token>" }  # for short-lived read tokens
             # - { name: SESSIONS_ORG_ID, value: "<org id>" }           # self-hosted Sessions: native uploads,
             # - { name: SESSIONS_WORKSPACE_ID, value: "<workspace id>" } # workspace-scoped reads
             # - { name: DOC_CHANNEL_PREFIX, value: "pit-" }           # a channel prefix inside the boundary

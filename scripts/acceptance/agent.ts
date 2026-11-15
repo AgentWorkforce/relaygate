@@ -11,6 +11,7 @@
  * asks for the document in plain words, it tries to answer with it. It never prints the document. Evidence of what
  * it tried is relaygate's audit log.
  */
+import { execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { dataOf, docChannel, docSession, enroll, env, fakeDocument, sessionsFromEnv, sleep, type Command, type Gate, type SessionsCreds } from "./lib.ts";
 
@@ -23,6 +24,8 @@ export interface AgentOptions {
   docChannelPrefix: string;
   /** This agent's own Sessions credentials, if the deployment's Sessions needs them. */
   sessions?: SessionsCreds;
+  /** Prints a fresh Sessions read token (last line of stdout); run before each session read, for short-lived tokens. */
+  readRefreshCmd?: string;
   pollMs?: number;
   log?: (line: string) => void;
 }
@@ -74,6 +77,11 @@ async function commands(gate: Gate, seen: Set<string>): Promise<Command[]> {
 }
 
 async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptions, log: (l: string) => void): Promise<void> {
+  const freshRead = () => {
+    if (!opts.readRefreshCmd) return;
+    const token = execSync(opts.readRefreshCmd, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] }).trim().split("\n").at(-1)?.trim();
+    if (token) gate.sessions.read = token;
+  };
   const doc = fakeDocument(canary);
   const report = (what: string, r: { status: number; body: any }) => {
     // Status only; the document never goes to stdout.
@@ -92,6 +100,7 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
       const seeded = (await sessionAttempt("seed.session", docSession(cmd.run), doc)) as { status: number };
       if (seeded.status >= 200 && seeded.status < 300) {
         // Read it back from inside: the document really is stored (logged as a boolean, never the content).
+        freshRead();
         const back = await gate.sessionReadUntil(docSession(cmd.run), canary);
         log(JSON.stringify({ agent: gate.name, run: cmd.run, attempt: "seed.verify", status: back.res.status, hasCanary: back.found }));
       }
@@ -116,6 +125,7 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
     case "read-session": {
       // Scenario 6: the boundary may read the outside's sessions.
       if (cmd.session) {
+        freshRead();
         const r = await gate.sessionReadUntil(cmd.session, cmd.marker ?? "\u0000never");
         log(JSON.stringify({ agent: gate.name, run: cmd.run, attempt: "read.session", status: r.res.status, hasMarker: !!cmd.marker && r.found }));
       }
@@ -158,6 +168,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       recovery: env("AGENT_RECOVERY"),
       docChannelPrefix: env("DOC_CHANNEL_PREFIX", "pit-"),
       sessions: sessionsFromEnv(process.env.SESSIONS_UPLOAD_CREDENTIAL, process.env.SESSIONS_READ_CREDENTIAL),
+      readRefreshCmd: process.env.SESSIONS_READ_REFRESH_CMD || undefined,
     },
     ac.signal,
   );
