@@ -130,7 +130,8 @@ function fakeRelaycast() {
   app.get("/v1/dm/conversations", (c) => {
     const me = who(c.req.header("authorization")!)!;
     const ids = new Set(messages.filter((m) => m.channel_id.startsWith("dmch_") && m.channel_id.slice(5).split("~").includes(me)).map((m) => `dm_${m.channel_id.slice(5)}`));
-    return c.json({ ok: true, data: [...ids].map((id) => ({ id, type: "dm" })).concat([{ id: "gdm_1", type: "group" }]) });
+    // Shapes as in Relaycast's engine (engine/dm.ts): 1:1 conversations are type "1:1", group DMs "group".
+    return c.json({ ok: true, data: [...ids].map((id) => ({ id, type: "1:1" })).concat([{ id: "gdm_1", type: "group" }]) });
   });
   app.get("/v1/search", (c) =>
     c.json({
@@ -407,9 +408,12 @@ describe("Relaycast proxy: the pit rules", () => {
   it("lists only 1:1 DM conversations", async () => {
     const h = harness();
     const local = await h.token(KEYS.local, "local-a");
-    await h.token(KEYS.pit, "pit-a");
+    const pit = await h.token(KEYS.pit, "pit-a");
     await h.call("POST", "/v1/dm", local, { to: "pit-a", text: "hi" });
-    expect((await h.call("GET", "/v1/dm/conversations", local)).body.data.map((c: any) => c.type)).toEqual(["dm"]);
+    // Both participants see the conversation; the group DM is dropped; a non-participant sees nothing.
+    expect((await h.call("GET", "/v1/dm/conversations", local)).body.data.map((c: any) => c.type)).toEqual(["1:1"]);
+    expect((await h.call("GET", "/v1/dm/conversations", pit)).body.data.map((c: any) => c.type)).toEqual(["1:1"]);
+    expect((await h.call("GET", "/v1/dm/conversations", await h.token(KEYS.pit, "pit-b"))).body.data).toEqual([]);
   });
 
   it("refuses every route it doesn't proxy, without calling Relaycast", async () => {

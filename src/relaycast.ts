@@ -469,7 +469,8 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
     // Group DMs aren't modelled by relaygate; only 1:1 conversations are listed, and only while the caller may read
     // its own inbox (each entry carries the last message).
     const inbox = canRead(deps, c.get("principal"), inboxStream(c.get("agent").name));
-    const visible = inbox ? asArray(dataOf(res.body)).filter((conv) => conv.type === undefined || conv.type === "dm" || conv.type === "direct") : [];
+    // Relaycast marks 1:1 conversations `type: "1:1"` (group DMs are "group") with `dm_` ids.
+    const visible = inbox ? asArray(dataOf(res.body)).filter((conv) => conv.type === "1:1" && typeof conv.id === "string" && DM_ID.test(conv.id)) : [];
     return c.json({ ...(res.body as object), data: visible }, 200);
   });
 
