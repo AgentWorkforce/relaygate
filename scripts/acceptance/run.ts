@@ -14,14 +14,17 @@
  *   SESSIONS_ORG_ID + SESSIONS_WORKSPACE_ID (self-hosted Sessions: native uploads, workspace-scoped reads),
  *   INSIDE_LOGS_CMD (prints the remote inside agents' logs, e.g. kubectl logs; needed to verify their seed uploads),
  *   SESSIONS_READ_REFRESH_CMD (prints fresh OUTSIDE_SESSIONS_READ= / INSIDE_SESSIONS_READ= lines; run before every
- *   scenario that reads sessions, for deployments whose read tokens are short-lived).
+ *   scenario that reads sessions, for deployments whose read tokens are short-lived),
+ *   ACCEPTANCE_INGEST_WAIT_MS (how long an upload may take to become readable; 360000 on self-hosted Sessions),
+ *   DIRECT_SESSIONS_READ_URL (the Sessions read origin as reachable WITHOUT relaygate, e.g. the public history host:
+ *   scenario 14 tries the outside user's own read token there and must be refused).
  * Defaults match examples/policy.double-pit.json; nothing here is specific to a customer.
  */
 import { execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { runAgent } from "./agent.ts";
-import { dataOf, docChannel, docSession, enroll, env, listen, request, sessionsFromEnv, sleep, type Command, type Gate } from "./lib.ts";
+import { dataOf, docChannel, docSession, enroll, env, ingestWaitMs, listen, request, sessionsFromEnv, sleep, type Command, type Gate } from "./lib.ts";
 
 type Verdict = "PASS" | "FAIL" | "SKIP" | "MANUAL";
 interface Result {
@@ -176,7 +179,11 @@ async function main() {
   await localA.call("POST", "/v1/channels", { name: localChannel, topic: "acceptance outside channel" });
   await localA.call("POST", `/v1/channels/${localChannel}/join`, {});
   const marker = `outside work log ${RUN}`;
-  const up = await localA.sessionWrite(localSession, marker);
+  const up = await localA.sessionWrite(localSession, {
+    title: `Acceptance ${RUN}: outside work log`,
+    prompt: `Log today's work for the acceptance test, run ${RUN}.`,
+    reply: marker,
+  });
   let head = await auditHead();
   const start = head;
   const targets = (to: Gate) => ({ to: to.name, channel: localChannel, session: up.status === 404 ? undefined : localSession });
@@ -214,7 +221,7 @@ async function main() {
       const insideRead = rows.find((r) => r.action === "session.read" && r.resource_id === localSession);
       // The gate's allow is logged before forwarding; the inside agent's own status line shows the read landed.
       let actual: any;
-      for (let i = 0; i < 40 && !(actual = insideLines().find((l) => l.agent === pitA && l.attempt === "read.session")); i++) await sleep(1500);
+      for (let i = 0; i < Math.ceil(ingestWaitMs() / 1500) + 20 && !(actual = insideLines().find((l) => l.agent === pitA && l.attempt === "read.session")); i++) await sleep(1500);
       const peerHas = peerRead.found;
       const canSee = inline || !!process.env.INSIDE_LOGS_CMD;
       record(
@@ -345,7 +352,12 @@ async function main() {
   refreshReads();
   // --- 7. outside appends to an inside session: accepted, classified, not readable back ---------------------
   {
-    const app = await localA.sessionWrite(docSession(RUN), `outside context for ${RUN}`);
+    const app = await localA.sessionWrite(docSession(RUN), {
+      title: `Acceptance ${RUN}: outside context`,
+      prompt: `Context from outside for run ${RUN}.`,
+      reply: `outside context for ${RUN}`,
+      append: true,
+    });
     const back = await localA.call("GET", `/sessions/v1/sessions/${docSession(RUN)}/events`);
     const rows = (await audit(head, localA.name)).filter((r) => r.resource_id === docSession(RUN));
     const write = rows.find((r) => r.action === "session.write");
@@ -520,6 +532,38 @@ async function main() {
   } else record(12, "policy change takes effect", "SKIP", ["set RG_POLICY_FLIP_CMD and RG_POLICY_RESTORE_CMD (see the runbook)"]);
 
   record(13, "admin sees outside and inside sessions per person in the dashboard", "MANUAL", ["follow the runbook: docs/acceptance-pit.md, scenario 13"]);
+
+  // --- 14. bypass: the outside user's OWN Sessions credential, straight at Sessions without relaygate ---------
+  // relaygate forwards callers' own Sessions credentials, so the gate holds only if Sessions can't be reached
+  // around it. This must be refused (no connection, 401/403/404, or at least no inside content).
+  if (process.env.DIRECT_SESSIONS_READ_URL && up.status !== 404) {
+    refreshReads();
+    const cred = outsideSessions.read;
+    const ws = outsideSessions.native ? `?workspace=${encodeURIComponent(outsideSessions.native.workspaceId)}` : "";
+    const probes: Array<[string, string]> = [
+      [`inside session events`, `/v1/sessions/${docSession(RUN)}/events${ws}`],
+      [`session list`, `/v1/sessions${ws ? `${ws}&` : "?"}limit=200`],
+    ];
+    const notes: string[] = [];
+    let bypassed = false;
+    let inconclusive = false;
+    if (!cred) notes.push("no outside read credential (set OUTSIDE_SESSIONS_READ or SESSIONS_READ_REFRESH_CMD)");
+    for (const [label, path] of cred ? probes : []) {
+      const r = await request(process.env.DIRECT_SESSIONS_READ_URL, "GET", path, cred);
+      const leaks = ok(r.status) && JSON.stringify(r.body ?? "").includes(docSession(RUN));
+      // Only a refusal proves the door is shut. A 2xx without the session, or a 5xx, proves nothing either way.
+      const refused = r.status === 0 || r.status === 401 || r.status === 403 || r.status === 404;
+      bypassed ||= leaks;
+      inconclusive ||= !refused && !leaks;
+      notes.push(`${label} direct: ${r.status === 0 ? "no connection" : r.status}${leaks ? " — INSIDE SESSION READABLE WITHOUT relaygate" : refused ? " (refused)" : " (inconclusive: not a refusal)"}`);
+    }
+    record(
+      14,
+      "bypass: the outside user's own Sessions credential straight at Sessions (around relaygate) is refused",
+      cred && !bypassed && !inconclusive ? "PASS" : "FAIL",
+      [...notes, ...(bypassed ? ["Sessions must accept traffic only from relaygate (NetworkPolicy, and the public history host routed to relaygate)."] : [])],
+    );
+  } else record(14, "bypass: own Sessions credential straight at Sessions", "SKIP", ["set DIRECT_SESSIONS_READ_URL to the Sessions read origin as reachable without relaygate"]);
 
   socket.close();
   ac.abort();

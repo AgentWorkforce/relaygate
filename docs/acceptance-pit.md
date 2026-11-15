@@ -48,6 +48,7 @@ run with `node` directly (no build step).
 | 11 | relaygate down / bypass | no fail-open: nothing reaches upstream; clients never hold upstream credentials | driver (needs hooks for the down part) |
 | 12 | Policy change takes effect | flip one ACL, rerun 2 (now allowed), restore (refused again); audit shows both policy versions | driver (needs hooks) |
 | 13 | Admin view | the org admin sees outside and inside sessions per person | manual |
+| 14 | Bypass: an outside member's own Sessions read token, straight at Sessions (e.g. the public history host), skipping relaygate | refused: no connection, 401/403/404, never the inside session | driver (needs `DIRECT_SESSIONS_READ_URL`) |
 
 **Scenario 9, why there is no inside-to-outside classifier path.** The policy
 gives the inside no write bit on anything the outside can read, so every inside
@@ -138,8 +139,26 @@ that prints fresh `OUTSIDE_SESSIONS_READ=…` and `INSIDE_SESSIONS_READ=…` lin
 `POST /api/v1/workspaces/<ws>/session-read/session`). The driver runs it before
 every scenario that reads sessions. An expired token shows up as
 `upstream 401` in scenarios 6 and 8 (the gate allowed the read; Sessions
-refused the token). Self-hosted ingest is asynchronous, so the driver and the
-inside agents poll a session (up to 45 s) until the content they wrote appears.
+refused the token). Self-hosted ingest is asynchronous: an upload becomes
+readable on the search indexer's reconcile tick (every 5 minutes by default), so
+set `ACCEPTANCE_INGEST_WAIT_MS=360000` there (and on the inside agents); the
+driver and the inside agents poll a session until the content they wrote
+appears.
+
+Uploads look like real Claude Code sessions (a `session` record with a title
+and first prompt, then a user and an assistant event), so in the dashboard each
+test session has a title, a brief and readable events. The read API's `/turns`
+view stays empty for them: turns come only from the private turns route, which
+the public delivery protocol can't write.
+
+**Scenario 14 (bypass).** relaygate forwards each caller's own Sessions
+credential, so a member who holds one can try Sessions directly. Set
+`DIRECT_SESSIONS_READ_URL` to the Sessions read origin as reachable without
+relaygate (the public history host); the driver reads the inside session with
+the outside user's own read token there. It must be refused. Until Sessions
+admits only relaygate (NetworkPolicy, and the history host routed to relaygate
+via `SESSIONS_HOSTS`), this scenario fails: that is the finding it exists to
+catch.
 
 ```
 export OUTSIDE_KEY=<outside enrollment key>
