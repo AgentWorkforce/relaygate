@@ -117,6 +117,12 @@ export class Store {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS node_tokens_by_agent_token ON node_tokens (agent_token_hash);
+      CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        owner TEXT NOT NULL REFERENCES agents(id),
+        gid INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS audit (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         at TEXT NOT NULL,
@@ -211,6 +217,36 @@ export class Store {
       )
       .get(hash);
     return row ? toAgent(row) : undefined;
+  }
+
+  session(id: string): { id: string; owner: string; gid: number } | undefined {
+    const row = this.db.prepare("SELECT id, owner, gid FROM sessions WHERE id = ?").get(id);
+    return row ? { id: String(row.id), owner: String(row.owner), gid: Number(row.gid) } : undefined;
+  }
+
+  /**
+   * Claims every id for `owner` in one transaction, or none: if any is already owned by someone else, nothing is
+   * written and the ids that were taken are returned.
+   */
+  claimSessions(ids: string[], owner: string, gid: number): { claimed: boolean; taken: string[] } {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const taken = ids.filter((id) => {
+        const row = this.session(id);
+        return row !== undefined && row.owner !== owner;
+      });
+      if (taken.length > 0) {
+        this.db.exec("ROLLBACK");
+        return { claimed: false, taken };
+      }
+      const insert = this.db.prepare("INSERT OR IGNORE INTO sessions (id, owner, gid, created_at) VALUES (?, ?, ?, ?)");
+      for (const id of ids) insert.run(id, owner, gid, now());
+      this.db.exec("COMMIT");
+      return { claimed: true, taken: [] };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   upstreamAgent(agentId: string): { upstreamId: string; tokenSealed: string } | undefined {

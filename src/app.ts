@@ -4,6 +4,7 @@ import { ClassifierUnavailable, type Classifier } from "./classifier.js";
 import { allGroups, check, inGroup, type AclEntry, type Guarded, type Op, type Principal } from "./mode.js";
 import { deny as proxyDeny, mountRelaycast, type RelaycastUpstream } from "./relaycast.js";
 import { mountNodeToken } from "./realtime.js";
+import { mountSessions, type SessionsConfig } from "./sessions.js";
 import { explain, runCases, CaseSchema, QuerySchema } from "./explain.js";
 import { keyUsable, parsePolicy, type EnrollmentKey, type Policy } from "./policy.js";
 import { sameHash, sha256, type Agent, type Store } from "./store.js";
@@ -19,6 +20,8 @@ export interface Deps {
   adminToken?: string;
   /** The Relaycast upstream; unset disables the Relaycast proxy. */
   relaycast?: RelaycastUpstream;
+  /** The Sessions upstream; unset disables the Sessions proxy. */
+  sessions?: SessionsConfig;
   /** Called after tokens are revoked, so open sockets close at once rather than at the next revalidation. */
   onTokensRevoked?: () => void;
 }
@@ -132,14 +135,34 @@ export async function decide(
   streamId: string,
   content: string | undefined,
 ): Promise<Decision> {
-  const policy = deps.policy();
-  const stream = resolveStream(streamId, deps.store, policy);
+  const stream = resolveStream(streamId, deps.store, deps.policy());
   if (!stream) return { status: "deny", stage: "mode", error: "relaygate_denied", reason: "unknown_stream" };
-  const result = check(principal, stream, op, policy.ceilings);
-  const modeReason = `${result.reason}:${stream.source}`;
+  return decideResource(deps, agent, principal, op, { kind: "stream", ...stream }, content);
+}
+
+export interface ResolvedResource extends Guarded {
+  kind: "stream" | "session";
+  id: string;
+  /** Streams only: classify every write. */
+  classify?: boolean;
+  source: string;
+}
+
+/** The decision for a resolved resource: mode check first, then the classifier when the contract requires it. */
+export async function decideResource(
+  deps: Deps,
+  agent: Agent,
+  principal: Principal,
+  op: Op,
+  x: ResolvedResource,
+  content: string | undefined,
+): Promise<Decision> {
+  const policy = deps.policy();
+  const result = check(principal, x, op, policy.ceilings);
+  const modeReason = `${result.reason}:${x.source}`;
   if (!result.allowed) return { status: "deny", stage: "mode", error: "relaygate_denied", reason: modeReason };
-  const crossesGroup = !inGroup(principal, stream.gid);
-  if (op === "w" && (crossesGroup || stream.classify)) {
+  const crossesGroup = !inGroup(principal, x.gid);
+  if (op === "w" && (crossesGroup || x.classify === true)) {
     if (content === undefined) return { status: "invalid", reason: "content is required for this write" };
     try {
       const verdict = await deps.classifier().classify({
@@ -150,7 +173,7 @@ export async function decide(
           guest: isGuest(agent, policy),
         },
         op: "w",
-        resource: { kind: "stream", id: stream.id, group: groupName(policy, stream.gid) },
+        resource: { kind: x.kind, id: x.id, group: groupName(policy, x.gid) },
         content,
       });
       if (verdict.decision === "deny") {
@@ -259,7 +282,7 @@ export function createApp(deps: Deps) {
   });
 
   // Everything below needs an rg_ token.
-  app.use("/v1/*", async (c, next) => {
+  const authenticate = async (c: Context<Env>, next: () => Promise<void>) => {
     const token = bearer(c);
     const agent = token?.startsWith("rg_") ? store.agentForToken(token) : undefined;
     if (!agent) return deny(c, 401, "relaygate_unauthenticated");
@@ -281,7 +304,9 @@ export function createApp(deps: Deps) {
     c.set("principal", principalFor(agent, policy));
     c.set("tokenHash", sha256(token!));
     await next();
-  });
+  };
+  app.use("/v1/*", authenticate);
+  app.use("/sessions/*", authenticate);
 
   app.get("/v1/whoami", (c) => {
     const policy = deps.policy();
@@ -356,6 +381,7 @@ export function createApp(deps: Deps) {
     mountRelaycast(app, deps, deps.relaycast);
     mountNodeToken(app, deps, deps.relaycast);
   }
+  if (deps.sessions) mountSessions(app, deps, deps.sessions);
   // Allowlist only: every other /v1 route is refused before anything reaches upstream.
   app.all("/v1/*", (c) => proxyDeny(c, 404, "relaygate_route_not_proxied", { path: c.req.path }));
 

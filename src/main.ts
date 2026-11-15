@@ -58,12 +58,21 @@ if (process.env.RELAYCAST_URL) {
   }
   relaycast = new RelaycastUpstream({ url: process.env.RELAYCAST_URL, workspaceKey, box: new SecretBox(secret) }, store);
 }
+// The Sessions proxy is on when SESSIONS_URL is set; SESSIONS_TOKEN is an rth_st_ service token (rth:sync, rth:read).
+let sessions: { url: string; token: string } | undefined;
+if (process.env.SESSIONS_URL) {
+  if (!process.env.SESSIONS_TOKEN) {
+    console.error("SESSIONS_URL needs SESSIONS_TOKEN");
+    process.exit(1);
+  }
+  sessions = { url: process.env.SESSIONS_URL, token: process.env.SESSIONS_TOKEN };
+}
 let sockets: NodeSockets | undefined;
-const deps = { store, policy: () => policy, classifier: () => classifier, adminToken, relaycast, onTokensRevoked: () => sockets?.revalidate() };
+const deps = { store, policy: () => policy, classifier: () => classifier, adminToken, relaycast, sessions, onTokensRevoked: () => sockets?.revalidate() };
 const app = createApp(deps);
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
-  console.log(JSON.stringify({ msg: "relaygate listening", port: info.port, model_classifier: policy.classifier.model.enabled, relaycast: !!relaycast }));
+  console.log(JSON.stringify({ msg: "relaygate listening", port: info.port, model_classifier: policy.classifier.model.enabled, relaycast: !!relaycast, sessions: !!sessions }));
 });
 if (relaycast) {
   sockets = new NodeSockets(deps, relaycast);
