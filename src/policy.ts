@@ -63,7 +63,7 @@ export const PolicySchema = z.object({
   /** Mode and ACL for sessions, by the owning (first uploader's) group. A group without an entry gets 600. */
   sessionDefaults: z.array(z.object({ gid: Gid, mode: Mode, acl: AclSchema })).default([]),
   /**
-   * Per-session changes, e.g. sharing one session with a guest: `{"id": "...", "acl": [{"gid": 44, "perm": "r"}]}`.
+   * Per-session changes, e.g. sharing one session with a guest: `{"id": "...", "acl": [{"gid": <gid>, "perm": "r"}]}`.
    * An override can't move a session to another group: its owning group is what ceilings are checked against.
    */
   sessionOverrides: z.array(z.object({ id: z.string().min(1), mode: Mode.optional(), acl: AclSchema }).strict()).default([]),
