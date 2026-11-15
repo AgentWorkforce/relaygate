@@ -363,6 +363,48 @@ describe("enrollment key lifecycle", () => {
     expect(sweepGuestKeys(h.store, h.policy(), Date.now())).toHaveLength(0);
   });
 
+  it("the sweep ends tokens of a removed guest key, so restoring the key doesn't revive them", async () => {
+    const h = harness();
+    const guest = await h.token(GUEST_KEY, "guest-1");
+    h.setPolicy((r) => r.enrollmentKeys.splice(3, 1));
+    expect(sweepGuestKeys(h.store, h.policy(), Date.now())).toHaveLength(1);
+    h.setPolicy(() => {});
+    expect((await h.call("GET", "/v1/whoami", guest)).status).toBe(401);
+  });
+
+  it("an ordinary key turned guest makes its agents guests for good", async () => {
+    const h = harness();
+    const local = await h.token(LOCAL_KEY, "local-1");
+    h.setPolicy((r) => ((r.enrollmentKeys[0] as Record<string, unknown>).guest = true));
+    expect((await (await h.call("GET", "/v1/whoami", local)).json()).guest).toBe(true);
+    h.setPolicy((r) => r.enrollmentKeys.splice(0, 1));
+    expect((await h.call("GET", "/v1/whoami", local)).status).toBe(401);
+  });
+
+  it("a guest recovers its identity with a replacement key after the old one expires", async () => {
+    const NEXT = "enroll-guest-next-00000000000000";
+    const proof = "recovery-proof-0123456789";
+    const h = harness();
+    const first = await h.register(GUEST_KEY, "guest-1", proof);
+    h.setPolicy((r) => {
+      guestKey(r).expiresAt = "2020-01-01T00:00:00Z";
+      r.enrollmentKeys.push({ id: "vendor-2", gid: 44, sha256: sha256(NEXT), guest: true, expiresAt: FUTURE } as never);
+    });
+    const again = await h.register(NEXT, "guest-1", proof);
+    expect(again.status).toBe(200);
+    expect(again.body.agent_id).toBe(first.body.agent_id);
+    expect((await h.call("GET", "/v1/whoami", String(again.body.token))).status).toBe(200);
+    expect(sweepGuestKeys(h.store, h.policy(), Date.now())).toHaveLength(0);
+  });
+
+  it("a revoked entry doesn't mask a usable entry with the same key", async () => {
+    const h = harness(new Fixed("allow"), (r) => {
+      r.enrollmentKeys[0]!.revoked = true;
+      r.enrollmentKeys.push({ id: "local-2", gid: 11, sha256: sha256(LOCAL_KEY) } as never);
+    });
+    expect((await h.register(LOCAL_KEY, "local-1")).status).toBe(200);
+  });
+
   it("revoking an ordinary key stops new registrations and leaves existing agents working", async () => {
     const h = harness();
     const local = await h.token(LOCAL_KEY, "local-1");

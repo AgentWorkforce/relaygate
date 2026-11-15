@@ -126,12 +126,27 @@ export class Store {
     return rows.map((r) => String(r.hash));
   }
 
-  /** Revokes every token issued to agents enrolled with the key; returns the revoked hashes. */
-  revokeKeyTokens(keyId: string): string[] {
-    const q = "FROM tokens WHERE revoked = 0 AND agent_id IN (SELECT id FROM agents WHERE key_id = ?)";
-    const rows = this.db.prepare(`SELECT hash ${q}`).all(keyId);
-    this.db.prepare(`UPDATE tokens SET revoked = 1 WHERE revoked = 0 AND agent_id IN (SELECT id FROM agents WHERE key_id = ?)`).run(keyId);
+  /** Revokes every token issued to guest agents enrolled with the key; returns the revoked hashes. */
+  revokeGuestKeyTokens(keyId: string): string[] {
+    const agents = "SELECT id FROM agents WHERE key_id = ? AND guest = 1";
+    const rows = this.db.prepare(`SELECT hash FROM tokens WHERE revoked = 0 AND agent_id IN (${agents})`).all(keyId);
+    this.db.prepare(`UPDATE tokens SET revoked = 1 WHERE revoked = 0 AND agent_id IN (${agents})`).run(keyId);
     return rows.map((r) => String(r.hash));
+  }
+
+  /** Records that agents enrolled with this key are guests, so removing the key from the policy can't un-guest them. */
+  markKeyGuest(keyId: string): void {
+    this.db.prepare("UPDATE agents SET guest = 1 WHERE key_id = ? AND guest = 0").run(keyId);
+  }
+
+  /** Enrollment key ids that guest agents registered with. */
+  guestKeyIds(): string[] {
+    return this.db.prepare("SELECT DISTINCT key_id FROM agents WHERE guest = 1").all().map((r) => String(r.key_id));
+  }
+
+  /** Re-associates an agent with the enrollment key that just recovered it (key rotation). */
+  setAgentKey(agentId: string, keyId: string, guest: boolean): void {
+    this.db.prepare("UPDATE agents SET key_id = ?, guest = MAX(guest, ?) WHERE id = ?").run(keyId, guest ? 1 : 0, agentId);
   }
 
   issueToken(agentId: string): string {

@@ -61,9 +61,16 @@ export function guestEnded(agent: Agent, policy: Policy, now: number): string | 
   return undefined;
 }
 
-/** Revokes every token issued from guest keys that are revoked or expired; returns the revoked hashes. */
+/**
+ * Records every agent of a guest key as a guest, then revokes every token issued from guest keys that are revoked,
+ * expired or gone from the policy. Returns the revoked hashes.
+ */
 export function sweepGuestKeys(store: Store, policy: Policy, now: number): string[] {
-  return policy.enrollmentKeys.filter((k) => k.guest && !keyUsable(k, now)).flatMap((k) => store.revokeKeyTokens(k.id));
+  for (const k of policy.enrollmentKeys) if (k.guest) store.markKeyGuest(k.id);
+  return store.guestKeyIds().flatMap((id) => {
+    const key = policy.enrollmentKeys.find((k) => k.id === id);
+    return key && keyUsable(key, now) ? [] : store.revokeGuestKeyTokens(id);
+  });
 }
 
 /** The sender card stamped on everything relaygate forwards and returned by /v1/whoami. */
@@ -167,8 +174,9 @@ export function createApp(deps: Deps) {
   app.post("/v1/register", async (c) => {
     const key = bearer(c);
     const policy = deps.policy();
-    const found: EnrollmentKey | undefined = key ? policy.enrollmentKeys.find((k) => sameHash(k.sha256, sha256(key))) : undefined;
-    const enrollment = found && keyUsable(found, now()) ? found : undefined;
+    const matches: EnrollmentKey[] = key ? policy.enrollmentKeys.filter((k) => sameHash(k.sha256, sha256(key))) : [];
+    const enrollment = matches.find((k) => keyUsable(k, now()));
+    const found = matches[0];
     if (!enrollment) {
       const reason = !found ? "bad_enrollment_key" : found.revoked ? `key_revoked:${found.id}` : `key_expired:${found.id}`;
       store.audit({ agentId: null, action: "register", op: null, resourceKind: null, resourceId: null, decision: "deny", stage: "auth", reason });
@@ -195,6 +203,8 @@ export function createApp(deps: Deps) {
         return deny(c, 409, "relaygate_name_taken");
       }
       store.revokeTokens(existing.id);
+      // The key that recovered the agent now governs it (key rotation: the old key may have expired).
+      if (existing.keyId !== enrollment.id) store.setAgentKey(existing.id, enrollment.id, enrollment.guest);
       const token = store.issueToken(existing.id);
       store.audit({ agentId: existing.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: "recovered" });
       return c.json({ agent_id: existing.id, gid: existing.gid, token });
@@ -212,6 +222,11 @@ export function createApp(deps: Deps) {
     const agent = token?.startsWith("rg_") ? store.agentForToken(token) : undefined;
     if (!agent) return deny(c, 401, "relaygate_unauthenticated");
     const policy = deps.policy();
+    // A key that became a guest key makes its agents guests for good.
+    if (!agent.guest && isGuest(agent, policy)) {
+      store.markKeyGuest(agent.keyId);
+      agent.guest = true;
+    }
     const ended = guestEnded(agent, policy, now());
     if (ended) {
       // Permanent: un-revoking or extending the key later doesn't bring these tokens back.
