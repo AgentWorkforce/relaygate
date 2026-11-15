@@ -1,0 +1,508 @@
+{
+ "cases": [
+  {
+   "note": "1: local reads a local channel",
+   "as": {
+    "key": "local"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:channel/eng"
+   },
+   "expect": "allow"
+  },
+  {
+   "note": "1: local writes a local channel, unclassified",
+   "as": {
+    "key": "local"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:channel/eng"
+   },
+   "expect": "allow",
+   "classified": false
+  },
+  {
+   "note": "1: local DMs another local agent",
+   "as": {
+    "key": "local"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:inbox/local-b"
+   },
+   "expect": "allow",
+   "classified": false
+  },
+  {
+   "note": "1: local reads its own inbox",
+   "as": {
+    "key": "local",
+    "name": "local-a"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:inbox/local-a"
+   },
+   "expect": "allow"
+  },
+  {
+   "note": "1: local reads a local session",
+   "as": {
+    "key": "local"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "session",
+    "id": "s-local",
+    "gid": 11
+   },
+   "expect": "allow"
+  },
+  {
+   "note": "1: local writes a local session",
+   "as": {
+    "key": "local"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "session",
+    "id": "s-local",
+    "gid": 11
+   },
+   "expect": "allow",
+   "classified": false
+  },
+  {
+   "note": "2: local messages a pit agent, classified",
+   "as": {
+    "key": "local"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:inbox/pit-a"
+   },
+   "expect": "allow",
+   "classified": true
+  },
+  {
+   "note": "2: local posts context into a pit channel, classified",
+   "as": {
+    "key": "local"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:channel/pit-ops"
+   },
+   "expect": "allow",
+   "classified": true
+  },
+  {
+   "note": "2: local drops context into a pit session, classified",
+   "as": {
+    "key": "local"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "session",
+    "id": "s-pit",
+    "gid": 22
+   },
+   "expect": "allow",
+   "classified": true
+  },
+  {
+   "note": "2: local can't read a pit inbox",
+   "as": {
+    "key": "local"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:inbox/pit-a"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "2: local can't read a pit channel",
+   "as": {
+    "key": "local"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:channel/pit-ops"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "2: local can't read a pit session",
+   "as": {
+    "key": "local"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "session",
+    "id": "s-pit",
+    "gid": 22
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "2: local can DM the Slack bridge, classified",
+   "as": {
+    "key": "local"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:inbox/slack-bridge-1"
+   },
+   "expect": "allow",
+   "classified": true
+  },
+  {
+   "note": "2: local can't read the Slack bridge's inbox",
+   "as": {
+    "key": "local"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:inbox/slack-bridge-1"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "2: local can't post into a Slack routing channel",
+   "as": {
+    "key": "local"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:channel/slack-c0123"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "2: local can't read a Slack routing channel",
+   "as": {
+    "key": "local"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:channel/slack-c0123"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "3: pit reads a local channel",
+   "as": {
+    "key": "pit"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:channel/eng"
+   },
+   "expect": "allow"
+  },
+  {
+   "note": "3: pit reads a local inbox",
+   "as": {
+    "key": "pit"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:inbox/local-a"
+   },
+   "expect": "allow"
+  },
+  {
+   "note": "3: pit reads a local session",
+   "as": {
+    "key": "pit"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "session",
+    "id": "s-local",
+    "gid": 11
+   },
+   "expect": "allow"
+  },
+  {
+   "note": "3: pit can't post into a local channel",
+   "as": {
+    "key": "pit"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:channel/eng"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "3: pit can't answer a local agent",
+   "as": {
+    "key": "pit"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:inbox/local-a"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "3: pit can't write a local session",
+   "as": {
+    "key": "pit"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "session",
+    "id": "s-local",
+    "gid": 11
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "3: the Slack bridge can't answer a local agent",
+   "as": {
+    "key": "slack-bridge"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:inbox/local-a"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "4: pit writes a pit channel, unclassified",
+   "as": {
+    "key": "pit"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:channel/pit-ops"
+   },
+   "expect": "allow",
+   "classified": false
+  },
+  {
+   "note": "4: pit reads a pit channel",
+   "as": {
+    "key": "pit"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:channel/pit-ops"
+   },
+   "expect": "allow"
+  },
+  {
+   "note": "4: pit DMs another pit agent",
+   "as": {
+    "key": "pit"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:inbox/pit-b"
+   },
+   "expect": "allow",
+   "classified": false
+  },
+  {
+   "note": "4: pit reads a pit session",
+   "as": {
+    "key": "pit"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "session",
+    "id": "s-pit",
+    "gid": 22
+   },
+   "expect": "allow"
+  },
+  {
+   "note": "4: pit writes a pit session",
+   "as": {
+    "key": "pit"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "session",
+    "id": "s-pit",
+    "gid": 22
+   },
+   "expect": "allow",
+   "classified": false
+  },
+  {
+   "note": "4: the bridge DMs a pit agent",
+   "as": {
+    "key": "slack-bridge"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:inbox/pit-a"
+   },
+   "expect": "allow",
+   "classified": false
+  },
+  {
+   "note": "4: the bridge posts into its Slack routing channel",
+   "as": {
+    "key": "slack-bridge"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:channel/slack-c0123"
+   },
+   "expect": "allow",
+   "classified": false
+  },
+  {
+   "note": "5: the bridge posts to Slack, classified",
+   "as": {
+    "key": "slack-bridge"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "slack:T1/C1/1700000000.0001"
+   },
+   "expect": "allow",
+   "classified": true
+  },
+  {
+   "note": "5: pit writes the knowledge base, classified",
+   "as": {
+    "key": "pit"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "kb:brain-write/slack/general/2026-11-14"
+   },
+   "expect": "allow",
+   "classified": true
+  },
+  {
+   "note": "5: pit reads the knowledge base",
+   "as": {
+    "key": "pit"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "kb:brain-write/slack/general/2026-11-14"
+   },
+   "expect": "allow"
+  },
+  {
+   "note": "5: local can't post to Slack",
+   "as": {
+    "key": "local"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "slack:T1/C1/1700000000.0001"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "5: local can't read Slack",
+   "as": {
+    "key": "local"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "slack:T1/C1/1700000000.0001"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "5: local can't write the knowledge base",
+   "as": {
+    "key": "local"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "kb:brain-write/slack/general/2026-11-14"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "5: local can't read the knowledge base",
+   "as": {
+    "key": "local"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "kb:brain-write/slack/general/2026-11-14"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "7: an inbox outside every name prefix is refused",
+   "as": {
+    "key": "pit"
+   },
+   "op": "w",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:inbox/someone"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "7: an unknown stream is refused",
+   "as": {
+    "key": "pit"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "teams:abc"
+   },
+   "expect": "deny"
+  },
+  {
+   "note": "7: a pit agent can't enroll under a local name",
+   "as": {
+    "key": "pit",
+    "name": "local-x"
+   },
+   "op": "r",
+   "resource": {
+    "kind": "stream",
+    "id": "relaycast:channel/eng"
+   },
+   "expect": "deny"
+  }
+ ]
+}

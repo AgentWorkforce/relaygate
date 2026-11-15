@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { groupName, guestEnded, isGuest, principalFor, resolveStream, type ResolvedStream } from "./app.js";
+import { groupName, guestEnded, isGuest, principalFor, resolveStream, type ResolvedResource, type ResolvedStream } from "./app.js";
+import { resolveSession } from "./sessions.js";
 import { allGroups, check, inGroup, type CheckStep, type Op, type Principal } from "./mode.js";
 import { keyUsable, type Policy } from "./policy.js";
 import type { Store } from "./store.js";
@@ -24,7 +25,14 @@ export type Subject = z.input<typeof SubjectSchema>;
 export const QuerySchema = z.object({
   as: SubjectSchema,
   op: z.enum(["r", "w"]),
-  resource: z.object({ kind: z.literal("stream"), id: z.string().min(1) }),
+  resource: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("stream"), id: z.string().min(1) }),
+    /**
+     * A session: a recorded one is looked up in relaygate's database; otherwise `gid` says which group's agent
+     * uploaded it first (a hypothetical session; the subject is never its owner).
+     */
+    z.object({ kind: z.literal("session"), id: z.string().min(1), gid: Gid.optional() }),
+  ]),
 });
 export type Query = z.input<typeof QuerySchema>;
 
@@ -43,7 +51,7 @@ export interface Explanation {
   /** Whether the classifier would see this request (writes across a group boundary, or to a classify stream). */
   classified: boolean;
   subject: { name: string; gid: number; groups: number[]; group_names: string[]; guest: boolean };
-  resource: ResolvedStream | null;
+  resource: ResolvedStream | ResolvedResource | null;
   steps: Array<CheckStep | { step: "subject" | "resource" | "classifier"; detail: string }>;
   summary: string;
 }
@@ -84,7 +92,7 @@ function resolveSubject(subject: Subject, policy: Policy, store: Pick<Store, "ag
   return { ok: true, principal: { agentId: `explain:${name}`, gid: s.gid, groups: s.groups }, name, guest: s.guest, notes: ["a hypothetical agent"] };
 }
 
-export function explain(policy: Policy, store: Pick<Store, "agentByName" | "stream"> | undefined, query: Query, now = Date.now()): Explanation {
+export function explain(policy: Policy, store: Pick<Store, "agentByName" | "stream"> & Partial<Pick<Store, "session">> | undefined, query: Query, now = Date.now()): Explanation {
   const q = QuerySchema.parse(query);
   const op = q.op as Op;
   const id = q.resource.id;
@@ -111,12 +119,23 @@ export function explain(policy: Policy, store: Pick<Store, "agentByName" | "stre
   };
   const steps: Explanation["steps"] = subject.notes.map((detail) => ({ step: "subject" as const, detail: `${detail}, in ${card.group_names.join(", ")}${guest ? " (guest)" : ""}` }));
 
-  const stream = resolveStream(id, store, policy);
-  if (!stream) {
-    steps.push({ step: "resource", detail: `${id} matches no override, registered stream or prefix default` });
-    return { decision: "deny", reason: "unknown_stream", classified: false, subject: card, resource: null, steps, summary: `${name} may not ${verb} ${id}: unknown stream` };
+  let stream: (ResolvedStream | ResolvedResource) & { classify?: boolean };
+  if (q.resource.kind === "session") {
+    const row = store?.session?.(id) ?? (q.resource.gid === undefined ? undefined : { owner: "explain:<first uploader>", gid: q.resource.gid });
+    if (!row) {
+      steps.push({ step: "resource", detail: `session ${id} isn't recorded; give its first uploader's gid to explain a hypothetical one` });
+      return { decision: "deny", reason: "unknown_session", classified: false, subject: card, resource: null, steps, summary: `${name} may not ${verb} session ${id}: unknown session` };
+    }
+    stream = resolveSession(id, row, policy);
+  } else {
+    const found = resolveStream(id, store, policy);
+    if (!found) {
+      steps.push({ step: "resource", detail: `${id} matches no override, registered stream or prefix default` });
+      return { decision: "deny", reason: "unknown_stream", classified: false, subject: card, resource: null, steps, summary: `${name} may not ${verb} ${id}: unknown stream` };
+    }
+    stream = found;
   }
-  const acl = stream.acl.map((e) => `${e.gid}:${e.perm}`).join(",");
+  const acl = (stream.acl ?? []).map((e) => `${e.gid}:${e.perm}`).join(",");
   steps.push({
     step: "resource",
     detail: `${id} from ${stream.source}: gid ${stream.gid} (${groupName(policy, stream.gid)}), mode ${stream.mode}${acl ? `, acl ${acl}` : ""}${stream.classify ? ", classify on" : ""}`,
@@ -130,12 +149,12 @@ export function explain(policy: Policy, store: Pick<Store, "agentByName" | "stre
     return { decision: "deny", reason, classified: false, subject: card, resource: stream, steps, summary: `${name} may not ${verb} ${id}: ${why}` };
   }
   const crosses = !inGroup(principal, stream.gid);
-  const classified = op === "w" && (crosses || stream.classify);
+  const classified = op === "w" && (crosses || stream.classify === true);
   steps.push({
     step: "classifier",
     detail: classified
       ? `runs: ${crosses ? "the write crosses a group boundary" : "the stream has classify on"}; it can still deny on content`
-      : op === "w" ? "skipped: same-group write to a stream without classify" : "skipped: reads are not classified",
+      : op === "w" ? "skipped: same-group write without classify" : "skipped: reads are not classified",
   });
   return {
     decision: "allow",
@@ -155,7 +174,7 @@ export interface CaseResult {
 }
 
 /** Runs a list of expected decisions against a policy, for testing a drafted policy before it is applied. */
-export function runCases(policy: Policy, store: Pick<Store, "agentByName" | "stream"> | undefined, cases: Case[], now = Date.now()): CaseResult[] {
+export function runCases(policy: Policy, store: Pick<Store, "agentByName" | "stream"> & Partial<Pick<Store, "session">> | undefined, cases: Case[], now = Date.now()): CaseResult[] {
   return cases.map((raw) => {
     const c = CaseSchema.parse(raw);
     const got = explain(policy, store, c, now);
