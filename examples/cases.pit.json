@@ -1,0 +1,16 @@
+{
+  "cases": [
+    { "note": "a local agent can message a pit agent", "as": { "key": "local" }, "op": "w", "resource": { "kind": "stream", "id": "relaycast:inbox/pit-a" }, "expect": "allow", "classified": true },
+    { "note": "a local agent can't read a pit inbox", "as": { "key": "local" }, "op": "r", "resource": { "kind": "stream", "id": "relaycast:inbox/pit-a" }, "expect": "deny" },
+    { "note": "a pit agent can't answer outside the pit", "as": { "key": "pit" }, "op": "w", "resource": { "kind": "stream", "id": "relaycast:inbox/local-a" }, "expect": "deny" },
+    { "note": "pit agents read local inboxes", "as": { "key": "pit" }, "op": "r", "resource": { "kind": "stream", "id": "relaycast:inbox/local-a" }, "expect": "allow" },
+    { "note": "only the pit posts to slack, always classified", "as": { "key": "slack-bridge" }, "op": "w", "resource": { "kind": "stream", "id": "slack:T1/C1/1.1" }, "expect": "allow", "classified": true },
+    { "note": "local agents can't post to slack", "as": { "key": "local" }, "op": "w", "resource": { "kind": "stream", "id": "slack:T1/C1/1.1" }, "expect": "deny" },
+    { "note": "a guest writes the collab channel, classified", "as": { "key": "vendor-guest" }, "op": "w", "resource": { "kind": "stream", "id": "relaycast:channel/collab-design" }, "expect": "allow", "classified": true },
+    { "note": "a guest can't read local inboxes", "as": { "key": "vendor-guest" }, "op": "r", "resource": { "kind": "stream", "id": "relaycast:inbox/local-a" }, "expect": "deny" },
+    { "note": "a guest can't read ordinary local channels", "as": { "key": "vendor-guest" }, "op": "r", "resource": { "kind": "stream", "id": "relaycast:channel/general" }, "expect": "deny" },
+    { "note": "a guest never reaches the pit", "as": { "key": "vendor-guest" }, "op": "w", "resource": { "kind": "stream", "id": "relaycast:inbox/pit-a" }, "expect": "deny" },
+    { "note": "local agents answer a guest", "as": { "key": "local" }, "op": "w", "resource": { "kind": "stream", "id": "relaycast:inbox/guest-a" }, "expect": "allow" },
+    { "note": "an inbox outside every name prefix is refused", "as": { "key": "pit" }, "op": "r", "resource": { "kind": "stream", "id": "relaycast:inbox/someone" }, "expect": "deny" }
+  ]
+}

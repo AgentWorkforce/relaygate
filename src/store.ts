@@ -44,8 +44,10 @@ export interface AuditEntry {
 export class Store {
   private db: DatabaseSync;
 
-  constructor(path: string) {
-    this.db = new DatabaseSync(path);
+  /** `readOnly` opens an existing database without creating or migrating anything (for the explain CLI). */
+  constructor(path: string, opts: { readOnly?: boolean } = {}) {
+    this.db = new DatabaseSync(path, { readOnly: opts.readOnly ?? false });
+    if (opts.readOnly) return;
     this.db.exec(`
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS agents (
