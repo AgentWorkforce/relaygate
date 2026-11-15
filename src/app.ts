@@ -2,7 +2,8 @@ import { Hono, type Context } from "hono";
 import { z } from "zod";
 import { ClassifierUnavailable, type Classifier } from "./classifier.js";
 import { allGroups, check, inGroup, type AclEntry, type Guarded, type Op, type Principal } from "./mode.js";
-import { keyUsable, type EnrollmentKey, type Policy } from "./policy.js";
+import { explain, runCases, CaseSchema, QuerySchema } from "./explain.js";
+import { keyUsable, parsePolicy, type EnrollmentKey, type Policy } from "./policy.js";
 import { sameHash, sha256, type Agent, type Store } from "./store.js";
 
 export interface Deps {
@@ -12,6 +13,8 @@ export interface Deps {
   classifier: () => Classifier;
   /** Clock for key expiry; defaults to Date.now. */
   now?: () => number;
+  /** Operator token for /admin/v1/*. Unset disables the admin endpoints. */
+  adminToken?: string;
 }
 
 type Env = { Variables: { agent: Agent; principal: Principal } };
@@ -90,10 +93,10 @@ export interface ResolvedStream extends Guarded {
 }
 
 /** Operator override, then the registered stream, then the longest matching prefix default. */
-export function resolveStream(id: string, store: Store, policy: Policy): ResolvedStream | undefined {
+export function resolveStream(id: string, store: Pick<Store, "stream"> | undefined, policy: Policy): ResolvedStream | undefined {
   const override = policy.streamOverrides.find((o) => o.id === id);
   if (override) return { id, owner: null, gid: override.gid, mode: override.mode, classify: override.classify, acl: override.acl, source: "override" };
-  const row = store.stream(id);
+  const row = store?.stream(id);
   if (row) return { id, owner: row.owner, gid: row.gid, mode: row.mode, classify: row.classify, acl: row.acl, source: "registered" };
   const prefix = longestPrefix(id, policy);
   if (prefix) return { id, owner: null, gid: prefix.gid, mode: prefix.mode, classify: prefix.classify, acl: prefix.acl, source: "prefix" };
@@ -219,6 +222,33 @@ export function createApp(deps: Deps) {
     const token = store.issueToken(agent.id);
     store.audit({ agentId: agent.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: `key:${enrollment.id}` });
     return c.json({ agent_id: agent.id, gid: agent.gid, token });
+  });
+
+  // Operator endpoints, authorized with the admin token (never an rg_ token).
+  const ExplainBody = z.union([
+    QuerySchema.extend({ policy: z.unknown().optional() }),
+    z.object({ policy: z.unknown().optional(), cases: z.array(CaseSchema).min(1).max(1000) }),
+  ]);
+  app.post("/admin/v1/explain", async (c) => {
+    const token = bearer(c);
+    if (!deps.adminToken) return deny(c, 404, "relaygate_not_found");
+    if (!token || !sameHash(sha256(token), sha256(deps.adminToken))) return deny(c, 401, "relaygate_unauthenticated");
+    const parsed = ExplainBody.safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return deny(c, 400, "relaygate_bad_request", { detail: parsed.error.issues[0]?.message });
+    let policy: Policy;
+    try {
+      // A draft policy is checked exactly like a file the operator would load; nothing is applied.
+      policy = parsed.data.policy === undefined ? deps.policy() : parsePolicy(parsed.data.policy);
+    } catch (error) {
+      return deny(c, 400, "relaygate_bad_policy", { detail: (error as Error).message.slice(0, 2000) });
+    }
+    const draft = parsed.data.policy !== undefined;
+    if ("cases" in parsed.data) {
+      const results = runCases(policy, store, parsed.data.cases, now());
+      const failed = results.filter((r) => !r.pass).length;
+      return c.json({ draft, passed: results.length - failed, failed, results });
+    }
+    return c.json({ draft, ...explain(policy, store, parsed.data, now()) });
   });
 
   // Everything below needs an rg_ token.

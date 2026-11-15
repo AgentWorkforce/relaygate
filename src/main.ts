@@ -37,7 +37,12 @@ setInterval(() => {
   }
 }, reloadMs).unref();
 
-const app = createApp({ store, policy: () => policy, classifier: () => classifier });
+const adminToken = process.env.RELAYGATE_ADMIN_TOKEN || undefined;
+if (adminToken !== undefined && adminToken.length < 24) {
+  console.error("RELAYGATE_ADMIN_TOKEN must be at least 24 characters");
+  process.exit(1);
+}
+const app = createApp({ store, policy: () => policy, classifier: () => classifier, adminToken });
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(JSON.stringify({ msg: "relaygate listening", port: info.port, model_classifier: policy.classifier.model.enabled }));

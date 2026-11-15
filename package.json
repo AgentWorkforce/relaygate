@@ -12,7 +12,8 @@
     "start": "node dist/main.js",
     "dev": "tsx src/main.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "explain": "tsx src/explain-cli.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.8.0",
@@ -25,5 +26,8 @@
     "tsx": "^4.23.15",
     "typescript": "^5.9.3",
     "vitest": "^5.1.0"
+  },
+  "bin": {
+    "relaygate-explain": "dist/explain-cli.js"
   }
 }

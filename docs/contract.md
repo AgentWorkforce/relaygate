@@ -417,6 +417,42 @@ registered like any other (see "Registering streams and prefix defaults").
 in a group may hold third-party credentials, and the deployment's network
 rules allow egress to those services only from those components.
 
+## Explain
+
+An operator (or an agent drafting a policy for one) can ask "may X do op on
+Y, and why" without sending anything. Explain runs the same deterministic check
+as a real request, against the live policy or a draft, and never calls the
+classifier; it says whether the classifier would run.
+
+```
+POST /admin/v1/explain
+Authorization: Bearer <admin token>
+{"as": {"key": "vendor-guest"}, "op": "w",
+ "resource": {"kind": "stream", "id": "relaycast:inbox/pit-a"},
+ "policy": { ...optional draft... }}
+
+200
+{"draft": false, "decision": "deny", "reason": "ceiling:44->22:prefix",
+ "classified": false, "summary": "guest-<new> may not write ...: refused by a ceiling",
+ "steps": [{"step": "subject", "detail": "..."}, {"step": "resource", ...},
+           {"step": "other", ...}, {"step": "ceiling", ...}]}
+```
+
+`as` is a registered agent (`{"agent": "<name>"}`), a new agent enrolled with
+a key (`{"key": "<id>", "name"?}`), or bare groups (`{"gid": 44, "groups":
+[]}`). A body with `cases` instead runs a list of expected decisions
+(`"expect": "allow" | "deny"`, optionally `"classified"`) and reports which
+fail, so a drafted policy can carry its own tests. An invalid draft answers
+`400 relaygate_bad_policy` with the reason. Nothing is applied and nothing is
+audited as a decision.
+
+The same check runs offline: `relaygate-explain --policy <file> --as
+key:vendor-guest --op w --stream <id>`, or `--cases <file>`, which exits `1`
+when any case fails (see `examples/cases.pit.json`).
+
+**Open:** in production the admin endpoint belongs behind relay-control, which
+holds the policy; today it is enabled by `RELAYGATE_ADMIN_TOKEN`.
+
 ## Audit
 
 relaygate records every decision: who, what resource, which op, allowed or
@@ -436,6 +472,4 @@ content.
 - The default classifier and its latency budget.
 - Whether tool calls (Relaycast actions) need to be their own guarded
   resource, beyond streams and sessions.
-- An "explain" check for operators ("may X do op on Y, and why"), so a policy
-  an agent drafted can be tested before it is applied.
 - What, if anything, the `1` bit means.

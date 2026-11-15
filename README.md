@@ -31,6 +31,7 @@ ceilings and guest provenance. The Relaycast and Sessions proxies come next.
 | `RELAYGATE_POLICY` | required | Path to the operator policy JSON (see `examples/policy.pit.json`). Reloaded when it changes; a bad edit keeps the previous policy. |
 | `RELAYGATE_DB` | `/data/relaygate.db` | SQLite file for agents, tokens, streams and the audit log. |
 | `PORT` | `8080` | HTTP port. |
+| `RELAYGATE_ADMIN_TOKEN` | none | Enables `POST /admin/v1/explain` (operator "may X do op on Y, and why"). |
 | `ANTHROPIC_API_KEY` | none | Needed only when `classifier.model.enabled` is true. |
 
 Health: `GET /healthz` (process up) and `GET /readyz` (policy loaded, database
@@ -43,3 +44,19 @@ docker run -p 8080:8080 -v $PWD/policy.json:/etc/relaygate/policy.json \
 
 Enrollment keys appear in the policy only as sha256 hashes:
 `printf %s "$KEY" | shasum -a 256`.
+
+## Testing a policy
+
+`relaygate-explain` (`npm run explain --` in a checkout) answers "may X do op on
+Y, and why" from a policy file, without a running gate:
+
+```
+npm run explain -- --policy policy.json --as key:vendor-guest --op r --stream relaycast:inbox/pit-a
+DENY  guest-<new> may not read relaycast:inbox/pit-a: refused by a ceiling
+  ...
+npm run explain -- --policy draft.json --cases examples/cases.pit.json   # exits 1 on any failure
+```
+
+`--as` is `agent:<name>` (with `--db`), `key:<id>[:<name>]` or
+`gid:<gid>[,<gid>...]`.
+
