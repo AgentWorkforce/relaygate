@@ -2,6 +2,8 @@ import { Hono, type Context } from "hono";
 import { z } from "zod";
 import { ClassifierUnavailable, type Classifier } from "./classifier.js";
 import { allGroups, check, inGroup, type AclEntry, type Guarded, type Op, type Principal } from "./mode.js";
+import { deny as proxyDeny, mountRelaycast, type RelaycastUpstream } from "./relaycast.js";
+import { mountNodeToken } from "./realtime.js";
 import { explain, runCases, CaseSchema, QuerySchema } from "./explain.js";
 import { keyUsable, parsePolicy, type EnrollmentKey, type Policy } from "./policy.js";
 import { sameHash, sha256, type Agent, type Store } from "./store.js";
@@ -15,9 +17,13 @@ export interface Deps {
   now?: () => number;
   /** Operator token for /admin/v1/*. Unset disables the admin endpoints. */
   adminToken?: string;
+  /** The Relaycast upstream; unset disables the Relaycast proxy. */
+  relaycast?: RelaycastUpstream;
+  /** Called after tokens are revoked, so open sockets close at once rather than at the next revalidation. */
+  onTokensRevoked?: () => void;
 }
 
-type Env = { Variables: { agent: Agent; principal: Principal } };
+export type Env = { Variables: { agent: Agent; principal: Principal; tokenHash: string } };
 
 const NAME = /^[A-Za-z0-9._:-]{1,128}$/;
 const STREAM_ID = /^[\x21-\x7e]{1,512}$/;
@@ -37,7 +43,7 @@ function bearer(c: Context): string | undefined {
   return h?.startsWith("Bearer ") ? h.slice(7).trim() : undefined;
 }
 
-function deny(c: Context, status: 400 | 401 | 403 | 404 | 409 | 503, error: string, extra: Record<string, unknown> = {}) {
+export function deny(c: Context, status: 400 | 401 | 403 | 404 | 409 | 503, error: string, extra: Record<string, unknown> = {}) {
   return c.json({ error, ...extra }, status);
 }
 
@@ -211,6 +217,7 @@ export function createApp(deps: Deps) {
         return deny(c, 409, "relaygate_name_taken");
       }
       store.revokeTokens(existing.id);
+      deps.onTokensRevoked?.();
       // The key that recovered the agent now governs it (key rotation: the old key may have expired).
       if (existing.keyId !== enrollment.id) store.setAgentKey(existing.id, enrollment.id, enrollment.guest);
       const token = store.issueToken(existing.id);
@@ -266,11 +273,13 @@ export function createApp(deps: Deps) {
     if (ended) {
       // Permanent: un-revoking or extending the key later doesn't bring these tokens back.
       store.revokeTokens(agent.id);
+      deps.onTokensRevoked?.();
       store.audit({ agentId: agent.id, action: "auth", op: null, resourceKind: null, resourceId: null, decision: "deny", stage: "auth", reason: ended });
       return deny(c, 401, "relaygate_unauthenticated");
     }
     c.set("agent", agent);
     c.set("principal", principalFor(agent, policy));
+    c.set("tokenHash", sha256(token!));
     await next();
   });
 
@@ -342,6 +351,13 @@ export function createApp(deps: Deps) {
         return deny(c, 503, "relaygate_unavailable");
     }
   });
+
+  if (deps.relaycast) {
+    mountRelaycast(app, deps, deps.relaycast);
+    mountNodeToken(app, deps, deps.relaycast);
+  }
+  // Allowlist only: every other /v1 route is refused before anything reaches upstream.
+  app.all("/v1/*", (c) => proxyDeny(c, 404, "relaygate_route_not_proxied", { path: c.req.path }));
 
   return app;
 }

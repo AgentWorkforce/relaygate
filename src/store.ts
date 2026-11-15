@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import type { AclEntry } from "./mode.js";
 
@@ -8,6 +8,34 @@ export function sameHash(a: string, b: string): boolean {
   const x = Buffer.from(a, "hex");
   const y = Buffer.from(b, "hex");
   return x.length === y.length && timingSafeEqual(x, y);
+}
+
+/** AES-256-GCM for upstream credentials at rest. The key comes from RELAYGATE_SECRET, never the database. */
+export class SecretBox {
+  private key: Buffer;
+  constructor(secret: string) {
+    this.key = createHash("sha256").update(secret).digest();
+  }
+  seal(plain: string): string {
+    const iv = randomBytes(12);
+    const c = createCipheriv("aes-256-gcm", this.key, iv);
+    const body = Buffer.concat([c.update(plain, "utf8"), c.final()]);
+    return [iv, c.getAuthTag(), body].map((b) => b.toString("base64url")).join(".");
+  }
+  open(sealed: string): string {
+    const [iv, tag, body] = sealed.split(".").map((p) => Buffer.from(p, "base64url"));
+    const d = createDecipheriv("aes-256-gcm", this.key, iv!);
+    d.setAuthTag(tag!);
+    return Buffer.concat([d.update(body!), d.final()]).toString("utf8");
+  }
+}
+
+export interface NodeTokenRow {
+  agentId: string;
+  /** Hash of the rg_ token that minted it; the node token dies with that token. */
+  agentTokenHash: string;
+  nodeId: string;
+  upstreamSealed: string;
 }
 
 export interface Agent {
@@ -73,6 +101,20 @@ export class Store {
         classify INTEGER NOT NULL,
         acl TEXT NOT NULL DEFAULT '[]',
         updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS upstream_agents (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+        upstream_id TEXT NOT NULL,
+        token_sealed TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS node_tokens (
+        hash TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        agent_token_hash TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        upstream_sealed TEXT NOT NULL,
+        created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS audit (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,12 +200,48 @@ export class Store {
   }
 
   agentForToken(token: string): Agent | undefined {
+    return this.agentForTokenHash(sha256(token));
+  }
+
+  agentForTokenHash(hash: string): Agent | undefined {
     const row = this.db
       .prepare(
         "SELECT a.id, a.name, a.gid, a.key_id, a.recovery_hash, a.guest FROM tokens t JOIN agents a ON a.id = t.agent_id WHERE t.hash = ? AND t.revoked = 0",
       )
-      .get(sha256(token));
+      .get(hash);
     return row ? toAgent(row) : undefined;
+  }
+
+  upstreamAgent(agentId: string): { upstreamId: string; tokenSealed: string } | undefined {
+    const row = this.db.prepare("SELECT upstream_id, token_sealed FROM upstream_agents WHERE agent_id = ?").get(agentId);
+    return row ? { upstreamId: String(row.upstream_id), tokenSealed: String(row.token_sealed) } : undefined;
+  }
+
+  putUpstreamAgent(agentId: string, upstreamId: string, tokenSealed: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO upstream_agents (agent_id, upstream_id, token_sealed, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(agent_id) DO UPDATE SET upstream_id = excluded.upstream_id, token_sealed = excluded.token_sealed, updated_at = excluded.updated_at`,
+      )
+      .run(agentId, upstreamId, tokenSealed, now());
+  }
+
+  /** Issues an rgn_ node token bound to the rg_ token that asked for it. */
+  issueNodeToken(row: NodeTokenRow): string {
+    const token = `rgn_${randomBytes(32).toString("base64url")}`;
+    this.db
+      .prepare("INSERT INTO node_tokens (hash, agent_id, agent_token_hash, node_id, upstream_sealed, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(sha256(token), row.agentId, row.agentTokenHash, row.nodeId, row.upstreamSealed, now());
+    return token;
+  }
+
+  nodeToken(token: string): NodeTokenRow | undefined {
+    const row = this.db
+      .prepare("SELECT agent_id, agent_token_hash, node_id, upstream_sealed FROM node_tokens WHERE hash = ?")
+      .get(sha256(token));
+    return row
+      ? { agentId: String(row.agent_id), agentTokenHash: String(row.agent_token_hash), nodeId: String(row.node_id), upstreamSealed: String(row.upstream_sealed) }
+      : undefined;
   }
 
   stream(id: string): StreamRow | undefined {

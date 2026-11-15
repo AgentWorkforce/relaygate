@@ -1,0 +1,485 @@
+import type { Context, Hono } from "hono";
+import { decide, provenance, resolveStream, type Deps, type Env } from "./app.js";
+import { check, type Op, type Principal } from "./mode.js";
+import type { Agent, SecretBox, Store } from "./store.js";
+
+/**
+ * The Relaycast proxy (docs/contract.md, "Tokens and the upstream credentials" and "Reads and lists").
+ *
+ * Relaycast has no act-as for agents, so relaygate registers every agent upstream under the same name with the
+ * workspace key and keeps that agent's at_live_ token, sealed, server-side. Agents only ever hold rg_ tokens.
+ *
+ * Only the routes below are proxied; anything else answers 404 relaygate_route_not_proxied. Several Relaycast reads
+ * skip membership checks (GET /messages/:id, /search, channel message lists), so relaygate checks each one itself.
+ */
+
+const MESSAGES: Record<string, string> = {
+  relaygate_denied: "relaygate refused this request (permission bits)",
+  relaygate_classified: "relaygate's classifier refused this content",
+  relaygate_unavailable: "relaygate could not decide; retry with backoff",
+  relaygate_bad_request: "relaygate could not read this request",
+  relaygate_route_not_proxied: "this Relaycast route is not available through relaygate",
+  relaygate_not_found: "not found",
+};
+
+/** Errors on proxied routes use Relaycast's shape, so SDK clients surface relaygate's code and message. */
+export function deny(c: Context, status: 400 | 401 | 403 | 404 | 409 | 502 | 503, code: string, extra: Record<string, unknown> = {}) {
+  const detail = typeof extra.detail === "string" ? `: ${extra.detail}` : "";
+  return c.json({ ok: false, error: { code, message: `${MESSAGES[code] ?? code}${detail}` }, ...extra }, status);
+}
+
+export interface RelaycastConfig {
+  /** Base URL of Relaycast, e.g. https://relaycast.internal */
+  url: string;
+  /** rk_live_ workspace key; used only to register agents upstream and recover their tokens. */
+  workspaceKey: string;
+  box: SecretBox;
+  fetch?: typeof fetch;
+}
+
+export class UpstreamError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
+interface UpstreamResponse {
+  status: number;
+  body: unknown;
+}
+
+export class RelaycastUpstream {
+  private fetch: typeof fetch;
+  private pending = new Map<string, Promise<string>>();
+
+  constructor(
+    readonly cfg: RelaycastConfig,
+    private store: Store,
+  ) {
+    this.fetch = cfg.fetch ?? fetch;
+  }
+
+  private url(path: string): string {
+    return new URL(path, this.cfg.url.endsWith("/") ? this.cfg.url : `${this.cfg.url}/`).toString();
+  }
+
+  async raw(method: string, path: string, token: string, body?: unknown, headers: Record<string, string> = {}): Promise<UpstreamResponse> {
+    const res = await this.fetch(this.url(path.replace(/^\//, "")), {
+      method,
+      headers: { ...headers, authorization: `Bearer ${token}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await res.text();
+    let parsed: unknown = null;
+    try {
+      parsed = text ? JSON.parse(text) : null;
+    } catch {
+      parsed = { ok: false, error: { code: "upstream_not_json" } };
+    }
+    return { status: res.status, body: parsed };
+  }
+
+  /** The agent's upstream at_live_ token, registering the agent upstream on first use. */
+  async agentToken(agent: Agent): Promise<string> {
+    const row = this.store.upstreamAgent(agent.id);
+    if (row) return this.cfg.box.open(row.tokenSealed);
+    return this.enroll(agent, false);
+  }
+
+  /** Registers the agent upstream, or takes its identity over when the name already exists there. Single-flight per agent. */
+  enroll(agent: Agent, takeover: boolean): Promise<string> {
+    const inflight = this.pending.get(agent.id);
+    if (inflight) return inflight;
+    const p = this.doEnroll(agent, takeover).finally(() => this.pending.delete(agent.id));
+    this.pending.set(agent.id, p);
+    return p;
+  }
+
+  private async doEnroll(agent: Agent, takeover: boolean): Promise<string> {
+    const key = this.cfg.workspaceKey;
+    if (!takeover) {
+      const created = await this.raw("POST", "/v1/agents", key, {
+        name: agent.name,
+        auto_join_general: false,
+        metadata: { relaygate: { agent_id: agent.id } },
+      });
+      if (created.status === 200 || created.status === 201) {
+        const data = dataOf(created.body) as { id: string; token: string };
+        this.store.putUpstreamAgent(agent.id, data.id, this.cfg.box.seal(data.token));
+        return data.token;
+      }
+      if (created.status !== 409) throw new UpstreamError(`upstream agent registration failed (${created.status})`, created.status);
+    }
+    // The name exists upstream (relaygate's database was reset, or the stored token stopped working): take it over.
+    const found = await this.raw("GET", `/v1/agents/${encodeURIComponent(agent.name)}`, key);
+    if (found.status !== 200) throw new UpstreamError(`upstream agent lookup failed (${found.status})`, found.status);
+    const id = (dataOf(found.body) as { id: string }).id;
+    const taken = await this.raw("POST", `/v1/agents/${encodeURIComponent(agent.name)}/takeover`, key, {
+      expected_agent_id: id,
+      actor: "relaygate",
+      reason: "relaygate holds this agent's upstream credential",
+      session_ref: `relaygate:${agent.id}`,
+      node_id: "relaygate",
+    });
+    if (taken.status !== 200) throw new UpstreamError(`upstream agent takeover failed (${taken.status})`, taken.status);
+    const token = (dataOf(taken.body) as { token: string }).token;
+    this.store.putUpstreamAgent(agent.id, id, this.cfg.box.seal(token));
+    this.store.audit({ agentId: agent.id, action: "upstream.takeover", op: null, resourceKind: "agent", resourceId: agent.name, decision: "allow", stage: null, reason: "relaycast" });
+    return token;
+  }
+
+  /** Calls Relaycast as the agent. A 401 means the stored token stopped working: recover it once and retry. */
+  async asAgent(agent: Agent, method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<UpstreamResponse> {
+    const first = await this.raw(method, path, await this.agentToken(agent), body, headers);
+    if (first.status !== 401) return first;
+    return this.raw(method, path, await this.enroll(agent, true), body, headers);
+  }
+
+  /** Calls Relaycast with the workspace key (only for reads relaygate filters itself). */
+  asWorkspace(method: string, path: string): Promise<UpstreamResponse> {
+    return this.raw(method, path, this.cfg.workspaceKey);
+  }
+}
+
+const dataOf = (body: unknown): unknown => (body && typeof body === "object" && "data" in body ? (body as { data: unknown }).data : body);
+
+// ---------------------------------------------------------------------------------------------------------------
+// Stream ids relaygate derives from Relaycast requests.
+
+export const channelStream = (name: string) => `relaycast:channel/${name}`;
+export const inboxStream = (agentName: string) => `relaycast:inbox/${agentName}`;
+
+/** Relaycast stores DMs as hidden channels named dm-<pair>; they are never addressed as channels through relaygate. */
+export const isDmChannelName = (name: string) => name.startsWith("dm-") || name.startsWith("dmch_");
+
+const CHANNEL_NAME = /^[A-Za-z0-9._-]{1,128}$/;
+
+/** May this principal read the stream? Deterministic only (reads are never classified). */
+export function canRead(deps: Deps, principal: Principal, id: string): boolean {
+  const policy = deps.policy();
+  const stream = resolveStream(id, deps.store, policy);
+  return stream !== undefined && check(principal, stream, "r", policy.ceilings).allowed;
+}
+
+/** Every field of a write that carries content, flattened for the classifier. */
+export function writeContent(body: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (typeof body.text === "string") parts.push(body.text);
+  for (const key of ["blocks", "attachments", "data"] as const) {
+    if (body[key] !== undefined) parts.push(JSON.stringify(body[key]));
+  }
+  return parts.join("\n");
+}
+
+/** Replaces any client-sent relaygate card with the verified one, so provenance can't be forged. */
+export function stampProvenance(body: Record<string, unknown>, card: ReturnType<typeof provenance>): Record<string, unknown> {
+  const data = body.data && typeof body.data === "object" && !Array.isArray(body.data) ? { ...(body.data as Record<string, unknown>) } : {};
+  delete data.relaygate;
+  return { ...body, data: { ...data, relaygate: card } };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+
+type Ctx = Context<Env>;
+
+export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUpstream): void {
+  const { store } = deps;
+
+  const audit = (c: Ctx, action: string, op: Op | null, id: string | null, decision: "allow" | "deny" | "unavailable", stage: "mode" | "classifier" | null, reason: string) =>
+    store.audit({ agentId: c.get("agent").id, action, op, resourceKind: id ? "stream" : null, resourceId: id, decision, stage, reason });
+
+  const denied = (c: Ctx, op: Op, id: string) => deny(c, 403, "relaygate_denied", { op, resource: id });
+
+  const pass = (c: Ctx, r: UpstreamResponse) => c.json(r.body as object, r.status as 200);
+
+  const forward = async (c: Ctx, method: string, path: string, body?: unknown) => {
+    try {
+      // Idempotency-Key passes through unchanged so client retries stay safe.
+      const idem = c.req.header("idempotency-key");
+      return await upstream.asAgent(c.get("agent"), method, path, body, idem ? { "idempotency-key": idem } : {});
+    } catch (error) {
+      console.error(JSON.stringify({ msg: "relaycast upstream error", error: (error as Error).message }));
+      return { status: 502, body: { ok: false, error: { code: "relaygate_upstream_unavailable" } } };
+    }
+  };
+
+  const pathWithQuery = (c: Ctx) => {
+    const u = new URL(c.req.url);
+    return `${u.pathname}${u.search}`;
+  };
+
+  const jsonBody = async (c: Ctx): Promise<Record<string, unknown> | undefined> => {
+    const b = await c.req.json().catch(() => undefined);
+    return b && typeof b === "object" && !Array.isArray(b) ? (b as Record<string, unknown>) : undefined;
+  };
+
+  /** Mode check + classifier for a read, with audit. Returns a response when refused. */
+  const gateRead = (c: Ctx, action: string, id: string) => {
+    const principal = c.get("principal");
+    const ok = canRead(deps, principal, id);
+    audit(c, action, "r", id, ok ? "allow" : "deny", "mode", ok ? "read" : "read_denied");
+    return ok ? undefined : denied(c, "r", id);
+  };
+
+  /** The full decision for a write (mode, then classifier), with audit. Returns a response when refused. */
+  const gateWrite = async (c: Ctx, action: string, id: string, content: string) => {
+    const d = await decide(deps, c.get("agent"), c.get("principal"), "w", id, content);
+    switch (d.status) {
+      case "allow":
+        audit(c, action, "w", id, "allow", d.stage, d.reason);
+        return undefined;
+      case "deny":
+        audit(c, action, "w", id, "deny", d.stage, d.reason);
+        return deny(c, 403, d.error, { op: "w", resource: id });
+      case "unavailable":
+        audit(c, action, "w", id, "unavailable", d.stage, d.reason);
+        return deny(c, 503, "relaygate_unavailable");
+      case "invalid":
+        return deny(c, 400, "relaygate_bad_request", { detail: d.reason });
+    }
+  };
+
+  const channelParam = (c: Ctx): string | undefined => {
+    const name = c.req.param("name");
+    return name && CHANNEL_NAME.test(name) && !isDmChannelName(name) ? name : undefined;
+  };
+
+  /** Which stream a message lives in, from its channel id. Undefined for DM messages and unknown channels. */
+  const channelNames = new Map<string, string>();
+  const channelNameFor = async (c: Ctx, channelId: string): Promise<string | undefined> => {
+    const cached = channelNames.get(channelId);
+    if (cached) return cached;
+    const list = await forward(c, "GET", "/v1/channels");
+    for (const ch of asArray(dataOf(list.body))) {
+      if (typeof ch.id === "string" && typeof ch.name === "string") channelNames.set(ch.id, ch.name);
+    }
+    return channelNames.get(channelId);
+  };
+
+  /**
+   * Resolves the stream a message id belongs to by fetching it as the caller. A message in a channel maps to that
+   * channel's stream. A DM message has no channel stream: only its author may address it by id.
+   */
+  const messageStream = async (
+    c: Ctx,
+    messageId: string,
+  ): Promise<{ id: string } | { authorOnly: true; author: string; conversationId: string | undefined } | { status: number; body: unknown }> => {
+    const res = await forward(c, "GET", `/v1/messages/${encodeURIComponent(messageId)}`);
+    if (res.status !== 200) return res;
+    const msg = dataOf(res.body) as Record<string, unknown>;
+    const name = typeof msg.channel_id === "string" ? await channelNameFor(c, msg.channel_id) : undefined;
+    if (name && !isDmChannelName(name)) return { id: channelStream(name) };
+    const channelId = typeof msg.channel_id === "string" ? msg.channel_id : "";
+    return { authorOnly: true, author: String(msg.agent_name ?? ""), conversationId: channelId.startsWith("dmch_") ? `dm_${channelId.slice(5)}` : undefined };
+  };
+
+  /** Whether the caller participates in a 1:1 DM conversation, by its own conversation list. */
+  const inConversation = async (c: Ctx, conversationId: string | undefined): Promise<boolean> => {
+    if (!conversationId) return false;
+    const res = await forward(c, "GET", "/v1/dm/conversations?limit=100");
+    return res.status === 200 && asArray(dataOf(res.body)).some((conv) => conv.id === conversationId);
+  };
+
+  const MSG_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+  // --- self ------------------------------------------------------------------------------------------------
+  app.get("/v1/agent", async (c) => pass(c, await forward(c, "GET", "/v1/agent")));
+  app.post("/v1/agents/heartbeat", async (c) => pass(c, await forward(c, "POST", "/v1/agents/heartbeat", (await jsonBody(c)) ?? {})));
+  app.post("/v1/agents/disconnect", async (c) => pass(c, await forward(c, "POST", "/v1/agents/disconnect", (await jsonBody(c)) ?? {})));
+
+  // --- agents (Relaycast refuses agent tokens here; relaygate answers with the workspace key, filtered) -------
+  // An agent sees the agents it could message or whose inbox it may read, and nothing else.
+  const visibleAgent = (c: Ctx, name: unknown) => {
+    if (typeof name !== "string") return false;
+    if (name === c.get("agent").name) return true;
+    const principal = c.get("principal");
+    const stream = resolveStream(inboxStream(name), store, deps.policy());
+    if (!stream) return false;
+    const ceilings = deps.policy().ceilings;
+    return check(principal, stream, "w", ceilings).allowed || check(principal, stream, "r", ceilings).allowed;
+  };
+  app.get("/v1/agents", async (c) => {
+    const res = await upstream.asWorkspace("GET", pathWithQuery(c)).catch(() => ({ status: 502, body: { ok: false, error: { code: "relaygate_upstream_unavailable" } } }));
+    if (res.status !== 200) return pass(c, res);
+    return c.json({ ...(res.body as object), data: asArray(dataOf(res.body)).filter((a) => visibleAgent(c, a.name)) }, 200);
+  });
+  app.get("/v1/agents/:name", async (c) => {
+    const name = c.req.param("name");
+    if (!visibleAgent(c, name)) return deny(c, 404, "relaygate_not_found");
+    const res = await upstream.asWorkspace("GET", `/v1/agents/${encodeURIComponent(name)}`).catch(() => ({ status: 502, body: { ok: false, error: { code: "relaygate_upstream_unavailable" } } }));
+    return pass(c, res);
+  });
+
+  // --- channels --------------------------------------------------------------------------------------------
+  app.get("/v1/channels", async (c) => {
+    const res = await forward(c, "GET", pathWithQuery(c));
+    if (res.status !== 200) return pass(c, res);
+    const principal = c.get("principal");
+    const visible = asArray(dataOf(res.body)).filter(
+      (ch) => typeof ch.name === "string" && !isDmChannelName(ch.name) && canRead(deps, principal, channelStream(ch.name)),
+    );
+    return c.json({ ...(res.body as object), data: visible }, 200);
+  });
+
+  app.post("/v1/channels", async (c) => {
+    const body = await jsonBody(c);
+    const name = typeof body?.name === "string" ? body.name : "";
+    if (!body || !CHANNEL_NAME.test(name) || isDmChannelName(name)) return deny(c, 400, "relaygate_bad_request", { detail: "invalid channel name" });
+    const id = channelStream(name);
+    const refused = await gateWrite(c, "channel.create", id, [body.topic, body.metadata && JSON.stringify(body.metadata)].filter(Boolean).join("\n"));
+    if (refused) return refused;
+    return pass(c, await forward(c, "POST", "/v1/channels", body));
+  });
+
+  app.get("/v1/channels/:name", async (c) => {
+    const name = channelParam(c);
+    if (!name) return deny(c, 404, "relaygate_route_not_proxied");
+    return gateRead(c, "channel.get", channelStream(name)) ?? pass(c, await forward(c, "GET", pathWithQuery(c)));
+  });
+
+  app.get("/v1/channels/:name/messages", async (c) => {
+    const name = channelParam(c);
+    if (!name) return deny(c, 404, "relaygate_route_not_proxied");
+    return gateRead(c, "channel.messages", channelStream(name)) ?? pass(c, await forward(c, "GET", pathWithQuery(c)));
+  });
+
+  // Joining subscribes the agent to the channel's deliveries, so it needs read.
+  app.post("/v1/channels/:name/join", async (c) => {
+    const name = channelParam(c);
+    if (!name) return deny(c, 404, "relaygate_route_not_proxied");
+    return gateRead(c, "channel.join", channelStream(name)) ?? pass(c, await forward(c, "POST", c.req.path, {}));
+  });
+
+  for (const verb of ["leave", "mute", "unmute"] as const) {
+    app.post(`/v1/channels/:name/${verb}`, async (c) => {
+      const name = channelParam(c);
+      if (!name) return deny(c, 404, "relaygate_route_not_proxied");
+      return pass(c, await forward(c, "POST", c.req.path, {}));
+    });
+  }
+
+  app.post("/v1/channels/:name/messages", async (c) => {
+    const name = channelParam(c);
+    if (!name) return deny(c, 404, "relaygate_route_not_proxied");
+    const body = await jsonBody(c);
+    if (!body) return deny(c, 400, "relaygate_bad_request", { detail: "JSON body required" });
+    // `from` lets a node post as another agent upstream; relaygate never forwards it.
+    delete body.from;
+    const id = channelStream(name);
+    const refused = await gateWrite(c, "channel.post", id, writeContent(body));
+    if (refused) return refused;
+    const card = provenance(c.get("agent"), c.get("principal"), deps.policy());
+    return pass(c, await forward(c, "POST", c.req.path, stampProvenance(body, card)));
+  });
+
+  // --- messages and threads --------------------------------------------------------------------------------
+  const byMessage = (op: Op, action: string, handler: (c: Ctx, messageId: string, body?: Record<string, unknown>) => Promise<Response>) =>
+    async (c: Ctx) => {
+      const messageId = c.req.param("id") ?? "";
+      if (!MSG_ID.test(messageId)) return deny(c, 400, "relaygate_bad_request", { detail: "invalid message id" });
+      const body = op === "w" ? await jsonBody(c) : undefined;
+      if (op === "w" && !body) return deny(c, 400, "relaygate_bad_request", { detail: "JSON body required" });
+      const where = await messageStream(c, messageId);
+      if ("status" in where) return pass(c, where);
+      if ("authorOnly" in where) {
+        // A DM message (or a thread under it) is readable by id only by the two participants. Writes into DM threads
+        // aren't modelled (which inbox would they go to?), so they are refused; answer with POST /v1/dm.
+        const mine = op === "r" && (where.author === c.get("agent").name || (await inConversation(c, where.conversationId)));
+        audit(c, action, op, `relaycast:message/${messageId}`, mine ? "allow" : "deny", "mode", mine ? "dm_author" : "dm_message");
+        return mine ? handler(c, messageId, body) : denied(c, op, `relaycast:message/${messageId}`);
+      }
+      if (op === "r") {
+        const refused = gateRead(c, action, where.id);
+        if (refused) return refused;
+      } else {
+        const refused = await gateWrite(c, action, where.id, writeContent(body!));
+        if (refused) return refused;
+      }
+      return handler(c, messageId, body);
+    };
+
+  app.get("/v1/messages/:id", byMessage("r", "message.get", async (c) => pass(c, await forward(c, "GET", c.req.path))));
+  app.get("/v1/messages/:id/replies", byMessage("r", "thread.get", async (c) => pass(c, await forward(c, "GET", pathWithQuery(c)))));
+  app.post(
+    "/v1/messages/:id/replies",
+    byMessage("w", "thread.reply", async (c, _id, body) => {
+      delete body!.from;
+      const card = provenance(c.get("agent"), c.get("principal"), deps.policy());
+      return pass(c, await forward(c, "POST", c.req.path, stampProvenance(body!, card)));
+    }),
+  );
+  app.get("/v1/messages/:id/reactions", byMessage("r", "reaction.list", async (c) => pass(c, await forward(c, "GET", c.req.path))));
+  app.post("/v1/messages/:id/reactions", byMessage("w", "reaction.add", async (c, _id, body) => pass(c, await forward(c, "POST", c.req.path, body))));
+  app.delete("/v1/messages/:id/reactions/:emoji", byMessage("r", "reaction.remove", async (c) => pass(c, await forward(c, "DELETE", c.req.path))));
+  app.post("/v1/messages/:id/read", byMessage("r", "message.read", async (c) => pass(c, await forward(c, "POST", c.req.path, {}))));
+
+  // --- DMs -------------------------------------------------------------------------------------------------
+  app.post("/v1/dm", async (c) => {
+    const body = await jsonBody(c);
+    const me = c.get("agent").name;
+    const to = typeof body?.to === "string" ? (body.to === "@self" ? me : body.to.replace(/^@/, "")) : "";
+    if (!body || !/^[A-Za-z0-9._:-]{1,128}$/.test(to)) return deny(c, 400, "relaygate_bad_request", { detail: "invalid recipient" });
+    const id = inboxStream(to);
+    const refused = await gateWrite(c, "dm.send", id, writeContent(body));
+    if (refused) return refused;
+    const card = provenance(c.get("agent"), c.get("principal"), deps.policy());
+    return pass(c, await forward(c, "POST", "/v1/dm", stampProvenance({ ...body, to }, card)));
+  });
+
+  app.get("/v1/dm/conversations", async (c) => {
+    const res = await forward(c, "GET", pathWithQuery(c));
+    if (res.status !== 200) return pass(c, res);
+    // Group DMs aren't modelled by relaygate; only 1:1 conversations are listed.
+    const visible = asArray(dataOf(res.body)).filter((conv) => conv.type === undefined || conv.type === "dm" || conv.type === "direct");
+    return c.json({ ...(res.body as object), data: visible }, 200);
+  });
+
+  app.get("/v1/dm/:cid/messages", async (c) => {
+    const cid = c.req.param("cid");
+    if (!/^dm_[A-Za-z0-9_-]{1,200}$/.test(cid)) return deny(c, 404, "relaygate_route_not_proxied");
+    // Upstream checks participation; reading your own conversations is reading your own inbox.
+    const refused = gateRead(c, "dm.messages", inboxStream(c.get("agent").name));
+    return refused ?? pass(c, await forward(c, "GET", pathWithQuery(c)));
+  });
+
+  // --- search and inbox (filtered) -------------------------------------------------------------------------
+  app.get("/v1/search", async (c) => {
+    const res = await forward(c, "GET", pathWithQuery(c));
+    if (res.status !== 200) return pass(c, res);
+    const principal = c.get("principal");
+    const me = c.get("agent").name;
+    // Upstream search spans every channel and every DM; keep channel hits the caller may read and DM hits it wrote.
+    const visible = asArray(dataOf(res.body)).filter((hit) => {
+      const ch = typeof hit.channel_name === "string" ? hit.channel_name : undefined;
+      if (ch && !isDmChannelName(ch) && !hit.conversation_id) return canRead(deps, principal, channelStream(ch));
+      return hit.agent_name === me;
+    });
+    audit(c, "search", "r", null, "allow", "mode", `filtered:${visible.length}`);
+    return c.json({ ...(res.body as object), data: visible }, 200);
+  });
+
+  app.get("/v1/inbox", async (c) => {
+    const res = await forward(c, "GET", pathWithQuery(c));
+    if (res.status !== 200) return pass(c, res);
+    const principal = c.get("principal");
+    const data = (dataOf(res.body) ?? {}) as Record<string, unknown>;
+    const readable = (item: Record<string, unknown>) =>
+      typeof item.channel_name === "string" && !isDmChannelName(item.channel_name) && canRead(deps, principal, channelStream(item.channel_name));
+    const filtered = {
+      ...data,
+      unread_channels: asArray(data.unread_channels).filter(readable),
+      mentions: asArray(data.mentions).filter(readable),
+      unread_dms: asArray(data.unread_dms),
+      recent_reactions: asArray(data.recent_reactions).filter(readable),
+    };
+    return c.json({ ...(res.body as object), data: filtered }, 200);
+  });
+
+}
+
+function asArray(v: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(v) ? (v.filter((x) => x && typeof x === "object") as Array<Record<string, unknown>>) : [];
+}
