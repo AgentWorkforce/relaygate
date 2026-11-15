@@ -390,7 +390,13 @@ async function main() {
     const inList = !listOk || JSON.stringify(listed.body).includes(docSession(RUN));
     // The refusals only mean something if the document really was stored: the inside agent's own upload status and
     // its read-back (canary present, as a boolean).
-    const lines = insideLines().filter((l) => l.agent === pitA);
+    // The seed's read-back runs concurrently and may still be waiting on ingest: give it the ingest window.
+    let lines = insideLines().filter((l) => l.agent === pitA);
+    const canSeeLogs = inline || !!process.env.INSIDE_LOGS_CMD;
+    for (const start = Date.now(); canSeeLogs && !lines.some((l) => l.attempt === "seed.verify") && Date.now() - start < ingestWaitMs() + 60_000; ) {
+      await sleep(3000);
+      lines = insideLines().filter((l) => l.agent === pitA);
+    }
     const seedUp = lines.find((l) => l.attempt === "seed.session");
     const verify = lines.find((l) => l.attempt === "seed.verify");
     const stored = seedUp && ok(seedUp.status) && verify?.hasCanary === true;
