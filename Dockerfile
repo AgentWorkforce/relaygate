@@ -11,6 +11,9 @@ WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
+# Operator tooling that runs with Node's type stripping: the acceptance harness and the example policies/cases.
+COPY scripts ./scripts
+COPY examples ./examples
 RUN mkdir -p /data && chown node:node /data
 USER node
 VOLUME ["/data"]

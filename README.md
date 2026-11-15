@@ -70,6 +70,11 @@ npm run explain -- --policy draft.json --cases examples/cases.pit.json   # exits
 `gid:<gid>[,<gid>...]`. Use `--session <id> [--session-gid <gid>]` instead of `--stream` for
 sessions.
 
+A boundary acceptance test (inside agents hold a synthetic document with a
+canary; outside agents try every way to get it; the audit log is the evidence)
+is in [docs/acceptance-pit.md](docs/acceptance-pit.md), with the driver and the
+inside test agent in `scripts/acceptance/`.
+
 Example policies with their cases: `examples/policy.pit.json` (with a guest)
 and `examples/policy.double-pit.json` (two groups: laptops outside the
 regulated boundary, cloud agents inside it).
