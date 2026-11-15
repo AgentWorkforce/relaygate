@@ -37,8 +37,10 @@ Relaycast client's base URL at relaygate and use the `rg_` token (see
 | `RELAYCAST_URL` | none | Turns on the Relaycast proxy (REST allowlist and `/v1/node/ws`). |
 | `RELAYCAST_WORKSPACE_KEY` | none | `rk_live_` key relaygate uses to register agents upstream. Required with `RELAYCAST_URL`. |
 | `RELAYGATE_SECRET` | none | At least 32 characters; seals the upstream agent and node tokens at rest. Required with `RELAYCAST_URL`. |
-| `SESSIONS_URL` | none | Turns on the Sessions proxy at `/sessions`. |
-| `SESSIONS_TOKEN` | none | `rth_st_` service token (`rth:sync`, `rth:read`). Required with `SESSIONS_URL`. |
+| `SESSIONS_URL` | none | Turns on the Sessions proxy at `/sessions` (uploads and reads to one origin). |
+| `SESSIONS_UPLOAD_URL`, `SESSIONS_READ_URL` | `SESSIONS_URL` | Separate upload and read origins. |
+| `SESSIONS_HOSTS` | none | Comma-separated hosts whose requests are Sessions requests at the root path (a history origin pointed at relaygate). |
+| `SESSIONS_TOKEN` | none | Optional fallback Sessions credential for callers that send none; callers normally forward their own in `Authorization`, with their rg_ token in `X-Relaygate-Token`. |
 | `ANTHROPIC_API_KEY` | none | Needed only when `classifier.model.enabled` is true. |
 
 Health: `GET /healthz` (process up) and `GET /readyz` (policy loaded, database

@@ -5,6 +5,7 @@ import { classifierFromPolicy, type Classifier } from "./classifier.js";
 import { loadPolicyFile, type Policy } from "./policy.js";
 import { NodeSockets } from "./realtime.js";
 import { RelaycastUpstream } from "./relaycast.js";
+import { routeSessionsHosts } from "./sessions.js";
 import { SecretBox, Store } from "./store.js";
 
 const policyPath = process.env.RELAYGATE_POLICY;
@@ -58,21 +59,26 @@ if (process.env.RELAYCAST_URL) {
   }
   relaycast = new RelaycastUpstream({ url: process.env.RELAYCAST_URL, workspaceKey, box: new SecretBox(secret) }, store);
 }
-// The Sessions proxy is on when SESSIONS_URL is set; SESSIONS_TOKEN is an rth_st_ service token (rth:sync, rth:read).
-let sessions: { url: string; token: string } | undefined;
-if (process.env.SESSIONS_URL) {
-  if (!process.env.SESSIONS_TOKEN) {
-    console.error("SESSIONS_URL needs SESSIONS_TOKEN");
+// The Sessions proxy is on when SESSIONS_URL (or SESSIONS_UPLOAD_URL and SESSIONS_READ_URL) is set. relaygate
+// forwards each caller's own Sessions credential; SESSIONS_TOKEN is an optional fallback for callers that send none.
+let sessions: import("./sessions.js").SessionsConfig | undefined;
+const uploadUrl = process.env.SESSIONS_UPLOAD_URL || process.env.SESSIONS_URL;
+const readUrl = process.env.SESSIONS_READ_URL || process.env.SESSIONS_URL;
+if (uploadUrl || readUrl) {
+  if (!uploadUrl || !readUrl) {
+    console.error("set SESSIONS_URL, or both SESSIONS_UPLOAD_URL and SESSIONS_READ_URL");
     process.exit(1);
   }
-  sessions = { url: process.env.SESSIONS_URL, token: process.env.SESSIONS_TOKEN };
+  const hosts = (process.env.SESSIONS_HOSTS ?? "").split(",").map((h) => h.trim()).filter(Boolean);
+  sessions = { uploadUrl, readUrl, token: process.env.SESSIONS_TOKEN || undefined, hosts };
 }
 let sockets: NodeSockets | undefined;
 const deps = { store, policy: () => policy, classifier: () => classifier, adminToken, relaycast, sessions, onTokensRevoked: () => sockets?.revalidate() };
 const app = createApp(deps);
 
-const server = serve({ fetch: app.fetch, port }, (info) => {
-  console.log(JSON.stringify({ msg: "relaygate listening", port: info.port, model_classifier: policy.classifier.model.enabled, relaycast: !!relaycast, sessions: !!sessions }));
+const fetchFn = sessions?.hosts?.length ? routeSessionsHosts(app.fetch, sessions.hosts) : app.fetch;
+const server = serve({ fetch: fetchFn, port }, (info) => {
+  console.log(JSON.stringify({ msg: "relaygate listening", port: info.port, model_classifier: policy.classifier.model.enabled, relaycast: !!relaycast, sessions: !!sessions, sessions_hosts: sessions?.hosts ?? [] }));
 });
 if (relaycast) {
   sockets = new NodeSockets(deps, relaycast);
