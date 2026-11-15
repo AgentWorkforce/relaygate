@@ -139,6 +139,7 @@ export class Store {
     // Databases from build 1 predate these columns.
     this.addColumn("agents", "guest", "INTEGER NOT NULL DEFAULT 0");
     this.addColumn("streams", "acl", "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumn("audit", "policy_version", "TEXT");
   }
 
   private addColumn(table: string, column: string, decl: string): void {
@@ -315,12 +316,24 @@ export class Store {
       .run(s.id, s.owner, s.gid, s.mode, s.classify ? 1 : 0, JSON.stringify(s.acl), now());
   }
 
+  /** Version of the policy in force, recorded on every audit row (set by the app). */
+  policyVersion: () => string | null = () => null;
+
   audit(e: AuditEntry): void {
     this.db
       .prepare(
-        "INSERT INTO audit (at, agent_id, action, op, resource_kind, resource_id, decision, stage, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO audit (at, agent_id, action, op, resource_kind, resource_id, decision, stage, reason, policy_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(now(), e.agentId, e.action, e.op, e.resourceKind, e.resourceId, e.decision, e.stage, e.reason);
+      .run(now(), e.agentId, e.action, e.op, e.resourceKind, e.resourceId, e.decision, e.stage, e.reason, this.policyVersion());
+  }
+
+  /** Audit rows after `after` (a seq), oldest first, with the agent's name. Never contains message content. */
+  auditSince(after: number, limit: number, agentName?: string): Array<Record<string, unknown>> {
+    const where = agentName ? "AND g.name = ?" : "";
+    const params: Array<string | number> = [after, ...(agentName ? [agentName] : []), limit];
+    return this.db
+      .prepare(`SELECT a.*, g.name AS agent_name FROM audit a LEFT JOIN agents g ON g.id = a.agent_id WHERE a.seq > ? ${where} ORDER BY a.seq ASC LIMIT ?`)
+      .all(...params) as Array<Record<string, unknown>>;
   }
 
   recentAudit(limit = 100): Array<Record<string, unknown>> {

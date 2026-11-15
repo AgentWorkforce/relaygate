@@ -6,7 +6,7 @@ import { deny as proxyDeny, mountRelaycast, type RelaycastUpstream } from "./rel
 import { mountNodeToken } from "./realtime.js";
 import { mountSessions, type SessionsConfig } from "./sessions.js";
 import { explain, runCases, CaseSchema, QuerySchema } from "./explain.js";
-import { keyUsable, parsePolicy, type EnrollmentKey, type Policy } from "./policy.js";
+import { keyUsable, parsePolicy, policyVersion, type EnrollmentKey, type Policy } from "./policy.js";
 import { sameHash, sha256, type Agent, type Store } from "./store.js";
 
 export interface Deps {
@@ -192,12 +192,19 @@ export function createApp(deps: Deps) {
   const app = new Hono<Env>();
   const { store } = deps;
   const now = deps.now ?? Date.now;
+  store.policyVersion = () => {
+    try {
+      return policyVersion(deps.policy());
+    } catch {
+      return null;
+    }
+  };
 
   app.get("/healthz", (c) => c.json({ ok: true }));
   app.get("/readyz", (c) => {
     try {
       deps.policy();
-      return store.ping() ? c.json({ ok: true }) : c.json({ ok: false }, 503);
+      return store.ping() ? c.json({ ok: true, policy_version: policyVersion(deps.policy()) }) : c.json({ ok: false }, 503);
     } catch {
       return c.json({ ok: false }, 503);
     }
@@ -272,10 +279,27 @@ export function createApp(deps: Deps) {
     QuerySchema.extend({ policy: z.unknown().optional() }),
     z.object({ policy: z.unknown().optional(), cases: z.array(CaseSchema).min(1).max(1000) }),
   ]);
-  app.post("/admin/v1/explain", async (c) => {
+  const adminRefusal = (c: Context) => {
     const token = bearer(c);
     if (!deps.adminToken) return deny(c, 404, "relaygate_not_found");
     if (!token || !sameHash(sha256(token), sha256(deps.adminToken))) return deny(c, 401, "relaygate_unauthenticated");
+    return undefined;
+  };
+
+  // The audit log, for operators and acceptance evidence. Rows never contain message content.
+  app.get("/admin/v1/audit", (c) => {
+    const refused = adminRefusal(c);
+    if (refused) return refused;
+    const after = Number(c.req.query("after") ?? 0);
+    const limit = Math.min(Math.max(Number(c.req.query("limit") ?? 200), 1), 1000);
+    if (!Number.isInteger(after) || after < 0 || !Number.isInteger(limit)) return deny(c, 400, "relaygate_bad_request");
+    const rows = store.auditSince(after, limit, c.req.query("agent") || undefined);
+    return c.json({ policy_version: policyVersion(deps.policy()), rows });
+  });
+
+  app.post("/admin/v1/explain", async (c) => {
+    const refused = adminRefusal(c);
+    if (refused) return refused;
     const parsed = ExplainBody.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return deny(c, 400, "relaygate_bad_request", { detail: parsed.error.issues[0]?.message });
     let policy: Policy;

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 
@@ -127,6 +128,18 @@ export function parsePolicy(raw: unknown): Policy {
   }
   for (const rule of policy.classifier.rules) new RegExp(rule.pattern, rule.flags);
   return policy;
+}
+
+const versions = new WeakMap<Policy, string>();
+
+/** A short, stable id for a parsed policy: the first 12 hex digits of the sha256 of its canonical JSON. */
+export function policyVersion(policy: Policy): string {
+  let v = versions.get(policy);
+  if (!v) {
+    v = createHash("sha256").update(JSON.stringify(policy)).digest("hex").slice(0, 12);
+    versions.set(policy, v);
+  }
+  return v;
 }
 
 export type EnrollmentKey = Policy["enrollmentKeys"][number];
