@@ -537,17 +537,21 @@ async function main() {
     ];
     const notes: string[] = [];
     let bypassed = false;
+    let inconclusive = false;
     if (!cred) notes.push("no outside read credential (set OUTSIDE_SESSIONS_READ or SESSIONS_READ_REFRESH_CMD)");
     for (const [label, path] of cred ? probes : []) {
       const r = await request(process.env.DIRECT_SESSIONS_READ_URL, "GET", path, cred);
       const leaks = ok(r.status) && JSON.stringify(r.body ?? "").includes(docSession(RUN));
+      // Only a refusal proves the door is shut. A 2xx without the session, or a 5xx, proves nothing either way.
+      const refused = r.status === 0 || r.status === 401 || r.status === 403 || r.status === 404;
       bypassed ||= leaks;
-      notes.push(`${label} direct: ${r.status === 0 ? "no connection" : r.status}${leaks ? " — INSIDE SESSION READABLE WITHOUT relaygate" : ""}`);
+      inconclusive ||= !refused && !leaks;
+      notes.push(`${label} direct: ${r.status === 0 ? "no connection" : r.status}${leaks ? " — INSIDE SESSION READABLE WITHOUT relaygate" : refused ? " (refused)" : " (inconclusive: not a refusal)"}`);
     }
     record(
       14,
       "bypass: the outside user's own Sessions credential straight at Sessions (around relaygate) is refused",
-      cred && !bypassed ? "PASS" : "FAIL",
+      cred && !bypassed && !inconclusive ? "PASS" : "FAIL",
       [...notes, ...(bypassed ? ["Sessions must accept traffic only from relaygate (NetworkPolicy, and the public history host routed to relaygate)."] : [])],
     );
   } else record(14, "bypass: own Sessions credential straight at Sessions", "SKIP", ["set DIRECT_SESSIONS_READ_URL to the Sessions read origin as reachable without relaygate"]);
