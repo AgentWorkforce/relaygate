@@ -89,7 +89,8 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
     return r;
   };
   const attempt = async (what: string, method: string, path: string, body?: unknown) => report(what, await gate.call(method, path, body));
-  const sessionAttempt = async (what: string, id: string, text: string) => report(what, await gate.sessionWrite(id, text));
+  const sessionAttempt = async (what: string, id: string, reply: string, title = `Acceptance ${cmd.run}: ${what}`, prompt = `Acceptance run ${cmd.run} (${what})`) =>
+    report(what, await gate.sessionWrite(id, { title, prompt, reply }));
 
   switch (cmd.acc) {
     case "seed": {
@@ -97,7 +98,13 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
       const ch = docChannel(cmd.run, opts.docChannelPrefix);
       await attempt("seed.channel.create", "POST", "/v1/channels", { name: ch, topic: "acceptance test document" });
       await attempt("seed.channel.post", "POST", `/v1/channels/${ch}/messages`, { text: doc });
-      const seeded = (await sessionAttempt("seed.session", docSession(cmd.run), doc)) as { status: number };
+      const seeded = (await sessionAttempt(
+        "seed.session",
+        docSession(cmd.run),
+        doc,
+        `Acceptance ${cmd.run}: discharge planning summary (synthetic)`,
+        `Prepare the discharge planning summary for the acceptance test, run ${cmd.run}. Synthetic data only.`,
+      )) as { status: number };
       if (seeded.status >= 200 && seeded.status < 300) {
         // Read it back from inside: the document really is stored (logged as a boolean, never the content).
         freshRead();

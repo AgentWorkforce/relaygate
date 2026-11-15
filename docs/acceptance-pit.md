@@ -145,6 +145,12 @@ set `ACCEPTANCE_INGEST_WAIT_MS=360000` there (and on the inside agents); the
 driver and the inside agents poll a session until the content they wrote
 appears.
 
+Uploads look like real Claude Code sessions (a `session` record with a title
+and first prompt, then a user and an assistant event), so in the dashboard each
+test session has a title, a brief and readable events. The read API's `/turns`
+view stays empty for them: turns come only from the private turns route, which
+the public delivery protocol can't write.
+
 **Scenario 14 (bypass).** relaygate forwards each caller's own Sessions
 credential, so a member who holds one can try Sessions directly. Set
 `DIRECT_SESSIONS_READ_URL` to the Sessions read origin as reachable without

@@ -36,10 +36,48 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-/** One native delivery batch with a single session_event record (relayhistory-delivery-v1). */
-export function nativeBatch(native: { orgId: string; workspaceId: string }, sessionId: string, text: string) {
+/** What a session upload looks like to a person: the title, the user's prompt, and the assistant's reply. */
+export interface Transcript {
+  title: string;
+  prompt: string;
+  reply: string;
+  /** Adding to someone else's session: events only, never the session record (its title stays the owner's). */
+  append?: boolean;
+}
+
+/** Ingest nulls any number that passes the Luhn check (it could be a card number); keep timestamps clear of it. */
+function notLuhn(ms: number): number {
+  const luhn = (n: number) => {
+    const d = String(n).split("").reverse().map(Number);
+    return d.reduce((sum, x, i) => sum + (i % 2 ? (x * 2 > 9 ? x * 2 - 9 : x * 2) : x), 0) % 10 === 0;
+  };
+  while (luhn(ms)) ms += 1;
+  return ms;
+}
+
+/**
+ * One native delivery batch (relayhistory-delivery-v1) shaped like a real Claude Code session: a `session` record
+ * with its title and first prompt, then a user and an assistant `session_event`. The role on each event is what
+ * makes them messages, so the session gets a brief (title, summary) and readable events.
+ */
+export function nativeBatch(native: { orgId: string; workspaceId: string }, sessionId: string, t: Transcript) {
   const origin = "relaygate-acceptance";
   const id = `acc-${randomBytes(8).toString("hex")}`;
+  const revision = Date.now();
+  const t0 = notLuhn(Date.now());
+  const t1 = notLuhn(t0 + 1000);
+  const record = (recordId: string, kind: string, payload: Record<string, unknown>) => ({
+    schema_version: 1,
+    origin_id: origin,
+    record_id: recordId,
+    revision_id: `${recordId}:${revision}`,
+    revision,
+    kind,
+    source: "claude",
+    session_id: sessionId,
+    operation: "upsert",
+    payload,
+  });
   return {
     protocolVersion: 1,
     batch: {
@@ -53,18 +91,16 @@ export function nativeBatch(native: { orgId: string; workspaceId: string }, sess
       account_id: "relayhistory:" + createHash("sha256").update(canonicalJson([native.orgId, native.workspaceId])).digest("hex"),
       mapping_version: "relayhistory-delivery-v1",
       records: [
-        {
-          schema_version: 1,
-          origin_id: origin,
-          record_id: id,
-          revision_id: `${id}:r1`,
-          revision: 1,
-          kind: "session_event",
-          source: "claude",
-          session_id: sessionId,
-          operation: "upsert",
-          payload: { text, ts_ms: Date.now() },
-        },
+        ...(t.append ? [] : [record(`session:${sessionId}`, "session", {
+          title: t.title,
+          cwd: "/acceptance",
+          first_prompt: t.prompt,
+          first_activity_ms: t0,
+          last_activity_ms: t1,
+          models_json: JSON.stringify(["claude-opus-5-5"]),
+        })]),
+        record(`${id}:u`, "session_event", { role: "user", text: t.prompt, ts_ms: t0, message_id: `${id}-u` }),
+        record(`${id}:a`, "session_event", { role: "assistant", text: t.reply, ts_ms: t1, model: "claude-opus-5-5", message_id: `${id}-a` }),
       ],
     },
   };
@@ -84,11 +120,16 @@ export class Gate {
   }
 
   /** Writes `text` into a session, in whichever upload protocol the deployment's Sessions speaks. */
-  async sessionWrite(sessionId: string, text: string): Promise<Res> {
+  async sessionWrite(sessionId: string, t: Transcript): Promise<Res> {
     const once = () =>
       this.sessions.native
-        ? this.call("POST", "/sessions/v1/delivery/batches", nativeBatch(this.sessions.native, sessionId, text))
-        : this.call("POST", `/sessions/v1/sessions/${sessionId}/turns`, { turns: [{ turnIndex: Date.now() % 100000, role: "assistant", content: text, ts: new Date().toISOString() }] });
+        ? this.call("POST", "/sessions/v1/delivery/batches", nativeBatch(this.sessions.native, sessionId, t))
+        : this.call("POST", `/sessions/v1/sessions/${sessionId}/turns`, {
+            turns: [
+              { turnIndex: Date.now() % 100000, role: "user", content: t.prompt, ts: new Date().toISOString() },
+              { turnIndex: (Date.now() % 100000) + 1, role: "assistant", content: t.reply, ts: new Date().toISOString() },
+            ],
+          });
     // A dropped connection is retried once; a duplicate test record is harmless.
     const r = await once();
     return r.status === 0 ? once() : r;

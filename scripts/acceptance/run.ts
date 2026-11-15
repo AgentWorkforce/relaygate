@@ -179,7 +179,11 @@ async function main() {
   await localA.call("POST", "/v1/channels", { name: localChannel, topic: "acceptance outside channel" });
   await localA.call("POST", `/v1/channels/${localChannel}/join`, {});
   const marker = `outside work log ${RUN}`;
-  const up = await localA.sessionWrite(localSession, marker);
+  const up = await localA.sessionWrite(localSession, {
+    title: `Acceptance ${RUN}: outside work log`,
+    prompt: `Log today's work for the acceptance test, run ${RUN}.`,
+    reply: marker,
+  });
   let head = await auditHead();
   const start = head;
   const targets = (to: Gate) => ({ to: to.name, channel: localChannel, session: up.status === 404 ? undefined : localSession });
@@ -348,7 +352,12 @@ async function main() {
   refreshReads();
   // --- 7. outside appends to an inside session: accepted, classified, not readable back ---------------------
   {
-    const app = await localA.sessionWrite(docSession(RUN), `outside context for ${RUN}`);
+    const app = await localA.sessionWrite(docSession(RUN), {
+      title: `Acceptance ${RUN}: outside context`,
+      prompt: `Context from outside for run ${RUN}.`,
+      reply: `outside context for ${RUN}`,
+      append: true,
+    });
     const back = await localA.call("GET", `/sessions/v1/sessions/${docSession(RUN)}/events`);
     const rows = (await audit(head, localA.name)).filter((r) => r.resource_id === docSession(RUN));
     const write = rows.find((r) => r.action === "session.write");
