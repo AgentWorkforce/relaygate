@@ -282,6 +282,14 @@ describe("Sessions proxy: the caller's own credential", () => {
     }
   });
 
+  it("labels rewritten bodies as JSON and caps request bodies before buffering them", async () => {
+    const w = await world();
+    await w.call("POST", "/sessions/v1/sessions/s-local/turns", w.local, JSON.stringify({ turns: [{ turnIndex: 1, content: "x" }] }), { "content-type": "text/plain" });
+    expect(w.calls.at(-1)!.headers.get("content-type")).toBe("application/json");
+    const big = Buffer.alloc(5 * 1024 * 1024, 32);
+    expect((await w.call("POST", "/sessions/v1/delivery/batches", w.local, big, { "content-length": String(big.length) })).status).toBe(413);
+  });
+
   it("refuses records it can't place in a session, and classifies record payloads", async () => {
     const w = await world(policy([], [], ["s-local"]));
     expect((await w.call("POST", "/sessions/v1/delivery/batches", w.local, JSON.stringify(batch([rec(null)])))).status).toBe(400);

@@ -1,5 +1,6 @@
 import { gunzipSync, zstdDecompressSync } from "node:zlib";
 import type { Context, Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { decideResource, type Deps, type Env, type ResolvedResource } from "./app.js";
 import { check, type AclEntry, type Op } from "./mode.js";
 import type { Policy } from "./policy.js";
@@ -93,13 +94,18 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     text: string;
   }
 
-  const upstream = async (c: Ctx, base: string, method: string, path: string, body?: BodyInit): Promise<Upstream | Response> => {
+  const upstream = async (c: Ctx, base: string, method: string, path: string, body?: BodyInit, contentType?: string): Promise<Upstream | Response> => {
     const auth = credential(c);
     if (!auth) return deny(c, 401, "relaygate_unauthenticated", { detail: "send your Sessions credential in Authorization and your rg_ token in X-Relaygate-Token" });
     const headers: Record<string, string> = { authorization: auth };
     for (const h of PASS_REQUEST) {
       const v = c.req.header(h);
       if (v) headers[h] = v;
+    }
+    // A body relaygate rewrote is JSON it serialised itself, whatever the client labelled the original.
+    if (contentType) {
+      headers["content-type"] = contentType;
+      delete headers["content-encoding"];
     }
     try {
       const res = await doFetch(new URL(path.replace(/^\//, ""), slash(base)), { method, headers, body });
@@ -189,7 +195,14 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
    * session that a concurrent upload filled to another group. A failed first upload leaves the session with the
    * agent that will retry it (session ids are chosen by the uploader).
    */
-  const upload = async (c: Ctx, path: string, body: unknown) => pass(await upstream(c, cfg.uploadUrl, "POST", path, JSON.stringify(body)));
+  const upload = async (c: Ctx, path: string, body: unknown) =>
+    pass(await upstream(c, cfg.uploadUrl, "POST", path, JSON.stringify(body), "application/json"));
+
+  // No request body is buffered past the cap (Sessions' own limit is 2 MiB).
+  app.use(
+    "/sessions/*",
+    bodyLimit({ maxSize: MAX_UPLOAD, onError: (c) => deny(c, 413, "relaygate_bad_request", { detail: "request body too large" }) }),
+  );
 
   const gateRead = (c: Ctx, id: string) => {
     const ok = SESSION_ID.test(id) && canRead(c, id);
@@ -268,7 +281,6 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   // name its session, every session must be writable, and the original bytes are forwarded unchanged.
   app.post("/sessions/v1/delivery/batches", async (c) => {
     const raw = Buffer.from(await c.req.arrayBuffer());
-    if (raw.length > MAX_UPLOAD) return deny(c, 413, "relaygate_bad_request", { detail: "batch too large" });
     let decoded: Buffer;
     try {
       const enc = (c.req.header("content-encoding") ?? "identity").toLowerCase();
