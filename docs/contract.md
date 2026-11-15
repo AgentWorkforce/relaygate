@@ -45,9 +45,15 @@ group owns.
 
 - A **principal** is an agent, or a component such as a bridge acting for the
   humans behind it.
-- A **group** is a number (`gid`). Every principal is in exactly one group.
-- A principal's group is set when it registers and does not change. Moving an
-  agent to another group means registering a new agent.
+- A **group** is a number (`gid`). Every principal has one **primary group**,
+  set when it registers, and may have **supplementary groups** (like Unix
+  supplementary groups). Both come from the enrollment key it registered with,
+  so the operator controls them.
+- Supplementary groups express tiers of trust. A trusted developer can be in
+  `dev` and `dev-trusted`; a work-trial developer only in `dev-trial`.
+- The primary group never changes. Supplementary groups follow the current
+  policy for the agent's enrollment key, so the operator can widen or narrow
+  them without re-registering agents.
 
 Example deployment with two groups:
 
@@ -119,12 +125,13 @@ or appends never change them, whoever sends them.
 For a principal `p` doing `op` (`r` or `w`) on resource `x`:
 
 1. If `p` is `x.owner`, use the owner digit.
-2. Else if `p.gid == x.gid`, use the group digit.
+2. Else if `x.gid` is `p`'s primary group or one of its supplementary groups,
+   use the group digit.
 3. Else use the other digit.
 
 The request is allowed only if that digit contains the bit for `op`. The check
-uses nothing but `p.gid`, `x.owner`, `x.gid` and `x.mode`, so the same request
-always gets the same answer.
+uses nothing but `p`'s groups, `x.owner`, `x.gid` and `x.mode`, so the same
+request always gets the same answer.
 
 A refused request is answered by relaygate with `403` and
 `{"error":"relaygate_denied","op":"w","resource":"<id>"}`. It is never
@@ -251,6 +258,18 @@ stream even with REST filtered.
 When a token is revoked (re-registration, or an admin), relaygate closes every
 WebSocket opened with it.
 
+### The sender's groups travel with the message
+
+Every message relaygate forwards carries the sender's verified groups, so the
+recipient knows who is asking and with what scope:
+
+```
+"data": {"relaygate": {"agent": "<name>", "groups": ["dev", "dev-trusted"]}}
+```
+
+relaygate removes any `relaygate` field the client sent, so it can't be forged.
+`GET /v1/whoami` returns the same card for the caller.
+
 ## Reads and lists
 
 A list or search returns only resources the caller may read. relaygate applies
@@ -338,5 +357,8 @@ content.
 - Local agents writing into pit sessions (`662` or `660`).
 - The Sessions API filter parameter for lists and search.
 - The default classifier and its latency budget.
-- Whether a principal ever needs more than one group.
+- Whether tool calls (Relaycast actions) need to be their own guarded
+  resource, beyond streams and sessions.
+- An "explain" check for operators ("may X do op on Y, and why"), so a policy
+  an agent drafted can be tested before it is applied.
 - What, if anything, the `1` bit means.
