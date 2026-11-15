@@ -20,6 +20,7 @@ const MESSAGES: Record<string, string> = {
   relaygate_bad_request: "relaygate could not read this request",
   relaygate_route_not_proxied: "this Relaycast route is not available through relaygate",
   relaygate_not_found: "not found",
+  relaygate_conflict: "a concurrent request changed this; retry",
 };
 
 /** Errors on proxied routes use Relaycast's shape, so SDK clients surface relaygate's code and message. */

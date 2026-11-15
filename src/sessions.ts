@@ -33,7 +33,7 @@ export function resolveSession(id: string, row: { owner: string; gid: number }, 
     kind: "session",
     id,
     owner: row.owner,
-    gid: override?.gid ?? row.gid,
+    gid: row.gid,
     mode: override?.mode ?? def?.mode ?? "600",
     acl,
     source: override ? "session-override" : def ? "session-default" : "session-600",
@@ -101,26 +101,30 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   };
 
   /**
-   * Decides every session a request writes, and only when all are allowed claims the new ones, so a refused request
-   * never makes anyone an owner. A lost race to another first uploader is decided again against the real owner.
+   * Decides every session a request writes, then claims the new ones in one transaction. If another uploader got
+   * one of them first (while the classifier ran), nothing is claimed and the whole request is decided again against
+   * the real owners. Returns the ids this request claimed, so a failed upload can release them.
    */
-  const gateWrites = async (c: Ctx, writes: Map<string, string>): Promise<Response | undefined> => {
-    const fresh: Array<[string, string]> = [];
+  const gateWrites = async (c: Ctx, writes: Map<string, string>, attempt = 0): Promise<Response | string[]> => {
+    const fresh: string[] = [];
     for (const [id, content] of writes) {
       const isNew = !store.session(id);
       const refused = refusal(c, id, await decideWrite(c, id, content));
       if (refused) return refused;
-      if (isNew) fresh.push([id, content]);
+      if (isNew) fresh.push(id);
     }
-    const agent = c.get("agent");
-    for (const [id, content] of fresh) {
-      const claimed = store.claimSession(id, agent.id, c.get("principal").gid);
-      if (claimed.owner !== agent.id) {
-        const refused = refusal(c, id, await decideWrite(c, id, content, claimed));
-        if (refused) return refused;
-      }
-    }
-    return undefined;
+    if (fresh.length === 0) return [];
+    const result = store.claimSessions(fresh, c.get("agent").id, c.get("principal").gid);
+    if (result.claimed) return fresh;
+    if (attempt > 0) return deny(c, 409, "relaygate_conflict", { detail: "sessions were claimed concurrently; retry" });
+    return gateWrites(c, writes, attempt + 1);
+  };
+
+  /** Forwards an upload; if upstream didn't accept it, the sessions this request claimed are released. */
+  const upload = async (c: Ctx, claimed: string[], path: string, body: unknown) => {
+    const res = await upstream(c, "POST", path, body);
+    if (res.status < 200 || res.status >= 300) store.releaseSessions(claimed, c.get("agent").id);
+    return pass(c, res);
   };
 
   const gateRead = (c: Ctx, id: string) => {
@@ -137,28 +141,35 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     if (!body || !Array.isArray(body.turns)) return deny(c, 400, "relaygate_bad_request", { detail: "turns[] required" });
     const name = c.get("agent").name;
     const turns: Array<Record<string, unknown>> = (body.turns as Array<Record<string, unknown>>).map((t) => ({ ...t, sessionOwner: name }));
-    const content = turns.map((t) => (typeof t.content === "string" ? t.content : JSON.stringify(t.content ?? ""))).join("\n");
-    const refused = await gateWrites(c, new Map([[id, content]]));
-    if (refused) return refused;
-    return pass(c, await upstream(c, "POST", `/v1/sessions/${encodeURIComponent(id)}/turns`, { ...body, sessionOwner: name, turns }));
+    // The classifier sees every field that is forwarded, not only `content`.
+    const content = turns.map((t) => JSON.stringify(t)).join("\n");
+    const gate = await gateWrites(c, new Map([[id, content]]));
+    if (gate instanceof Response) return gate;
+    return upload(c, gate, `/v1/sessions/${encodeURIComponent(id)}/turns`, { ...body, sessionOwner: name, turns });
   });
 
   // Batch upload. Every session a batch touches must be writable, or nothing is forwarded.
   app.post("/sessions/v1/ingest", async (c) => {
     const body = (await c.req.json().catch(() => null)) as { records?: unknown } | null;
     if (!body || !Array.isArray(body.records)) return deny(c, 400, "relaygate_bad_request", { detail: "records[] required" });
-    const records = body.records as Array<Record<string, unknown>>;
+    const name = c.get("agent").name;
+    // Attribution relaygate vouches for: a tag naming the agent (client-sent relaygate: tags are dropped), and the
+    // agent as sessionOwner wherever a record names one.
+    const records: Array<Record<string, unknown>> = (body.records as Array<Record<string, unknown>>).map((r) => {
+      const tags = Array.isArray(r.tags) ? r.tags.filter((t) => typeof t === "string" && !t.startsWith("relaygate:")) : [];
+      return { ...r, tags: [...tags, `relaygate:agent:${name}`], ...("sessionOwner" in r ? { sessionOwner: name } : {}) };
+    });
     const bySession = new Map<string, string[]>();
     for (const r of records) {
       const id = r.sessionId;
       if (typeof id !== "string" || !SESSION_ID.test(id)) return deny(c, 400, "relaygate_bad_request", { detail: "every record needs a valid sessionId" });
       const parts = bySession.get(id) ?? [];
-      if (typeof r.content === "string") parts.push(r.content);
+      parts.push(JSON.stringify(r));
       bySession.set(id, parts);
     }
-    const refused = await gateWrites(c, new Map([...bySession].map(([id, parts]) => [id, parts.join("\n")])));
-    if (refused) return refused;
-    return pass(c, await upstream(c, "POST", "/v1/ingest", body));
+    const gate = await gateWrites(c, new Map([...bySession].map(([id, parts]) => [id, parts.join("\n")])));
+    if (gate instanceof Response) return gate;
+    return upload(c, gate, "/v1/ingest", { ...body, records });
   });
 
   // List and search: only sessions the caller may read. Filtering after the fact means a page can come back short.

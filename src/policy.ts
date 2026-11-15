@@ -62,10 +62,11 @@ export const PolicySchema = z.object({
     .default([]),
   /** Mode and ACL for sessions, by the owning (first uploader's) group. A group without an entry gets 600. */
   sessionDefaults: z.array(z.object({ gid: Gid, mode: Mode, acl: AclSchema })).default([]),
-  /** Per-session changes, e.g. sharing one session with a guest: `{"id": "...", "acl": [{"gid": 44, "perm": "r"}]}`. */
-  sessionOverrides: z
-    .array(z.object({ id: z.string().min(1), gid: Gid.optional(), mode: Mode.optional(), acl: AclSchema }))
-    .default([]),
+  /**
+   * Per-session changes, e.g. sharing one session with a guest: `{"id": "...", "acl": [{"gid": 44, "perm": "r"}]}`.
+   * An override can't move a session to another group: its owning group is what ceilings are checked against.
+   */
+  sessionOverrides: z.array(z.object({ id: z.string().min(1), mode: Mode.optional(), acl: AclSchema }).strict()).default([]),
   /** Per group, the groups whose resources it may never touch, whatever the mode or ACL says. */
   ceilings: z.array(z.object({ gid: Gid, never: z.array(Gid).min(1) })).default([]),
   classifier: z
@@ -107,7 +108,7 @@ export function parsePolicy(raw: unknown): Policy {
     ),
     ...policy.sessionDefaults.flatMap((d) => [d.gid, ...d.acl.map((e) => e.gid)].map((gid) => ({ where: `session default for ${d.gid}`, gid }))),
     ...policy.sessionOverrides.flatMap((o) =>
-      [...(o.gid === undefined ? [] : [o.gid]), ...o.acl.map((e) => e.gid)].map((gid) => ({ where: `session override ${o.id}`, gid })),
+      o.acl.map((e) => ({ where: `session override ${o.id}`, gid: e.gid })),
     ),
     ...policy.ceilings.flatMap((c) => [c.gid, ...c.never].map((gid) => ({ where: `ceiling for ${c.gid}`, gid }))),
   ].filter((r) => !gids.has(r.gid));

@@ -224,10 +224,35 @@ export class Store {
     return row ? { id: String(row.id), owner: String(row.owner), gid: Number(row.gid) } : undefined;
   }
 
-  /** Records the first uploader as the session's owner; later calls never change it. Returns the stored row. */
-  claimSession(id: string, owner: string, gid: number): { id: string; owner: string; gid: number } {
-    this.db.prepare("INSERT OR IGNORE INTO sessions (id, owner, gid, created_at) VALUES (?, ?, ?, ?)").run(id, owner, gid, now());
-    return this.session(id)!;
+  /**
+   * Claims every id for `owner` in one transaction, or none: if any is already owned by someone else, nothing is
+   * written and the ids that were taken are returned.
+   */
+  claimSessions(ids: string[], owner: string, gid: number): { claimed: boolean; taken: string[] } {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const taken = ids.filter((id) => {
+        const row = this.session(id);
+        return row !== undefined && row.owner !== owner;
+      });
+      if (taken.length > 0) {
+        this.db.exec("ROLLBACK");
+        return { claimed: false, taken };
+      }
+      const insert = this.db.prepare("INSERT OR IGNORE INTO sessions (id, owner, gid, created_at) VALUES (?, ?, ?, ?)");
+      for (const id of ids) insert.run(id, owner, gid, now());
+      this.db.exec("COMMIT");
+      return { claimed: true, taken: [] };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /** Releases claims this owner made for an upload that upstream didn't accept. */
+  releaseSessions(ids: string[], owner: string): void {
+    const del = this.db.prepare("DELETE FROM sessions WHERE id = ? AND owner = ?");
+    for (const id of ids) del.run(id, owner);
   }
 
   upstreamAgent(agentId: string): { upstreamId: string; tokenSealed: string } | undefined {

@@ -8,7 +8,7 @@ import { sha256, Store } from "../src/store.js";
 const KEYS = { local: "enroll-local-0000000000000000", pit: "enroll-pit-00000000000000000000", guest: "enroll-guest-0000000000000000000" };
 const SERVICE = "rth_st_service";
 
-function policy(shared: string[] = [], mistaken: string[] = []) {
+function policy(shared: string[] = [], mistaken: string[] = [], writable: string[] = []) {
   return parsePolicy({
     groups: [
       { gid: 11, name: "local" },
@@ -27,6 +27,7 @@ function policy(shared: string[] = [], mistaken: string[] = []) {
     sessionOverrides: [
       ...shared.map((id) => ({ id, acl: [{ gid: 44, perm: "r" }] })),
       ...mistaken.map((id) => ({ id, mode: "666", acl: [{ gid: 44, perm: "rw" }] })),
+      ...writable.map((id) => ({ id, acl: [{ gid: 44, perm: "rw" }] })),
     ],
     ceilings: [{ gid: 44, never: [22] }],
     classifier: { rules: [{ id: "ssn", pattern: "\\b\\d{3}-\\d{2}-\\d{4}\\b" }] },
@@ -41,7 +42,7 @@ function harness(pol = policy()) {
     calls.push({ method: c.req.method, path: c.req.path + new URL(c.req.url).search, auth: c.req.header("authorization") ?? "", body });
     await next();
   });
-  upstream.post("/v1/sessions/:id/turns", (c) => c.json({ accepted: 1 }));
+  upstream.post("/v1/sessions/:id/turns", (c) => (c.req.param("id") === "s-fail" ? c.json({ error: { code: "bad_request" } }, 400) : c.json({ accepted: 1 })));
   upstream.post("/v1/ingest", (c) => c.json({ received: 1 }));
   upstream.get("/v1/sessions", (c) => c.json({ sessions: [{ sessionId: "s-local" }, { sessionId: "s-pit" }, { sessionId: "s-elsewhere" }], nextCursor: "c2" }));
   upstream.get("/v1/sessions/:id/events", (c) => c.json({ events: [{ sessionId: c.req.param("id") }] }));
@@ -156,3 +157,48 @@ describe("Sessions proxy: reads", () => {
     expect((await w.call("GET", "/sessions/v1/sessions", "rg_nope")).status).toBe(401);
   });
 });
+
+describe("Sessions proxy: review regressions", () => {
+  it("a failed first upload leaves no owner behind", async () => {
+    const w = await world();
+    expect((await w.turns(w.local, "s-fail")).status).toBe(400);
+    expect(w.store.session("s-fail")).toBeUndefined();
+  });
+
+  it("claims are all or nothing", () => {
+    const store = new Store(":memory:");
+    const a = store.createAgent("local-a", 11, "local", undefined);
+    const b = store.createAgent("pit-a", 22, "pit", undefined);
+    expect(store.claimSessions(["beta"], b.id, 22).claimed).toBe(true);
+    expect(store.claimSessions(["alpha", "beta"], a.id, 11)).toEqual({ claimed: false, taken: ["beta"] });
+    expect(store.session("alpha")).toBeUndefined();
+  });
+
+  it("a session override can't move a session to another group", () => {
+    expect(() => policy()).not.toThrow();
+    expect(() =>
+      parsePolicy({ ...policy(), sessionOverrides: [{ id: "s-pit", gid: 11, acl: [{ gid: 44, perm: "r" }] }] }),
+    ).toThrow();
+  });
+
+  it("the classifier sees every forwarded field, not only content", async () => {
+    const w = await world(policy([], [], ["s-local"]));
+    const res = await w.call("POST", "/sessions/v1/sessions/s-local/turns", w.guest, {
+      turns: [{ turnIndex: 1, role: "assistant", content: "harmless", metadata: { note: "ssn 123-45-6789" } }],
+    });
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe("relaygate_classified");
+  });
+
+  it("ingest records carry relaygate's attribution, not the client's", async () => {
+    const w = await world();
+    await w.call("POST", "/sessions/v1/ingest", w.local, {
+      machine: {},
+      batchId: "b1",
+      records: [{ v: 1, kind: "turn", source: "cli", sessionId: "s-local", sessionOwner: "pit-a", tags: ["x", "relaygate:agent:pit-a"] }],
+    });
+    const sent = w.calls.at(-1)!.body as any;
+    expect(sent.records[0]).toMatchObject({ sessionOwner: "local-a", tags: ["x", "relaygate:agent:local-a"] });
+  });
+});
+
