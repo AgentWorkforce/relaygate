@@ -16,7 +16,8 @@ what.
 - **Then a classifier.** Messages that cross a group boundary are checked for
   attempts to pull out information they shouldn't.
 
-The contract is in [docs/contract.md](docs/contract.md).
+The contract is in [docs/contract.md](docs/contract.md). Running relaygate as the only way in (gate-only):
+[docs/gate-only.md](docs/gate-only.md).
 
 ## Running it
 
