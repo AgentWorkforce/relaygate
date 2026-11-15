@@ -455,6 +455,10 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
     const id = inboxStream(to);
     const refused = await gateWrite(c, "dm.send", id, writeContent(body));
     if (refused) return refused;
+    // A relaygate agent registered before eager enrollment (or whose enrollment was deferred) may not exist upstream
+    // yet; create it so the DM has somewhere to go.
+    const recipient = store.agentByName(to);
+    if (recipient && !store.upstreamAgent(recipient.id)) await upstream.agentToken(recipient).catch(() => undefined);
     const card = provenance(c.get("agent"), c.get("principal"), deps.policy());
     return pass(c, await forward(c, "POST", "/v1/dm", stampProvenance({ ...body, to }, card)));
   });

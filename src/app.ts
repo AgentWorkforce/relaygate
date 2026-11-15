@@ -203,6 +203,17 @@ export function createApp(deps: Deps) {
     }
   });
 
+  // An agent exists in Relaycast from the moment it registers, so others can DM it and see it before it makes a
+  // call of its own. Best effort: a failure here is retried lazily on the agent's first proxied request.
+  const enrollUpstream = async (agent: Agent) => {
+    if (!deps.relaycast) return;
+    try {
+      await deps.relaycast.agentToken(agent);
+    } catch (error) {
+      console.error(JSON.stringify({ msg: "upstream registration deferred", agent: agent.name, error: (error as Error).message }));
+    }
+  };
+
   app.post("/v1/register", async (c) => {
     const key = bearer(c);
     const policy = deps.policy();
@@ -245,12 +256,14 @@ export function createApp(deps: Deps) {
       if (existing.keyId !== enrollment.id) store.setAgentKey(existing.id, enrollment.id, enrollment.guest);
       const token = store.issueToken(existing.id);
       store.audit({ agentId: existing.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: "recovered" });
+      await enrollUpstream(existing);
       return c.json({ agent_id: existing.id, gid: existing.gid, token });
     }
 
     const agent = store.createAgent(name, enrollment.gid, enrollment.id, recovery, enrollment.guest);
     const token = store.issueToken(agent.id);
     store.audit({ agentId: agent.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: `key:${enrollment.id}` });
+    await enrollUpstream(agent);
     return c.json({ agent_id: agent.id, gid: agent.gid, token });
   });
 

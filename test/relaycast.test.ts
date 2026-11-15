@@ -122,6 +122,7 @@ function fakeRelaycast() {
   app.post("/v1/dm", async (c) => {
     const body = await c.req.json();
     const from = who(c.req.header("authorization")!)!;
+    if (!agents.has(body.to)) return c.json({ ok: false, error: { code: "agent_not_found", message: `Agent "${body.to}" not found` } }, 404);
     const m = { id: `m${++seq}`, channel_id: `dmch_${pairOf(from, body.to)}`, agent_name: from, text: body.text, metadata: body.data };
     messages.push(m);
     return c.json({ ok: true, data: { conversation_id: `dm_${pairOf(from, body.to)}`, message: m } }, 201);
@@ -230,6 +231,25 @@ describe("Relaycast proxy: identity and provenance", () => {
 });
 
 describe("Relaycast proxy: review regressions", () => {
+  it("an agent exists upstream from registration, so others can list and DM it before it calls anything", async () => {
+    const h = harness();
+    const local = await h.token(KEYS.local, "local-a");
+    await h.token(KEYS.pit, "pit-a");
+    expect(h.up.agents.has("pit-a")).toBe(true);
+    expect((await h.call("GET", "/v1/agents", local)).body.data.map((a: any) => a.name)).toContain("pit-a");
+  });
+
+  it("a DM to a relaygate agent not yet upstream enrolls it first", async () => {
+    const h = harness();
+    const local = await h.token(KEYS.local, "local-a");
+    await h.token(KEYS.pit, "pit-a");
+    h.up.agents.delete("pit-a");
+    // A pre-fix agent: not upstream, no stored credential.
+    (h.store as any).db.prepare("DELETE FROM upstream_agents WHERE agent_id = ?").run(h.store.agentByName("pit-a")!.id);
+    expect((await h.call("POST", "/v1/dm", local, { to: "pit-a", text: "hi" })).status).toBe(201);
+    expect(h.up.agents.has("pit-a")).toBe(true);
+  });
+
   it("fails closed when a message's channel can't be resolved", async () => {
     const h = harness();
     const local = await h.token(KEYS.local, "local-a");
