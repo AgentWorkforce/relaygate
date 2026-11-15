@@ -1,6 +1,7 @@
 /**
  * Runs the real acceptance driver (scripts/acceptance/run.ts) as a subprocess against an in-process relaygate with
- * the double-pit example policy, in front of in-memory Relaycast and Sessions stand-ins. Proves the harness itself
+ * the double-pit example policy, in front of in-memory Relaycast and Sessions stand-ins. The stand-in Relaycast has no
+ * realtime socket, so realtime coverage is marked optional here (a real deployment must show the control delivery). Proves the harness itself
  * works end to end before it is pointed at a real deployment.
  */
 import { spawn } from "node:child_process";
@@ -57,7 +58,7 @@ describe("acceptance driver dry run", { timeout: 300_000 }, () => {
 
     const out = await new Promise<{ code: number | null; text: string }>((resolve) => {
       const child = spawn(process.execPath, ["--import", "tsx", "scripts/acceptance/run.ts"], {
-        env: { ...process.env, RELAYGATE_URL: gateUrl, OUTSIDE_KEY: KEYS.local, INSIDE_KEY: KEYS.pit, ADMIN_TOKEN: ADMIN, POLICY_FILE: policyFile, RUN_ID: "dry1", SESSIONS_ORG_ID: "org-dry", SESSIONS_WORKSPACE_ID: "ws-dry" },
+        env: { ...process.env, RELAYGATE_URL: gateUrl, OUTSIDE_KEY: KEYS.local, INSIDE_KEY: KEYS.pit, ADMIN_TOKEN: ADMIN, POLICY_FILE: policyFile, RUN_ID: "dry1", SESSIONS_ORG_ID: "org-dry", SESSIONS_WORKSPACE_ID: "ws-dry", ACCEPTANCE_REALTIME: "optional" },
       });
       let text = "";
       child.stdout.on("data", (d) => (text += d));

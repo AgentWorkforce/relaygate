@@ -177,6 +177,10 @@ supported (see "Known gaps").
 
 - Every `[PASS]`; any `[FAIL]` prints the audit rows involved.
 - Scenario 4's sweep line: `canary CANARY-<run>… absent from …`.
+- `realtime: control delivery seen on the outside socket` near the top. The
+  driver DMs one outside agent from the other over the live node socket; only
+  then does the canary sweep cover realtime frames. Without it, scenario 4
+  fails (set `ACCEPTANCE_REALTIME=optional` only where realtime isn't proxied).
 - Audit rows for the inside agents' attempts are all `deny`, with reasons like
   `mode:660+acl:22:r:prefix` (the bits refused it), `registration
   (prefix_not_own_group)` or `unknown_stream`.

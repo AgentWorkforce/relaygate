@@ -128,6 +128,13 @@ async function main() {
   const frames: string[] = [];
   const socket = await listen(localA, (t) => frames.push(t));
   await sleep(inline ? 4000 : 1000);
+  // Realtime only counts as swept if a control delivery is seen on the outside agent's socket.
+  const control = `realtime-control-${RUN}`;
+  if (socket.opened) await localB.call("POST", "/v1/dm", { to: localA.name, text: control });
+  for (let i = 0; i < 15 && !frames.some((f) => f.includes(control)); i++) await sleep(1000);
+  const realtime = socket.opened && frames.some((f) => f.includes(control));
+  const realtimeOptional = process.env.ACCEPTANCE_REALTIME === "optional";
+  console.log(`realtime: ${realtime ? "control delivery seen on the outside socket" : `NOT VERIFIED (socket ${socket.opened ? "open, no control delivery" : "did not open"})`}`);
   let head = await auditHead();
 
   // --- 1. outside -> inside DM and stream post --------------------------------------------------------------
@@ -140,11 +147,9 @@ async function main() {
     record(
       1,
       "outside agent DMs an inside agent and posts into an inside stream: delivered",
-      ok(dm.status) && delivered && (ok(post.status) || post.status === 404) ? "PASS" : "FAIL",
-      [
-        `DM ${dm.status}; inside agent acted on it (seeded its document): ${delivered}`,
-        `post into ${docChannel(RUN, DOC_PREFIX)}: ${post.status}${post.status === 404 ? " (channel not created yet upstream)" : ""}`,
-      ],
+      // The outside post only succeeds if the inside agent really created its channel upstream.
+      ok(dm.status) && delivered && ok(post.status) ? "PASS" : "FAIL",
+      [`DM ${dm.status}; inside agent acted on it (seeded its document): ${delivered}`, `post into ${docChannel(RUN, DOC_PREFIX)} (exists upstream only if seeding worked): ${post.status}`],
       [...mine.filter((r) => r.action === "dm.send" || r.action === "channel.post").map(fmt), ...seeded.map(fmt)],
     );
     head = Math.max(head, ...seeded.map((r) => r.seq), ...mine.map((r) => r.seq));
@@ -226,11 +231,18 @@ async function main() {
     const leaks = exfil.filter((r) => r.decision !== "deny");
     await sleep(3000);
     const found = await canarySweep([localA, localB], localChannel, localSession, frames);
+    const realtimeOk = realtime || realtimeOptional;
     record(
       4,
       "outside agent asks an inside agent to paste the document: no reply delivered; canary nowhere outside",
-      leaks.length === 0 && exfil.length > 0 && found.length === 0 ? "PASS" : "FAIL",
-      [`exfiltration attempts ${exfil.length}, allowed ${leaks.length}`, found.length ? `CANARY FOUND: ${found.join(", ")}` : `canary ${CANARY_PREFIX}… absent from inbox, DMs, channel, search, session, realtime frames`],
+      leaks.length === 0 && exfil.length > 0 && found.length === 0 && realtimeOk ? "PASS" : "FAIL",
+      [
+        `exfiltration attempts ${exfil.length}, allowed ${leaks.length}`,
+        found.length ? `CANARY FOUND: ${found.join(", ")}` : `canary ${CANARY_PREFIX}… absent from inbox, DMs, channel, search, session${realtime ? ", realtime frames" : ""}`,
+        realtime
+          ? `realtime swept: ${frames.length} frames on the outside socket, control delivery seen`
+          : `realtime NOT swept (no live outside socket)${realtimeOptional ? "; ACCEPTANCE_REALTIME=optional" : ": FAIL (set ACCEPTANCE_REALTIME=optional only where realtime isn't proxied)"}`,
+      ],
       leaks.map(fmt),
     );
     const doors = new Map<string, any[]>();
@@ -360,16 +372,28 @@ async function main() {
       }
       return undefined;
     };
-    execSync(process.env.RG_POLICY_FLIP_CMD, { stdio: "inherit" });
-    const flipped = await waitVersion((v) => v !== undefined && v !== before);
-    const h1 = await auditHead();
-    await command(localA, pitA, { acc: "reply", run: `${RUN}f`, to: localA.name });
-    const allowed = (await waitFor(pitA, h1, ["dm.send"])).find((r) => r.action === "dm.send");
-    execSync(process.env.RG_POLICY_RESTORE_CMD, { stdio: "inherit" });
-    const restored = await waitVersion((v) => v === before);
+    // Whatever happens after the flip, the original policy is restored before the driver moves on or exits.
+    let restoredOnce = false;
+    const restore = () => {
+      if (restoredOnce) return;
+      restoredOnce = true;
+      execSync(process.env.RG_POLICY_RESTORE_CMD!, { stdio: "inherit" });
+    };
+    process.once("exit", restore);
+    let flipped: string | undefined, allowed: any, restored: string | undefined, deniedAgain: any;
+    try {
+      execSync(process.env.RG_POLICY_FLIP_CMD, { stdio: "inherit" });
+      flipped = await waitVersion((v) => v !== undefined && v !== before);
+      const h1 = await auditHead();
+      await command(localA, pitA, { acc: "reply", run: `${RUN}f`, to: localA.name });
+      allowed = (await waitFor(pitA, h1, ["dm.send"])).find((r) => r.action === "dm.send");
+    } finally {
+      restore();
+    }
+    restored = await waitVersion((v) => v === before);
     const h2 = await auditHead();
     await command(localA, pitA, { acc: "reply", run: `${RUN}r`, to: localA.name });
-    const deniedAgain = (await waitFor(pitA, h2, ["dm.send"])).find((r) => r.action === "dm.send");
+    deniedAgain = (await waitFor(pitA, h2, ["dm.send"])).find((r) => r.action === "dm.send");
     record(
       12,
       "policy change takes effect (flip one ACL, rerun scenario 2, restore)",
