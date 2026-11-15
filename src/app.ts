@@ -192,6 +192,11 @@ export function createApp(deps: Deps) {
 
     const existing = store.agentByName(name);
     if (existing) {
+      // Effective guest status, persisted first, so a key that just turned guest can't be escaped by rebinding.
+      if (!existing.guest && isGuest(existing, policy)) {
+        store.markKeyGuest(existing.keyId);
+        existing.guest = true;
+      }
       const recovered =
         existing.gid === enrollment.gid &&
         existing.guest === enrollment.guest &&

@@ -397,6 +397,19 @@ describe("enrollment key lifecycle", () => {
     expect(sweepGuestKeys(h.store, h.policy(), Date.now())).toHaveLength(0);
   });
 
+  it("an agent whose key just turned guest can't recover through an ordinary key", async () => {
+    const OTHER = "enroll-local-other-00000000000000";
+    const proof = "recovery-proof-0123456789";
+    const h = harness();
+    await h.register(LOCAL_KEY, "local-1", proof);
+    h.setPolicy((r) => {
+      (r.enrollmentKeys[0] as Record<string, unknown>).guest = true;
+      r.enrollmentKeys.push({ id: "local-2", gid: 11, sha256: sha256(OTHER) } as never);
+    });
+    expect((await h.register(OTHER, "local-1", proof)).status).toBe(409);
+    expect(h.store.agentByName("local-1")?.guest).toBe(true);
+  });
+
   it("a revoked entry doesn't mask a usable entry with the same key", async () => {
     const h = harness(new Fixed("allow"), (r) => {
       r.enrollmentKeys[0]!.revoked = true;
