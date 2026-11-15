@@ -452,6 +452,15 @@ describe("Relaycast proxy: realtime", { timeout: 30_000 }, () => {
     expect(nt.body.data.token).toMatch(/^rgn_/);
     expect(JSON.stringify(nt.body)).not.toContain("nt_live_");
 
+    // A malformed request target is refused without taking the gateway down.
+    const { connect } = await import("node:net");
+    await new Promise<void>((resolve) => {
+      const sock = connect(rt.port, "127.0.0.1", () => sock.write("GET //[ HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"));
+      sock.on("data", () => sock.destroy());
+      sock.on("close", () => resolve());
+    });
+    expect((await rt.h.call("GET", "/v1/whoami", local)).status).toBe(200);
+
     // A bad token never gets a socket.
     const bad = new WebSocket(`ws://127.0.0.1:${rt.port}/v1/node/ws?token=rgn_nope`);
     const badResult = await new Promise((r) => bad.on("error", () => r("error")).on("open", () => r("open")));

@@ -71,7 +71,14 @@ export class NodeSockets {
   }
 
   attach(server: Server): void {
-    server.on("upgrade", (req, socket, head) => this.onUpgrade(req, socket, head));
+    server.on("upgrade", (req, socket, head) => {
+      // Nothing an unauthenticated client sends may throw out of the upgrade path and take the gateway down.
+      try {
+        this.onUpgrade(req, socket, head);
+      } catch {
+        socket.destroy();
+      }
+    });
   }
 
   /** The agent behind a node token, while the rg_ token that minted it still works. */
@@ -86,7 +93,13 @@ export class NodeSockets {
   }
 
   private onUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
-    const url = new URL(req.url ?? "/", "http://relaygate");
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "/", "http://relaygate");
+    } catch {
+      socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+      return;
+    }
     if (url.pathname !== "/v1/node/ws") {
       socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
       return;
