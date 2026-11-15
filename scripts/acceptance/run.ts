@@ -454,12 +454,23 @@ async function main() {
       pass &&= direct.status === 401 || direct.status === 403 || direct.status === 0;
     } else notes.push("rg_ token straight at Relaycast: SKIPPED (set RELAYCAST_DIRECT_URL)");
     if (process.env.RG_DOWN_CMD && process.env.RG_UP_CMD) {
-      execSync(process.env.RG_DOWN_CMD, { stdio: "inherit" });
-      await sleep(5000);
-      const down = await localA.call("POST", "/v1/dm", { to: pitA, text: "while down" });
-      notes.push(`request while relaygate is down: ${down.status} ${down.body?.error ?? ""} (anything but 2xx; nothing can reach upstream without relaygate)`);
-      pass &&= !ok(down.status);
-      execSync(process.env.RG_UP_CMD, { stdio: "inherit" });
+      // Bring relaygate back whatever happens once the down hook starts: in finally, and on exit as a fallback.
+      let upDone = false;
+      const bringUp = () => {
+        if (upDone) return;
+        execSync(process.env.RG_UP_CMD!, { stdio: "inherit" });
+        upDone = true;
+      };
+      process.once("exit", bringUp);
+      try {
+        execSync(process.env.RG_DOWN_CMD, { stdio: "inherit" });
+        await sleep(5000);
+        const down = await localA.call("POST", "/v1/dm", { to: pitA, text: "while down" });
+        notes.push(`request while relaygate is down: ${down.status} ${down.body?.error ?? ""} (anything but 2xx; nothing can reach upstream without relaygate)`);
+        pass &&= !ok(down.status);
+      } finally {
+        bringUp();
+      }
       for (let i = 0; i < 60 && (await request(URL_, "GET", "/readyz", undefined)).status !== 200; i++) await sleep(2000);
     } else notes.push("relaygate down: SKIPPED (set RG_DOWN_CMD and RG_UP_CMD, e.g. kubectl scale --replicas=0/1)");
     record(11, "relaygate down / bypass: no fail-open, no upstream credentials on clients", pass ? "PASS" : "FAIL", notes);
