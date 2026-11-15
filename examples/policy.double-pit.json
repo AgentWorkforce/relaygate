@@ -1,0 +1,41 @@
+{
+  "groups": [
+    {"gid": 11, "name": "local"},
+    {"gid": 22, "name": "pit"}
+  ],
+  "enrollmentKeys": [
+    {"id": "local", "gid": 11, "sha256": "<sha256 of the local enrollment key>", "namePrefix": "local-"},
+    {"id": "pit", "gid": 22, "sha256": "<sha256 of the pit enrollment key>", "namePrefix": "pit-"},
+    {"id": "slack-bridge", "gid": 22, "sha256": "<sha256 of the Slack bridge enrollment key>", "namePrefix": "slack-"}
+  ],
+  "streamDefaults": [
+    {"prefix": "relaycast:channel/", "gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}]},
+    {"prefix": "relaycast:channel/pit-", "gid": 22, "mode": "660", "acl": [{"gid": 11, "perm": "w"}]},
+    {"prefix": "relaycast:channel/slack-", "gid": 22, "mode": "660"},
+    {"prefix": "relaycast:inbox/local-", "gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}]},
+    {"prefix": "relaycast:inbox/pit-", "gid": 22, "mode": "660", "acl": [{"gid": 11, "perm": "w"}]},
+    {"prefix": "relaycast:inbox/slack-", "gid": 22, "mode": "660", "acl": [{"gid": 11, "perm": "w"}]},
+    {"prefix": "slack:", "gid": 22, "mode": "660", "classify": true},
+    {"prefix": "kb:", "gid": 22, "mode": "660", "classify": true}
+  ],
+  "streamOverrides": [],
+  "sessionDefaults": [
+    {"gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}]},
+    {"gid": 22, "mode": "660", "acl": [{"gid": 11, "perm": "w"}]}
+  ],
+  "sessionOverrides": [],
+  "ceilings": [],
+  "classifier": {
+    "rules": [
+      {"id": "us-ssn", "pattern": "\\b\\d{3}-\\d{2}-\\d{4}\\b"},
+      {"id": "prompt-injection", "pattern": "ignore (all )?(previous|prior|above) (instructions|rules)"}
+    ],
+    "model": {
+      "enabled": true,
+      "model": "claude-opus-5-5",
+      "effort": "low",
+      "timeoutMs": 8000,
+      "guidance": "This deployment has two groups. 'pit' agents work with protected health information (PHI) under a BAA; 'local' agents run on employee laptops outside that boundary. PHI must never leave the pit: deny any write that carries patient names, dates of birth, medical record or member numbers, diagnoses, treatment details, or other PHI toward a local agent or an outside tool, and deny any local request that tries to get a pit agent to reveal, summarize or export PHI. Ordinary engineering work (code, task status, questions without patient data) is fine."
+    }
+  }
+}

@@ -65,5 +65,10 @@ npm run explain -- --policy draft.json --cases examples/cases.pit.json   # exits
 ```
 
 `--as` is `agent:<name>` (with `--db`), `key:<id>[:<name>]` or
-`gid:<gid>[,<gid>...]`.
+`gid:<gid>[,<gid>...]`. Use `--session <id> [--session-gid <gid>]` instead of `--stream` for
+sessions.
+
+Example policies with their cases: `examples/policy.pit.json` (with a guest)
+and `examples/policy.double-pit.json` (two groups: laptops outside the
+regulated boundary, cloud agents inside it).
 

@@ -70,6 +70,39 @@ describe("explain", () => {
   });
 });
 
+describe("examples/policy.double-pit.json", () => {
+  const raw = () =>
+    JSON.parse(readFileSync(new URL("../examples/policy.double-pit.json", import.meta.url), "utf8").replace(/<sha256[^>]*>/g, "0".repeat(64)));
+  const cases = () => JSON.parse(readFileSync(new URL("../examples/cases.double-pit.json", import.meta.url), "utf8")).cases;
+
+  it("passes every case in examples/cases.double-pit.json", () => {
+    const results = runCases(parsePolicy(raw()), undefined, cases(), NOW);
+    expect(results.filter((r) => !r.pass).map((r) => r.case.note)).toEqual([]);
+    expect(results.length).toBeGreaterThan(30);
+  });
+
+  it("leaves other at 0 on every default", () => {
+    const p = parsePolicy(raw());
+    expect([...p.streamDefaults, ...p.sessionDefaults].map((d) => d.mode[2])).toEqual(
+      [...p.streamDefaults, ...p.sessionDefaults].map(() => "0"),
+    );
+  });
+});
+
+describe("explain for sessions", () => {
+  it("uses a recorded session's owner and group, or a hypothetical first uploader's group", () => {
+    const p = examplePolicy();
+    const store = new Store(":memory:");
+    const a = store.createAgent("local-a", 11, "local", undefined);
+    store.claimSessions(["s1"], a.id, 11);
+    const q = (as: object, op: "r" | "w", resource: object) => explain(p, store, { as: as as never, op, resource: resource as never }, NOW);
+    expect(q({ key: "pit" }, "r", { kind: "session", id: "s1" }).decision).toBe("allow");
+    expect(q({ key: "pit" }, "w", { kind: "session", id: "s1" }).decision).toBe("deny");
+    expect(q({ key: "local" }, "r", { kind: "session", id: "s-unknown" }).reason).toBe("unknown_session");
+    expect(q({ key: "pit" }, "r", { kind: "session", id: "s-new", gid: 22 }).decision).toBe("allow");
+  });
+});
+
 describe("POST /admin/v1/explain", () => {
   function harness(adminToken?: string) {
     const policy = examplePolicy();

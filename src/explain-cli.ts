@@ -17,7 +17,7 @@ import { Store } from "./store.js";
 function usage(message?: string): never {
   if (message) console.error(message);
   console.error(
-    "usage: relaygate-explain --policy <file> [--db <file>] [--json] (--as <subject> --op r|w --stream <id> | --cases <file>)\n" +
+    "usage: relaygate-explain --policy <file> [--db <file>] [--json] (--as <subject> --op r|w (--stream <id> | --session <id> [--session-gid <gid>]) | --cases <file>)\n" +
       "  subject: agent:<name> | key:<id>[:<name>] | gid:<gid>[,<gid>...]",
   );
   process.exit(2);
@@ -53,6 +53,8 @@ const { values } = parseArgs({
     as: { type: "string" },
     op: { type: "string" },
     stream: { type: "string" },
+    session: { type: "string" },
+    "session-gid": { type: "string" },
     cases: { type: "string" },
     json: { type: "boolean", default: false },
   },
@@ -86,8 +88,12 @@ if (values.cases) {
   process.exit(failed.length > 0 ? 1 : 0);
 }
 
-if (!values.as || !values.stream || (values.op !== "r" && values.op !== "w")) usage();
-const e = explain(policy, store, { as: parseSubject(values.as), op: values.op, resource: { kind: "stream", id: values.stream } });
+if (!values.as || (!values.stream === !values.session) || (values.op !== "r" && values.op !== "w")) usage();
+const sessionGid = values["session-gid"] === undefined ? undefined : Number(values["session-gid"]);
+const resource = values.session
+  ? { kind: "session" as const, id: values.session, ...(sessionGid === undefined ? {} : { gid: sessionGid }) }
+  : { kind: "stream" as const, id: values.stream! };
+const e = explain(policy, store, { as: parseSubject(values.as), op: values.op, resource });
 if (values.json) console.log(JSON.stringify(e, null, 2));
 else print(e);
 store?.close();

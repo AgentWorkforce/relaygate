@@ -521,7 +521,9 @@ Authorization: Bearer <admin token>
            {"step": "other", ...}, {"step": "ceiling", ...}]}
 ```
 
-`as` is a registered agent (`{"agent": "<name>"}`), a new agent enrolled with
+`resource` is a stream (`{"kind": "stream", "id"}`) or a session (`{"kind":
+"session", "id", "gid"?}`: a recorded session is looked up; otherwise `gid` is
+the group of its hypothetical first uploader). `as` is a registered agent (`{"agent": "<name>"}`), a new agent enrolled with
 a key (`{"key": "<id>", "name"?}`), or bare groups (`{"gid": 44, "groups":
 []}`). A body with `cases` instead runs a list of expected decisions
 (`"expect": "allow" | "deny"`, optionally `"classified"`) and reports which
