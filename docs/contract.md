@@ -6,10 +6,12 @@ undecided.
 
 ## What relaygate is
 
-A gateway in front of Relaycast and the Sessions API. Agents hold relaygate
-tokens only. relaygate holds the Relaycast and Sessions credentials, checks
-every request against the caller's group and the resource's mode, and only then
-forwards it.
+A gateway in front of Relaycast and the Sessions API. relaygate checks every
+request against the caller's group and the resource's mode, and only then
+forwards it. For Relaycast, agents hold relaygate tokens only and relaygate
+holds the Relaycast credentials. For Sessions, callers keep their own Sessions
+credential, which relaygate forwards unchanged after checking the caller (see
+"Session uploads" and "Control principals").
 
 Relaycast and Sessions stay unaware of groups. They get no new fields and no
 policy code.
@@ -19,11 +21,15 @@ end-user auth to the dashboard.
 
 ## Who decides, who enforces
 
-The **operator** defines the policy in **relay-control**, the control plane
-they already use. relaygate holds no policy of its own; it enforces what
-relay-control defines.
+The **operator** defines the policy. The plan is for it to live in
+**relay-control**, the control plane they already use, with relaygate only
+enforcing it. **Today** the policy is a JSON file (`RELAYGATE_POLICY`, on
+Kubernetes a ConfigMap): relaygate checks it for changes every few seconds
+(`RELAYGATE_POLICY_RELOAD_MS`, default 5000), applies a new version once it
+parses, and keeps the last good policy if an edit doesn't. Each audit row
+records the version in force (see "Audit").
 
-The operator, in relay-control, owns:
+The operator owns:
 
 - the **groups**: each `gid` and its name;
 - the **enrollment keys**: which group each key enrolls into, its optional name
@@ -36,10 +42,10 @@ The operator, in relay-control, owns:
 - the **ceilings**: per group, the groups it may never touch;
 - the **classifier settings**.
 
-relaygate pulls this policy from relay-control and keeps it cached, so a
-relay-control outage doesn't stop enforcement. A policy change takes effect in
-relaygate within a bounded delay. **Open:** the relay-control API for this, and
-the delay.
+**Planned:** relaygate pulls this policy from relay-control and keeps it
+cached, so a relay-control outage doesn't stop enforcement, and a change takes
+effect within a bounded delay. **Open:** the relay-control API for this, and the
+delay.
 
 Agents and components can only do what the policy already allows: register
 with a key the operator issued, and register a stream inside a prefix their
@@ -308,18 +314,26 @@ key.
 
 - An `rg_` token only works against relaygate. Relaycast and Sessions don't
   accept it.
-- relaygate calls Relaycast and Sessions with its own credentials, and passes
-  the acting agent's identity so upstream records the real author. Relaycast
-  has no act-as for agents, so relaygate registers each agent upstream under
+- relaygate calls Relaycast with its own credentials, and passes the acting
+  agent's identity so upstream records the real author. Relaycast has no
+  act-as for agents, so relaygate registers each agent upstream under
   the same name (with the workspace key, `auto_join_general: false`) and keeps
   that agent's `at_live_` token sealed (AES-GCM, key from `RELAYGATE_SECRET`)
   in its database. If Relaycast stops accepting the token, relaygate takes the
   identity over with the workspace key and retries once.
-- Agents never receive a Relaycast or Sessions credential. An agent that has
-  one can go around the gate, so a deployment must not hand them out.
+- Agents never receive a Relaycast credential. An agent that has one can go
+  around the gate, so a deployment must not hand them out.
+- Sessions is different: callers do hold their own Sessions credentials (device
+  tokens, read tokens), and relaygate forwards them unchanged after checking
+  the caller. relaygate holds no Sessions credential of its own (an optional
+  `SESSIONS_TOKEN` fallback aside), so Sessions keeps recording the real
+  person.
 - Relaycast and Sessions accept traffic only from relaygate. On Kubernetes this
   is a NetworkPolicy; elsewhere a firewall rule. The gate is only as strong as
-  this rule.
+  this rule, and for Sessions it is the whole boundary: a member holding a
+  Sessions credential can read whatever Sessions serves them wherever Sessions
+  is reachable without relaygate, including a public history host not routed
+  through it (acceptance scenario 14 checks this).
 
 For clients, the change is a base URL. Bridges and MCP servers set
 their Relaycast and Sessions base URLs to relaygate and use the `rg_` token.
