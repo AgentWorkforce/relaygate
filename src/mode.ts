@@ -78,7 +78,7 @@ export interface CheckResult {
   allowed: boolean;
   /** The read/write bits `p` ends up with (0 when a ceiling refused). */
   bits: number;
-  /** Content-free, auditable summary, e.g. `mode:660+acl:44:rw` or `ceiling:44->22`. */
+  /** Content-free, auditable summary, e.g. `mode:660+acl:<gid>:rw` or `ceiling:<gid>-><gid>`. */
   reason: string;
   /** Every step that applied, in order, for operators ("explain"). */
   steps: CheckStep[];
