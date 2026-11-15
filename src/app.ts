@@ -337,7 +337,9 @@ export function createApp(deps: Deps) {
 
   // Everything below needs an rg_ token.
   const authenticate = async (c: Context<Env>, next: () => Promise<void>) => {
-    const token = bearer(c);
+    // On Sessions routes the caller's Authorization carries its own Sessions credential and the rg_ token comes in
+    // X-Relaygate-Token (docs/contract.md, "Session uploads").
+    const token = (c.req.path.startsWith("/sessions/") ? c.req.header("x-relaygate-token")?.trim() : undefined) ?? bearer(c);
     const agent = token?.startsWith("rg_") ? store.agentForToken(token) : undefined;
     if (!agent) return deny(c, 401, "relaygate_unauthenticated");
     const policy = deps.policy();
