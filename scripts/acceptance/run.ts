@@ -393,7 +393,13 @@ async function main() {
     // The seed's read-back runs concurrently and may still be waiting on ingest: give it the ingest window.
     let lines = insideLines().filter((l) => l.agent === pitA);
     const canSeeLogs = inline || !!process.env.INSIDE_LOGS_CMD;
-    for (const start = Date.now(); canSeeLogs && !lines.some((l) => l.attempt === "seed.verify") && Date.now() - start < ingestWaitMs() + 60_000; ) {
+    // Nothing to wait for if Sessions is off here, or the seed upload already failed (no read-back will come).
+    const seedFailed = () => lines.some((l) => l.attempt === "seed.session" && !ok(l.status));
+    for (
+      const start = Date.now();
+      canSeeLogs && up.status !== 404 && !seedFailed() && !lines.some((l) => l.attempt === "seed.verify") && Date.now() - start < ingestWaitMs() + 60_000;
+
+    ) {
       await sleep(3000);
       lines = insideLines().filter((l) => l.agent === pitA);
     }
