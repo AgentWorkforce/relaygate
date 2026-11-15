@@ -1,6 +1,6 @@
 # Fast path: test and publish an image on Blacksmith runners, outside the
-# shared GitHub-hosted queue. Only Khaliq can start it (workflow_dispatch +
-# actor check), and the fast-path environment also requires his approval.
+# shared GitHub-hosted queue. Anyone with write access (people or agents) may
+# start it; nothing runs until Khaliq approves the fast-path environment.
 # It never moves the :main tag: the image is tagged fast-<sha> and sha-<sha>,
 # and deployments pin the digest printed in the run summary.
 name: fast-path
@@ -23,7 +23,6 @@ concurrency:
   cancel-in-progress: false
 jobs:
   test:
-    if: github.actor == 'khaliqgant'
     environment: fast-path
     runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
