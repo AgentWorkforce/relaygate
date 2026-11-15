@@ -544,6 +544,23 @@ relaygate records every decision: who, what resource, which op, allowed or
 denied, and by which stage (mode or classifier). It never records message
 content.
 
+Each row also carries the `policy_version` in force (the first 12 hex digits
+of the sha256 of the parsed policy), so a policy change is visible in the log.
+`/readyz` reports the current version.
+
+```
+GET /admin/v1/audit?after=<seq>&agent=<name>&limit=<n>
+Authorization: Bearer <admin token>
+
+200 {"policy_version": "3f1c...", "rows": [{"seq": 41, "at": "...",
+     "agent_name": "local-a", "action": "dm.send", "op": "w",
+     "resource_kind": "stream", "resource_id": "relaycast:inbox/pit-a",
+     "decision": "allow", "stage": "classifier", "reason": "...",
+     "policy_version": "3f1c..."}]}
+```
+
+Rows come oldest first after `after`; `limit` is at most 1000.
+
 ## Open questions
 
 - How a customer shares one session with a guest from the dashboard (a
