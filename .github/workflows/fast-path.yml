@@ -18,8 +18,10 @@ on:
 permissions:
   contents: read
   packages: write
+# One group per run: a run waiting for approval must not hold a group that
+# makes GitHub cancel the next pending dispatch.
 concurrency:
-  group: fast-path-${{ inputs.ref }}
+  group: fast-path-${{ github.run_id }}
   cancel-in-progress: false
 jobs:
   test:
@@ -33,10 +35,11 @@ jobs:
           ref: ${{ inputs.ref }}
       - id: sha
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # No dependency cache: this builds unreviewed refs, and nothing it
+      # produces may be restored by another workflow.
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: npm
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
