@@ -2,6 +2,7 @@ import { gunzipSync, zstdDecompressSync } from "node:zlib";
 import type { Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { decideResource, type Deps, type Env, type ResolvedResource } from "./app.js";
+import { matchControlRule } from "./control.js";
 import { check, type AclEntry, type Op } from "./mode.js";
 import type { Policy } from "./policy.js";
 import { deny } from "./relaycast.js";
@@ -395,6 +396,22 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     mint("/internal/v1/session-read/revoke", false);
   }
 
+  // Revoking a token is always safe, whoever asks; the read API checks the token itself.
+  app.post("/sessions/v1/auth/token/revoke", async (c) => {
+    try {
+      const res = await doFetch(new URL("v1/auth/token/revoke", slash(cfg.readUrl)), {
+        method: "POST",
+        headers: { authorization: c.req.header("authorization") ?? "", "content-type": c.req.header("content-type") ?? "application/json" },
+        body: await c.req.text(),
+      });
+      return new Response(await res.text(), { status: res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } });
+    } catch {
+      return deny(c, 502, "relaygate_upstream_unavailable");
+    }
+  });
+  // The history host's health check answers for relaygate itself.
+  app.get("/sessions/healthz", (c) => c.json({ ok: true }));
+
   // CORS preflights for browsers reading Sessions directly: no credential to check, nothing but headers back.
   app.options("/sessions/*", async (c) => {
     const headers: Record<string, string> = {};
@@ -424,10 +441,31 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
       // An aggregate spans every session, so a principal under any ceiling never gets one (it may not see all groups).
       const ceilinged = policy.ceilings.some((cl) => cl.gid === principal.gid || principal.groups.includes(cl.gid));
       const allowed = !ceilinged && policy.sessionAggregates.gids.some((g) => principal.gid === g || principal.groups.includes(g));
-      audit(c, "session.aggregate", "r", path, allowed ? "allow" : "deny", "mode", allowed ? "sessionAggregates" : "not_in_sessionAggregates");
+      audit(c, "session.aggregate", "r", c.req.path.replace(/^\/sessions/, ""), allowed ? "allow" : "deny", "mode", allowed ? "sessionAggregates" : "not_in_sessionAggregates");
       return allowed ? pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c))) : deny(c, 403, "relaygate_denied", { op: "r", resource: `sessions${path}` });
     });
-  for (const path of ["/v1/sessions/users", "/v1/sessions/activity", "/v1/sessions/summaries/activity", "/v1/sessions/output", "/v1/sessions/titles", "/v1/digest/daily"]) aggregate(path);
+  for (const path of ["/v1/sessions/users", "/v1/sessions/activity", "/v1/sessions/summaries/activity", "/v1/sessions/output", "/v1/sessions/titles", "/v1/delivery/records", "/v1/digest/*"]) aggregate(path);
+
+  // Upload-side calls the desktop makes that carry no session content.
+  app.get("/sessions/v1/delivery/admission", async (c) => pass(await upstream(c, cfg.uploadUrl, "GET", upstreamPath(c))));
+  app.post("/sessions/v1/upload-consent", async (c) => pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/upload-consent", await c.req.text())));
+  // Choosing which sessions sync is a write on each session it names.
+  app.post("/sessions/v1/delivery/sessions/selection", async (c) => {
+    const raw = await c.req.text();
+    let body: any;
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      return deny(c, 400, "relaygate_bad_request", { detail: "selection is not JSON" });
+    }
+    const named = Array.isArray(body?.sessions) ? body.sessions : null;
+    if (!named || named.some((x: any) => typeof x?.session_id !== "string" || !SESSION_ID.test(x.session_id))) {
+      return deny(c, 400, "relaygate_bad_request", { detail: "sessions[] with session_id required" });
+    }
+    const gate = await gateWrites(c, new Map(named.map((x: any) => [x.session_id, JSON.stringify(body)])));
+    if (gate instanceof Response) return gate;
+    return pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/delivery/sessions/selection", raw));
+  });
 
   // Upload-side housekeeping that carries no session content.
   app.get("/sessions/v1/delivery/limits", async (c) => pass(await upstream(c, cfg.uploadUrl, "GET", "/v1/delivery/limits")));
@@ -436,3 +474,88 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
 
   app.all("/sessions/*", (c) => deny(c, 404, "relaygate_route_not_proxied", { path: c.req.path }));
 }
+
+export interface AdoptReport {
+  dryRun: boolean;
+  scanned: number;
+  adopted: Array<{ sessionId: string; owner: string; gid: number }>;
+  alreadyOwned: number;
+  /** No uploader in the read API's listing: stays unowned (invisible through relaygate). */
+  noUploader: string[];
+  /** The uploader matches no controlPrincipals rule: stays unowned. */
+  unmatched: Array<{ sessionId: string; userId: string }>;
+  /** Pages stopped early (upstream error); rerun to continue. */
+  error?: string;
+}
+
+/**
+ * Gives sessions uploaded before relaygate an owner (docs/contract.md, "Adopting existing sessions"): pages the read
+ * API's session list with a read service token, maps each session's uploader (its first userId) through
+ * controlPrincipals, and claims it as `ctl:<userId>` in that rule's group. Idempotent; a dry run only reports.
+ */
+export async function adoptSessions(
+  deps: Deps,
+  cfg: SessionsConfig,
+  opts: { readToken: string; orgId: string; workspaceId: string; dryRun: boolean; maxPages?: number },
+): Promise<AdoptReport> {
+  const doFetch = cfg.fetch ?? fetch;
+  const base = cfg.readUrl.endsWith("/") ? cfg.readUrl : `${cfg.readUrl}/`;
+  const report: AdoptReport = { dryRun: opts.dryRun, scanned: 0, adopted: [], alreadyOwned: 0, noUploader: [], unmatched: [] };
+  const policy = deps.policy();
+  let cursor: string | undefined;
+  for (let page = 0; page < (opts.maxPages ?? 500); page++) {
+    const q = new URLSearchParams({ workspace: opts.workspaceId, limit: "200", ...(cursor ? { cursor } : {}) });
+    let body: any;
+    try {
+      const res = await doFetch(new URL(`v1/sessions?${q}`, base), { headers: { authorization: `Bearer ${opts.readToken}` } });
+      if (!res.ok) {
+        report.error = `session list answered ${res.status}`;
+        break;
+      }
+      body = await res.json();
+    } catch (error) {
+      report.error = `session list failed: ${(error as Error).name}`;
+      break;
+    }
+    for (const item of Array.isArray(body?.sessions) ? body.sessions : []) {
+      const id = item?.sessionId;
+      if (typeof id !== "string" || !SESSION_ID.test(id)) continue;
+      report.scanned++;
+      if (deps.store.session(id)) {
+        report.alreadyOwned++;
+        continue;
+      }
+      const userId = Array.isArray(item.userIds) ? item.userIds.find((u: unknown) => typeof u === "string" && u) : undefined;
+      if (!userId) {
+        report.noUploader.push(id);
+        continue;
+      }
+      const identity = { kind: "device" as const, userId, email: deps.store.controlEmail(userId), orgId: opts.orgId, workspaceId: opts.workspaceId, scopes: [] };
+      const rule = matchControlRule(identity, policy);
+      if (!rule) {
+        report.unmatched.push({ sessionId: id, userId });
+        continue;
+      }
+      if (!opts.dryRun) {
+        let agent;
+        try {
+          agent = deps.store.ensureControlAgent(userId, rule.gid);
+        } catch {
+          report.unmatched.push({ sessionId: id, userId });
+          continue;
+        }
+        const claim = deps.store.claimSessions([id], agent.id, rule.gid);
+        if (!claim.claimed) {
+          report.alreadyOwned++;
+          continue;
+        }
+        deps.store.audit({ agentId: agent.id, action: "session.adopt", op: "w", resourceKind: "session", resourceId: id, decision: "allow", stage: "registration", reason: `uploader:${userId}` });
+      }
+      report.adopted.push({ sessionId: id, owner: `ctl:${userId}`, gid: rule.gid });
+    }
+    cursor = typeof body?.nextCursor === "string" && body.nextCursor ? body.nextCursor : undefined;
+    if (!cursor) break;
+  }
+  return report;
+}
+

@@ -4,7 +4,7 @@ import { ClassifierUnavailable, type Classifier } from "./classifier.js";
 import { allGroups, check, inGroup, type AclEntry, type Guarded, type Op, type Principal } from "./mode.js";
 import { deny as proxyDeny, mountRelaycast, type RelaycastUpstream } from "./relaycast.js";
 import { mountNodeToken } from "./realtime.js";
-import { mountSessions, sessionsCors, type SessionsConfig } from "./sessions.js";
+import { adoptSessions, mountSessions, sessionsCors, type SessionsConfig } from "./sessions.js";
 import { ControlUnavailable, controlPrincipal, controlTokenKind, matchControlRule, type ControlAuth } from "./control.js";
 import { explain, runCases, CaseSchema, QuerySchema } from "./explain.js";
 import { keyUsable, parsePolicy, policyVersion, type EnrollmentKey, type Policy } from "./policy.js";
@@ -321,6 +321,18 @@ export function createApp(deps: Deps) {
     return c.json({ policy_version: policyVersion(deps.policy()), rows });
   });
 
+  // Gives sessions uploaded before relaygate an owner, by their uploader (docs/contract.md, "Adopting existing sessions").
+  const AdoptBody = z.object({ readToken: z.string().min(8), orgId: z.string().min(1), workspaceId: z.string().min(1) });
+  app.post("/admin/v1/sessions/adopt", async (c) => {
+    const refused = adminRefusal(c);
+    if (refused) return refused;
+    if (!deps.sessions) return deny(c, 404, "relaygate_not_found");
+    const parsed = AdoptBody.safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return deny(c, 400, "relaygate_bad_request", { detail: parsed.error.issues[0]?.message });
+    const dryRun = c.req.query("dryRun") === "1" || c.req.query("dryRun") === "true";
+    return c.json(await adoptSessions(deps, deps.sessions, { ...parsed.data, dryRun }));
+  });
+
   app.post("/admin/v1/explain", async (c) => {
     const refused = adminRefusal(c);
     if (refused) return refused;
@@ -395,6 +407,8 @@ export function createApp(deps: Deps) {
     // CORS preflights carry no credential, and relay-control's internal mint calls carry the read API's own secret:
     // both are handled by the Sessions proxy itself.
     if (onSessions && (c.req.method === "OPTIONS" || c.req.path.startsWith("/sessions/internal/"))) return next();
+    // Token revocation (always safe) and the health check need no principal.
+    if (onSessions && (c.req.path === "/sessions/v1/auth/token/revoke" || c.req.path === "/sessions/healthz")) return next();
     const relaygateToken = onSessions ? c.req.header("x-relaygate-token")?.trim() : undefined;
     const presented = bearer(c);
     if (onSessions && !relaygateToken && deps.control && presented && controlTokenKind(presented)) {
