@@ -10,14 +10,15 @@
  *   OUTSIDE_CHANNEL_PREFIX (""), POLICY_FILE (for the draft-policy checks), RELAYCAST_DIRECT_URL,
  *   RG_DOWN_CMD / RG_UP_CMD, RG_POLICY_FLIP_CMD / RG_POLICY_RESTORE_CMD,
  *   OUTSIDE_SESSIONS_UPLOAD / OUTSIDE_SESSIONS_READ and INSIDE_SESSIONS_UPLOAD / INSIDE_SESSIONS_READ (the callers'
- *   own Sessions credentials, when the deployment's Sessions needs them; relaygate forwards them).
+ *   own Sessions credentials, when the deployment's Sessions needs them; relaygate forwards them),
+ *   SESSIONS_ORG_ID + SESSIONS_WORKSPACE_ID (self-hosted Sessions: native uploads, workspace-scoped reads).
  * Defaults match examples/policy.double-pit.json; nothing here is specific to a customer.
  */
 import { execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { runAgent } from "./agent.ts";
-import { dataOf, docChannel, docSession, enroll, env, listen, request, sleep, type Command, type Gate } from "./lib.ts";
+import { dataOf, docChannel, docSession, enroll, env, listen, request, sessionsFromEnv, sleep, type Command, type Gate } from "./lib.ts";
 
 type Verdict = "PASS" | "FAIL" | "SKIP" | "MANUAL";
 interface Result {
@@ -109,7 +110,7 @@ async function main() {
           name,
           recovery: randomBytes(16).toString("hex"),
           docChannelPrefix: DOC_PREFIX,
-          sessions: { upload: process.env.INSIDE_SESSIONS_UPLOAD || undefined, read: process.env.INSIDE_SESSIONS_READ || undefined },
+          sessions: sessionsFromEnv(process.env.INSIDE_SESSIONS_UPLOAD, process.env.INSIDE_SESSIONS_READ),
           log: () => {},
         },
         ac.signal,
@@ -119,7 +120,7 @@ async function main() {
   const [pitA, pitB] = insideNames as [string, string];
 
   // Outside agents.
-  const outsideSessions = { upload: process.env.OUTSIDE_SESSIONS_UPLOAD || undefined, read: process.env.OUTSIDE_SESSIONS_READ || undefined };
+  const outsideSessions = sessionsFromEnv(process.env.OUTSIDE_SESSIONS_UPLOAD, process.env.OUTSIDE_SESSIONS_READ);
   const localA = await enroll(URL_, OUTSIDE_KEY, `${OUT_PREFIX}acc-1-${RUN}`, randomBytes(16).toString("hex"), outsideSessions);
   const localB = await enroll(URL_, OUTSIDE_KEY, `${OUT_PREFIX}acc-2-${RUN}`, randomBytes(16).toString("hex"), outsideSessions);
   const localChannel = `${OUT_CH_PREFIX}acc-${RUN}`;
@@ -151,9 +152,7 @@ async function main() {
 
   // --- 6. outside session upload (first, so it exists before the inside agent tries to write it) -------------
   {
-    const up = await localA.call("POST", `/sessions/v1/sessions/${localSession}/turns`, {
-      turns: [{ turnIndex: 0, role: "assistant", content: `outside work log ${RUN}`, ts: new Date().toISOString() }],
-    });
+    const up = await localA.sessionWrite(localSession, `outside work log ${RUN}`);
     if (up.status === 404) {
       record(6, "outside session upload is stored and readable inside", "SKIP", ["Sessions proxy not enabled on this relaygate (/sessions 404)"]);
     } else {
@@ -249,9 +248,7 @@ async function main() {
 
   // --- 7. outside appends to an inside session: accepted, classified, not readable back ---------------------
   {
-    const app = await localA.call("POST", `/sessions/v1/sessions/${docSession(RUN)}/turns`, {
-      turns: [{ turnIndex: 50, role: "user", content: `outside context for ${RUN}` }],
-    });
+    const app = await localA.sessionWrite(docSession(RUN), `outside context for ${RUN}`);
     const back = await localA.call("GET", `/sessions/v1/sessions/${docSession(RUN)}/events`);
     const rows = (await audit(head, localA.name)).filter((r) => r.resource_id === docSession(RUN));
     const write = rows.find((r) => r.action === "session.write");

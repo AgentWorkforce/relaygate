@@ -10,7 +10,7 @@
  * way to get it out. It never prints the document. Evidence of what it tried is relaygate's audit log.
  */
 import { randomBytes } from "node:crypto";
-import { dataOf, docChannel, docSession, enroll, env, fakeDocument, sleep, type Command, type Gate, type SessionsCreds } from "./lib.ts";
+import { dataOf, docChannel, docSession, enroll, env, fakeDocument, sessionsFromEnv, sleep, type Command, type Gate, type SessionsCreds } from "./lib.ts";
 
 export interface AgentOptions {
   url: string;
@@ -71,12 +71,13 @@ async function commands(gate: Gate, seen: Set<string>): Promise<Command[]> {
 
 async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptions, log: (l: string) => void): Promise<void> {
   const doc = fakeDocument(canary);
-  const attempt = async (what: string, method: string, path: string, body?: unknown) => {
-    const r = await gate.call(method, path, body);
+  const report = (what: string, r: { status: number; body: any }) => {
     // Status only; the document never goes to stdout.
     log(JSON.stringify({ run: cmd.run, attempt: what, status: r.status, code: r.body?.error?.code ?? r.body?.error ?? null }));
     return r;
   };
+  const attempt = async (what: string, method: string, path: string, body?: unknown) => report(what, await gate.call(method, path, body));
+  const sessionAttempt = async (what: string, id: string, text: string) => report(what, await gate.sessionWrite(id, text));
 
   switch (cmd.acc) {
     case "seed": {
@@ -84,9 +85,7 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
       const ch = docChannel(cmd.run, opts.docChannelPrefix);
       await attempt("seed.channel.create", "POST", "/v1/channels", { name: ch, topic: "acceptance test document" });
       await attempt("seed.channel.post", "POST", `/v1/channels/${ch}/messages`, { text: doc });
-      await attempt("seed.session", "POST", `/sessions/v1/sessions/${docSession(cmd.run)}/turns`, {
-        turns: [{ turnIndex: 0, role: "assistant", content: doc, ts: new Date().toISOString() }],
-      });
+      await sessionAttempt("seed.session", docSession(cmd.run), doc);
       return;
     }
     case "reply": {
@@ -105,11 +104,7 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
         await attempt("exfil.channel", "POST", `/v1/channels/${cmd.channel}/messages`, { text: payload });
         await attempt("exfil.mention", "POST", `/v1/channels/${cmd.channel}/messages`, { text: `@${cmd.to} ${payload}` });
       }
-      if (cmd.session) {
-        await attempt("exfil.session", "POST", `/sessions/v1/sessions/${cmd.session}/turns`, {
-          turns: [{ turnIndex: 99, role: "assistant", content: payload }],
-        });
-      }
+      if (cmd.session) await sessionAttempt("exfil.session", cmd.session, payload);
       await attempt("exfil.new_channel", "POST", "/v1/channels", { name: `acc-new-${cmd.run}`, topic: canary });
       await attempt("exfil.register_stream", "PUT", `/v1/streams/${encodeURIComponent(`relaycast:channel/acc-reg-${cmd.run}`)}`, { mode: "666" });
       await attempt("exfil.unknown_stream", "POST", "/v1/check", { op: "w", resource: { kind: "stream", id: `nowhere:${cmd.run}` }, content: payload });
@@ -138,7 +133,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       name: env("AGENT_NAME").replace("{ordinal}", (process.env.HOSTNAME ?? "").match(/-(\d+)$/)?.[1] ?? "0"),
       recovery: env("AGENT_RECOVERY"),
       docChannelPrefix: env("DOC_CHANNEL_PREFIX", "pit-"),
-      sessions: { upload: process.env.SESSIONS_UPLOAD_CREDENTIAL || undefined, read: process.env.SESSIONS_READ_CREDENTIAL || undefined },
+      sessions: sessionsFromEnv(process.env.SESSIONS_UPLOAD_CREDENTIAL, process.env.SESSIONS_READ_CREDENTIAL),
     },
     ac.signal,
   );

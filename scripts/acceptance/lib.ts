@@ -9,10 +9,65 @@ export interface Res {
   body: any;
 }
 
+import { createHash, randomBytes } from "node:crypto";
+
 /** The caller's own Sessions credentials, when the deployment's Sessions needs them (relaygate forwards them). */
 export interface SessionsCreds {
   upload?: string;
   read?: string;
+  /**
+   * Self-hosted Sessions: uploads use the native delivery protocol (whose account id is derived from the org and
+   * workspace) and every read names its workspace. Without this, uploads use POST /v1/sessions/:id/turns.
+   */
+  native?: { orgId: string; workspaceId: string };
+}
+
+/** Session settings shared by every role, from the environment. */
+export function sessionsFromEnv(upload?: string, read?: string): SessionsCreds {
+  const orgId = process.env.SESSIONS_ORG_ID;
+  const workspaceId = process.env.SESSIONS_WORKSPACE_ID;
+  return { upload: upload || undefined, read: read || undefined, ...(orgId && workspaceId ? { native: { orgId, workspaceId } } : {}) };
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return "[" + value.map(canonicalJson).join(",") + "]";
+  if (value && typeof value === "object")
+    return "{" + Object.keys(value).sort().map((k) => JSON.stringify(k) + ":" + canonicalJson((value as any)[k])).join(",") + "}";
+  return JSON.stringify(value);
+}
+
+/** One native delivery batch with a single session_event record (relayhistory-delivery-v1). */
+export function nativeBatch(native: { orgId: string; workspaceId: string }, sessionId: string, text: string) {
+  const origin = "relaygate-acceptance";
+  const id = `acc-${randomBytes(8).toString("hex")}`;
+  return {
+    protocolVersion: 1,
+    batch: {
+      schema_version: 1,
+      origin_id: origin,
+      batch_id: id,
+      job_id: "relaygate-acceptance",
+      generation: 1,
+      destination_id: "relayhistory",
+      instance_id: "relaygate-acceptance",
+      account_id: "relayhistory:" + createHash("sha256").update(canonicalJson([native.orgId, native.workspaceId])).digest("hex"),
+      mapping_version: "relayhistory-delivery-v1",
+      records: [
+        {
+          schema_version: 1,
+          origin_id: origin,
+          record_id: id,
+          revision_id: `${id}:r1`,
+          revision: 1,
+          kind: "session_event",
+          source: "claude",
+          session_id: sessionId,
+          operation: "upsert",
+          payload: { text, ts_ms: Date.now() },
+        },
+      ],
+    },
+  };
 }
 
 export class Gate {
@@ -28,7 +83,17 @@ export class Gate {
     this.sessions = sessions;
   }
 
+  /** Writes `text` into a session, in whichever upload protocol the deployment's Sessions speaks. */
+  async sessionWrite(sessionId: string, text: string): Promise<Res> {
+    if (this.sessions.native) return this.call("POST", "/sessions/v1/delivery/batches", nativeBatch(this.sessions.native, sessionId, text));
+    return this.call("POST", `/sessions/v1/sessions/${sessionId}/turns`, { turns: [{ turnIndex: Date.now() % 100000, role: "assistant", content: text, ts: new Date().toISOString() }] });
+  }
+
   async call(method: string, path: string, body?: unknown): Promise<Res> {
+    // Self-hosted Sessions reads always name their workspace.
+    if (method === "GET" && path.startsWith("/sessions/") && this.sessions.native && !/[?&]workspace=/.test(path)) {
+      path += `${path.includes("?") ? "&" : "?"}workspace=${encodeURIComponent(this.sessions.native.workspaceId)}`;
+    }
     const cred = path.startsWith("/sessions/") ? (method === "GET" ? this.sessions.read : this.sessions.upload) : undefined;
     // On Sessions routes the rg_ token goes in X-Relaygate-Token and the caller's Sessions credential in Authorization.
     if (cred) return request(this.url, method, path, cred, body, { "x-relaygate-token": this.token });

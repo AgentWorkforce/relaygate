@@ -57,7 +57,7 @@ describe("acceptance driver dry run", { timeout: 300_000 }, () => {
 
     const out = await new Promise<{ code: number | null; text: string }>((resolve) => {
       const child = spawn(process.execPath, ["--import", "tsx", "scripts/acceptance/run.ts"], {
-        env: { ...process.env, RELAYGATE_URL: gateUrl, OUTSIDE_KEY: KEYS.local, INSIDE_KEY: KEYS.pit, ADMIN_TOKEN: ADMIN, POLICY_FILE: policyFile, RUN_ID: "dry1" },
+        env: { ...process.env, RELAYGATE_URL: gateUrl, OUTSIDE_KEY: KEYS.local, INSIDE_KEY: KEYS.pit, ADMIN_TOKEN: ADMIN, POLICY_FILE: policyFile, RUN_ID: "dry1", SESSIONS_ORG_ID: "org-dry", SESSIONS_WORKSPACE_ID: "ws-dry" },
       });
       let text = "";
       child.stdout.on("data", (d) => (text += d));

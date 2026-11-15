@@ -113,6 +113,8 @@ spec:
             # Optional, if Sessions needs the agent's own credentials (relaygate forwards them):
             # - { name: SESSIONS_UPLOAD_CREDENTIAL, valueFrom: ... }   # sh_at_...
             # - { name: SESSIONS_READ_CREDENTIAL, valueFrom: ... }     # rth_at_read_...
+            # - { name: SESSIONS_ORG_ID, value: "<org id>" }           # self-hosted Sessions: native uploads,
+            # - { name: SESSIONS_WORKSPACE_ID, value: "<workspace id>" } # workspace-scoped reads
             # - { name: DOC_CHANNEL_PREFIX, value: "pit-" }           # a channel prefix inside the boundary
 ```
 
@@ -132,6 +134,10 @@ export INSIDE_AGENTS=pit-acc-0,pit-acc-1      # or INSIDE_KEY=<inside key> for i
 export POLICY_FILE=examples/policy.double-pit.json   # enables the expired-guest-key check
 # If Sessions needs the callers' own credentials:
 # export OUTSIDE_SESSIONS_UPLOAD=sh_at_...  OUTSIDE_SESSIONS_READ=rth_at_read_...
+# (and INSIDE_SESSIONS_UPLOAD / INSIDE_SESSIONS_READ when the driver runs the inside agents in-process)
+# Self-hosted Sessions (session-ingest + session-read-api): uploads use the native delivery protocol, whose
+# account id is derived from the org and workspace, and every read names the workspace:
+# export SESSIONS_ORG_ID=<org id>  SESSIONS_WORKSPACE_ID=<workspace id>
 node scripts/acceptance/run.ts | tee acceptance-$(date +%Y%m%d-%H%M).log
 ```
 

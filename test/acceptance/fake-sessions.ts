@@ -25,6 +25,10 @@ export function fakeSessionsServer(): Server {
     sessions.set(id, [...(sessions.get(id) ?? []), ...(body?.turns ?? [])]);
     return send(200, { accepted: body?.turns?.length ?? 0 });
   }
+  if (req.method === "POST" && url.pathname === "/v1/delivery/batches") {
+    for (const r of body?.batch?.records ?? []) sessions.set(r.session_id, [...(sessions.get(r.session_id) ?? []), r]);
+    return send(200, { protocolVersion: 1, receiptId: "rhr_fake", batchId: body?.batch?.batch_id });
+  }
   if (req.method === "POST" && url.pathname === "/v1/ingest") {
     for (const r of body?.records ?? []) sessions.set(r.sessionId, [...(sessions.get(r.sessionId) ?? []), r]);
     return send(200, { batchId: body?.batchId, received: body?.records?.length ?? 0 });
