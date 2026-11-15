@@ -47,6 +47,8 @@ export interface Agent {
   recoveryHash: string | null;
   /** Enrolled with a guest key. Kept on the agent so removing the key from the policy can't make a guest a member. */
   guest: boolean;
+  /** Supplementary groups for agents enrolled without a policy key (a person's desktop, via controlPrincipals). */
+  groups: number[] | null;
 }
 
 export interface StreamRow {
@@ -157,6 +159,8 @@ export class Store {
     this.addColumn("streams", "acl", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumn("audit", "policy_version", "TEXT");
     this.addColumn("control_read_tokens", "email", "TEXT");
+    this.addColumn("agents", "groups", "TEXT");
+    this.addColumn("tokens", "expires_at", "INTEGER");
   }
 
   private addColumn(table: string, column: string, decl: string): void {
@@ -169,11 +173,11 @@ export class Store {
   }
 
   agentByName(name: string): Agent | undefined {
-    const row = this.db.prepare("SELECT id, name, gid, key_id, recovery_hash, guest FROM agents WHERE name = ?").get(name);
+    const row = this.db.prepare("SELECT id, name, gid, key_id, recovery_hash, guest, groups FROM agents WHERE name = ?").get(name);
     return row ? toAgent(row) : undefined;
   }
 
-  createAgent(name: string, gid: number, keyId: string, recovery: string | undefined, guest = false): Agent {
+  createAgent(name: string, gid: number, keyId: string, recovery: string | undefined, guest = false, groups: number[] | null = null): Agent {
     const agent: Agent = {
       id: `ag_${randomUUID()}`,
       name,
@@ -181,10 +185,11 @@ export class Store {
       keyId,
       recoveryHash: recovery ? sha256(recovery) : null,
       guest,
+      groups,
     };
     this.db
-      .prepare("INSERT INTO agents (id, name, gid, key_id, recovery_hash, guest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(agent.id, agent.name, agent.gid, agent.keyId, agent.recoveryHash, agent.guest ? 1 : 0, now());
+      .prepare("INSERT INTO agents (id, name, gid, key_id, recovery_hash, guest, groups, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(agent.id, agent.name, agent.gid, agent.keyId, agent.recoveryHash, agent.guest ? 1 : 0, groups ? JSON.stringify(groups) : null, now());
     return agent;
   }
 
@@ -218,10 +223,20 @@ export class Store {
     this.db.prepare("UPDATE agents SET key_id = ?, guest = MAX(guest, ?) WHERE id = ?").run(keyId, guest ? 1 : 0, agentId);
   }
 
-  issueToken(agentId: string): string {
+  issueToken(agentId: string, expiresAt?: number): string {
     const token = `rg_${randomBytes(32).toString("base64url")}`;
-    this.db.prepare("INSERT INTO tokens (hash, agent_id, created_at) VALUES (?, ?, ?)").run(sha256(token), agentId, now());
+    this.db.prepare("INSERT INTO tokens (hash, agent_id, created_at, expires_at) VALUES (?, ?, ?, ?)").run(sha256(token), agentId, now(), expiresAt ?? null);
     return token;
+  }
+
+  /** A desktop-enrolled agent's group follows its person's current controlPrincipals rule (set on each registration). */
+  setAgentGroups(agentId: string, gid: number, groups: number[]): void {
+    this.db.prepare("UPDATE agents SET gid = ?, groups = ? WHERE id = ?").run(gid, JSON.stringify(groups), agentId);
+  }
+
+  /** Forgets the upstream credential of a removed agent (the next use registers it upstream afresh). */
+  deleteUpstreamAgent(agentId: string): void {
+    this.db.prepare("DELETE FROM upstream_agents WHERE agent_id = ?").run(agentId);
   }
 
   agentForToken(token: string): Agent | undefined {
@@ -231,9 +246,9 @@ export class Store {
   agentForTokenHash(hash: string): Agent | undefined {
     const row = this.db
       .prepare(
-        "SELECT a.id, a.name, a.gid, a.key_id, a.recovery_hash, a.guest FROM tokens t JOIN agents a ON a.id = t.agent_id WHERE t.hash = ? AND t.revoked = 0",
+        "SELECT a.id, a.name, a.gid, a.key_id, a.recovery_hash, a.guest, a.groups FROM tokens t JOIN agents a ON a.id = t.agent_id WHERE t.hash = ? AND t.revoked = 0 AND (t.expires_at IS NULL OR t.expires_at > ?)",
       )
-      .get(hash);
+      .get(hash, Date.now());
     return row ? toAgent(row) : undefined;
   }
 
@@ -428,5 +443,6 @@ function toAgent(row: Record<string, unknown>): Agent {
     keyId: String(row.key_id),
     recoveryHash: row.recovery_hash === null ? null : String(row.recovery_hash),
     guest: Number(row.guest) === 1,
+    groups: row.groups === null || row.groups === undefined ? null : (JSON.parse(String(row.groups)) as number[]),
   };
 }

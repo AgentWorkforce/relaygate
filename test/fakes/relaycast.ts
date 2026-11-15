@@ -23,6 +23,8 @@ export function fakeRelaycast() {
   const calls: Array<{ method: string; path: string; auth: string; body: unknown; headers: Headers }> = [];
   let seq = 0;
   let revokeAll = false;
+  const deliveries: Array<Record<string, unknown> & { agent: string }> = [];
+  const failed: Array<{ id: string; body: unknown }> = [];
   let channelsDown = false;
   const app = new Hono();
   const who = (auth: string) => [...agents.entries()].find(([, a]) => `Bearer ${a.token}` === auth)?.[0];
@@ -123,6 +125,20 @@ export function fakeRelaycast() {
     c.json({ ok: true, data: { unread_channels: channels.map((ch) => ({ channel_name: ch.name, unread_count: 1 })), mentions: [{ channel_name: "pit-ops", text: "x" }], unread_dms: [], recent_reactions: [] } }),
   );
   app.post("/v1/agent/node-token", (c) => c.json({ ok: true, data: { node_id: `node_${who(c.req.header("authorization")!)}`, node_name: "direct", token: `nt_live_${++seq}` } }));
+  app.get("/v1/deliveries", (c) => {
+    const me = who(c.req.header("authorization")!)!;
+    return c.json({ ok: true, data: deliveries.filter((d) => d.agent === me) });
+  });
+  app.post("/v1/deliveries/:id/fail", async (c) => {
+    failed.push({ id: c.req.param("id"), body: await c.req.json().catch(() => ({})) });
+    return c.json({ ok: true, data: { id: c.req.param("id"), status: "failed" } });
+  });
+  app.post("/v1/deliveries/:id/ack", (c) => c.json({ ok: true, data: { id: c.req.param("id"), status: "acked" } }));
+  app.patch("/v1/agents/:name", async (c) => c.json({ ok: true, data: { name: c.req.param("name"), ...(await c.req.json()) } }));
+  app.delete("/v1/agents/:name", (c) => {
+    agents.delete(c.req.param("name"));
+    return c.json({ ok: true, data: { deleted: true } });
+  });
   app.all("*", (c) => c.json({ ok: true, data: "should never be reached" }));
 
   const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init))) as typeof fetch;
@@ -131,6 +147,8 @@ export function fakeRelaycast() {
     fetchFn,
     agents,
     messages,
+    deliveries,
+    failed,
     channels,
     calls,
     revokeUpstreamTokens: () => (revokeAll = true),

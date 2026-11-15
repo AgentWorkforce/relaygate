@@ -389,13 +389,26 @@ describe("Relaycast proxy: realtime", { timeout: 30_000 }, () => {
     await rt.connected;
     expect(rt.upstreamUrl()).toMatch(/token=nt_live_/);
 
-    client.send(JSON.stringify({ v: 1, type: "node.register", name: "x", node_id: "someone-elses-node", capabilities: [{ name: "spawn" }], max_agents: 5 }));
+    client.send(
+      JSON.stringify({
+        v: 1,
+        type: "node.register",
+        name: "x",
+        node_id: "someone-elses-node",
+        capabilities: [{ name: "spawn" }],
+        max_agents: 5,
+        machine_id: "mach-1",
+        origin_surface: "desktop",
+        provider: { name: "relay-node", instance_id: "inst-1" },
+      }),
+    );
     client.send(JSON.stringify({ v: 1, id: "r1", type: "agent.register", name: "pit-sneaky" }));
     client.send(JSON.stringify({ v: 1, type: "delivery.ack", agent: "pit-a", up_to_seq: 9 }));
     client.send(JSON.stringify({ v: 1, type: "delivery.ack", agent: "local-a", up_to_seq: 3 }));
     await waitFor(() => rt.received.length >= 2 && got.some((f) => f.id === "r1"));
     expect(rt.received).toEqual([
-      { v: 1, type: "node.register", name: "x", node_id: "node_local-a", capabilities: [], max_agents: 5 },
+      // Everything but node_id and capabilities passes through (machine_id, origin_surface, provider, ...).
+      { v: 1, type: "node.register", name: "x", node_id: "node_local-a", capabilities: [], max_agents: 5, machine_id: "mach-1", origin_surface: "desktop", provider: { name: "relay-node", instance_id: "inst-1" } },
       { v: 1, type: "delivery.ack", agent: "local-a", up_to_seq: 3 },
     ]);
     expect(got.find((f) => f.id === "r1")).toMatchObject({ type: "error", code: "relaygate_denied" });
@@ -419,3 +432,39 @@ describe("Relaycast proxy: realtime", { timeout: 30_000 }, () => {
     expect(rt.sockets.size).toBe(0);
   });
 });
+
+describe("Relaycast proxy: desktop broker routes", () => {
+  it("serves the delivery queue filtered by read access, and fails what it withholds upstream", async () => {
+    const h = harness();
+    const local = await h.token(KEYS.local, "local-a");
+    const pit = await h.token(KEYS.pit, "pit-a");
+    await h.call("POST", "/v1/channels/general/messages", pit, { text: "x" }).catch(() => {});
+    h.up.deliveries.push(
+      { id: "dl1", agent: "local-a", channel_id: "ch_general", message: { text: "general" } },
+      { id: "dl2", agent: "local-a", channel_id: "ch_pit", message: { text: "pit secret" } },
+      { id: "dl3", agent: "local-a", channel_id: "dmch_local-a~pit-a", message: { text: "a dm" } },
+      { id: "dl4", agent: "local-a", channel_id: "ch_unknown", message: { text: "?" } },
+    );
+    const res = await h.call("GET", "/v1/deliveries?limit=50", local);
+    expect(res.status).toBe(200);
+    expect(res.body.data.map((d: any) => d.id)).toEqual(["dl1", "dl3"]);
+    expect(h.up.failed).toEqual([
+      { id: "dl2", body: { error: "relaygate_denied", retryable: false } },
+      { id: "dl4", body: { error: "relaygate_denied", retryable: false } },
+    ]);
+    expect((await h.call("POST", "/v1/deliveries/dl1/ack", local, {})).status).toBe(200);
+    expect(h.up.calls.at(-1)).toMatchObject({ method: "POST", path: "/v1/deliveries/dl1/ack" });
+  });
+
+  it("lets an agent update and remove only itself; removal ends its tokens", async () => {
+    const h = harness();
+    const local = await h.token(KEYS.local, "local-a");
+    const patched = await h.call("PATCH", "/v1/agent", local, { status: "online", metadata: { cwd: "/x", relaygate: { forged: true } }, name: "pit-a" });
+    expect(patched.status).toBe(200);
+    expect(h.up.calls.at(-1)).toMatchObject({ method: "PATCH", path: "/v1/agents/local-a", body: { status: "online", metadata: { cwd: "/x" } } });
+    expect((await h.call("DELETE", "/v1/agent", local)).status).toBe(200);
+    expect(h.up.calls.at(-1)).toMatchObject({ method: "DELETE", path: "/v1/agents/local-a" });
+    expect((await h.call("GET", "/v1/agent", local)).status).toBe(401);
+  });
+});
+

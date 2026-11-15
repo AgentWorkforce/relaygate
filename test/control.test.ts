@@ -13,7 +13,8 @@ const INTERNAL = "read-api-internal-secret";
 
 /** The users relay-control knows, by device token. */
 const DEVICES: Record<string, Record<string, unknown>> = {
-  sh_at_member: { active: true, principal_type: "desktop-user", sub: "u-member", email: "dev@example.test", org: "org-1", workspace: "ws-1", role: "member", scopes: ["rth:sync", "rth:read"], exp: 4_102_444_800 },
+  sh_at_member: { active: true, principal_type: "desktop-user", sub: "u-member", email: "dev@example.test", org: "org-1", workspace: "ws-1", role: "member", scopes: ["rth:sync", "rth:read", "cli:auth"], exp: 4_102_444_800 },
+  sh_at_member2: { active: true, principal_type: "desktop-user", sub: "u-member2", org: "org-1", workspace: "ws-1", role: "member", scopes: ["cli:auth", "rth:sync"], exp: 4_102_444_800 },
   sh_at_inside: { active: true, principal_type: "desktop-user", sub: "u-inside", email: "inside@example.test", org: "org-1", workspace: "ws-1", role: "member", scopes: ["rth:sync"], exp: 4_102_444_800 },
   sh_at_otherorg: { active: true, principal_type: "desktop-user", sub: "u-x", org: "org-2", role: "owner", scopes: [] },
   sh_at_revoked: { active: false, reason: "revoked" },
@@ -266,6 +267,45 @@ describe("relay-control principals: review regressions", () => {
   it("an unreadable introspection answer is Control failing (503), not a bad token", async () => {
     const h = harness({ garbled: true });
     expect((await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", h.batch("s1"))).status).toBe(503);
+  });
+});
+
+describe("desktop enrolment: POST /v1/register with a device token", () => {
+  it("enrols an agent in the person's group with an expiring token, and recovers it for the same person only", async () => {
+    const h = harness();
+    const proof = "recovery-proof-0123456789";
+    const first = await h.call("POST", "/v1/register", "sh_at_member", { name: "desk-a", recovery: proof });
+    expect(first.status).toBe(200);
+    expect(first.body).toMatchObject({ gid: 11, user_id: "u-member" });
+    expect(String(first.body.token)).toMatch(/^rg_/);
+    const exp = Date.parse(first.body.expires_at);
+    expect(exp).toBeGreaterThan(Date.now());
+    expect(exp).toBeLessThanOrEqual(Date.now() + 24 * 3600 * 1000 + 1000);
+    expect((await h.call("GET", "/v1/whoami", first.body.token)).body).toMatchObject({ gid: 11 });
+    // Same person, same proof: same agent, new token, old one revoked.
+    const again = await h.call("POST", "/v1/register", "sh_at_member", { name: "desk-a", recovery: proof });
+    expect(again.body.agent_id).toBe(first.body.agent_id);
+    expect((await h.call("GET", "/v1/whoami", first.body.token)).status).toBe(401);
+    // Another person, even with the proof, can't take the name; nor can an enrollment key.
+    expect((await h.call("POST", "/v1/register", "sh_at_member2", { name: "desk-a", recovery: proof })).status).toBe(409);
+    expect((await h.call("POST", "/v1/register", "enroll-local-0000000000000000", { name: "desk-a", recovery: proof })).status).toBe(409);
+  });
+
+  it("an expired device-enrolled token is refused", async () => {
+    const h = harness();
+    const r = await h.call("POST", "/v1/register", "sh_at_member", { name: "desk-b" });
+    const agent = h.store.agentByName("desk-b")!;
+    const stale = h.store.issueToken(agent.id, Date.now() - 1000);
+    expect((await h.call("GET", "/v1/whoami", stale)).status).toBe(401);
+    expect((await h.call("GET", "/v1/whoami", r.body.token)).status).toBe(200);
+  });
+
+  it("refuses device tokens without cli:auth, people no rule matches, invalid tokens and reserved names", async () => {
+    const h = harness();
+    expect((await h.call("POST", "/v1/register", "sh_at_inside", { name: "desk-c" })).status).toBe(403);
+    expect((await h.call("POST", "/v1/register", "sh_at_otherorg", { name: "desk-c" })).status).toBe(403);
+    expect((await h.call("POST", "/v1/register", "sh_at_revoked", { name: "desk-c" })).status).toBe(401);
+    expect((await h.call("POST", "/v1/register", "sh_at_member", { name: "ctl:u-member" })).status).toBe(400);
   });
 });
 

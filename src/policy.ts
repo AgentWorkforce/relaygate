@@ -88,6 +88,8 @@ export const PolicySchema = z.object({
           .default({}),
         gid: Gid,
         groups: z.array(Gid).default([]),
+        /** Agent names this person's desktop may enrol (POST /v1/register with a device token). */
+        namePrefix: z.string().min(1).optional(),
       }),
     )
     .default([]),
