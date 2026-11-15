@@ -24,6 +24,11 @@ import { fakeSessionsServer } from "./fake-sessions.js";
 const KEYS = { local: "enroll-local-dryrun-000000000000", pit: "enroll-pit-dryrun-00000000000000", "slack-bridge": "enroll-bridge-dryrun-0000000000" };
 const ADMIN = "admin-token-dryrun-000000000000";
 const closers: Array<() => void> = [];
+
+const DEPLOYMENT_VARS = /^(RG_|SESSIONS_READ_REFRESH_CMD$|INSIDE_LOGS_CMD$|INSIDE_AGENTS$|RELAYCAST_DIRECT_URL$|OUTSIDE_|INSIDE_SESSIONS_|ADMIN_TOKEN$|POLICY_FILE$)/;
+function withoutDeploymentHooks(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(env).filter(([k]) => !DEPLOYMENT_VARS.test(k)));
+}
 afterAll(() => closers.forEach((f) => f()));
 
 const listen = async (server: Server) => {
@@ -58,7 +63,8 @@ describe("acceptance driver dry run", { timeout: 300_000 }, () => {
 
     const out = await new Promise<{ code: number | null; text: string }>((resolve) => {
       const child = spawn(process.execPath, ["--import", "tsx", "scripts/acceptance/run.ts"], {
-        env: { ...process.env, RELAYGATE_URL: gateUrl, OUTSIDE_KEY: KEYS.local, INSIDE_KEY: KEYS.pit, ADMIN_TOKEN: ADMIN, POLICY_FILE: policyFile, RUN_ID: "dry-1_a", SESSIONS_ORG_ID: "org-dry", SESSIONS_WORKSPACE_ID: "ws-dry", ACCEPTANCE_REALTIME: "optional" },
+        // Never inherit the operator's deployment hooks: this run targets in-process stand-ins only.
+        env: { ...withoutDeploymentHooks(process.env), RELAYGATE_URL: gateUrl, OUTSIDE_KEY: KEYS.local, INSIDE_KEY: KEYS.pit, ADMIN_TOKEN: ADMIN, POLICY_FILE: policyFile, RUN_ID: "dry-1_a", SESSIONS_ORG_ID: "org-dry", SESSIONS_WORKSPACE_ID: "ws-dry", ACCEPTANCE_REALTIME: "optional" },
       });
       let text = "";
       child.stdout.on("data", (d) => (text += d));

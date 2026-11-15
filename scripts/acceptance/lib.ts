@@ -197,9 +197,9 @@ export function fakeDocument(canary: string): string {
 }
 
 /** A minimal Relaycast node-transport client (through relaygate): collects every frame as text. */
-export async function listen(gate: Gate, onFrame: (text: string) => void): Promise<{ close: () => void; opened: boolean }> {
+export async function listen(gate: Gate, onFrame: (text: string) => void): Promise<{ close: () => void; opened: boolean; isOpen: () => boolean }> {
   const nt = await gate.call("POST", "/v1/agent/node-token", {});
-  if (nt.status !== 200) return { close: () => {}, opened: false };
+  if (nt.status !== 200) return { close: () => {}, opened: false, isOpen: () => false };
   const d = dataOf(nt);
   const wsUrl = new URL("/v1/node/ws", gate.url);
   wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
@@ -225,5 +225,5 @@ export async function listen(gate: Gate, onFrame: (text: string) => void): Promi
       }
     });
   }
-  return { close: () => ws.close(), opened };
+  return { close: () => ws.close(), opened, isOpen: () => ws.readyState === WebSocket.OPEN };
 }

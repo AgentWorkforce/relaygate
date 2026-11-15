@@ -76,8 +76,16 @@ async function auditHead(): Promise<number> {
 /** Waits until `agent` has audit rows for every action in `actions` after `after`. */
 async function waitFor(agent: string, after: number, actions: string[], ms = 90_000): Promise<any[]> {
   const start = Date.now();
+  const rows: any[] = [];
+  let cursor = after;
   for (;;) {
-    const rows = await audit(after, agent);
+    // Page forward from where the last read stopped, keeping everything collected so far.
+    for (;;) {
+      const page = await audit(cursor, agent);
+      rows.push(...page);
+      if (page.length) cursor = page.at(-1).seq;
+      if (page.length < 1000) break;
+    }
     if (actions.every((a) => rows.some((r) => r.action === a))) return rows;
     if (Date.now() - start > ms) return rows;
     await sleep(2000);
@@ -161,7 +169,7 @@ async function main() {
   const control = `realtime-control-${RUN}`;
   if (socket.opened) await localB.call("POST", "/v1/dm", { to: localA.name, text: control });
   for (let i = 0; i < 15 && !frames.some((f) => f.includes(control)); i++) await sleep(1000);
-  const realtime = socket.opened && frames.some((f) => f.includes(control));
+  let realtime = socket.opened && frames.some((f) => f.includes(control));
   const realtimeOptional = process.env.ACCEPTANCE_REALTIME === "optional";
   console.log(`realtime: ${realtime ? "control delivery seen on the outside socket" : `NOT VERIFIED (socket ${socket.opened ? "open, no control delivery" : "did not open"})`}`);
   // Outside setup: a channel and a session that exist before any inside agent writes, so none can claim them.
@@ -257,7 +265,10 @@ async function main() {
     const list = await localA.call("GET", "/v1/channels");
     const listed = (dataOf(list) ?? []).some((c: any) => c.name === ch);
     const leaked = JSON.stringify(search.body).includes(CANARY_PREFIX);
-    const refused = checks.every(([, r]) => r.status === 403 || (r.status === 404 && String(JSON.stringify(r.body)).includes("relaygate")));
+    // Without a Sessions proxy, the session routes don't exist at all (a plain 404): nothing to read there either.
+    const refused = checks.every(
+      ([name, r]) => r.status === 403 || (r.status === 404 && (String(JSON.stringify(r.body)).includes("relaygate") || (name.startsWith("session") && up.status === 404))),
+    );
     const rows = await audit(h, localA.name);
     record(
       3,
@@ -277,6 +288,13 @@ async function main() {
     const answers = askBlocked ? [] : (await waitFor(pitA, h, ["dm.send"], 60_000)).filter((r) => r.op === "w" && ["dm.send", "thread.reply"].includes(r.action));
     await sleep(3000);
     refreshReads();
+    // Realtime counts only if the socket stayed live through the attempts: a second control delivery, seen now.
+    if (realtime) {
+      const control2 = `realtime-control-2-${RUN}`;
+      await localB.call("POST", "/v1/dm", { to: localA.name, text: control2 });
+      for (let i = 0; i < 15 && !frames.some((f) => f.includes(control2)); i++) await sleep(1000);
+      realtime = socket.isOpen() && frames.some((f) => f.includes(control2));
+    }
     const sweep = await canarySweep([localA, localB], localChannel, up.status === 404 ? undefined : localSession, frames);
     const found = sweep.hits;
     const realtimeOk = realtime || realtimeOptional;
@@ -292,7 +310,7 @@ async function main() {
         found.length ? `CANARY FOUND: ${found.join(", ")}` : `canary ${CANARY_PREFIX}… absent from inbox, DMs, channel, search, session${realtime ? ", realtime frames" : ""}`,
         ...(sweep.gaps.length ? [`SWEEP INCOMPLETE (reads failed, so absence isn't proven): ${sweep.gaps.join("; ")}`] : []),
         realtime
-          ? `realtime swept: ${frames.length} frames on the outside socket, control delivery seen`
+          ? `realtime swept: ${frames.length} frames on the outside socket, control deliveries seen before and after the attempts`
           : `realtime NOT swept (no live outside socket)${realtimeOptional ? "; ACCEPTANCE_REALTIME=optional" : ": FAIL (set ACCEPTANCE_REALTIME=optional only where realtime isn't proxied)"}`,
       ],
       [...(await audit(h, localA.name)).filter((r) => r.action === "dm.send").map(fmt), ...answers.map(fmt)],
@@ -349,7 +367,9 @@ async function main() {
     const r1 = await localA.call("GET", `/sessions/v1/sessions/${docSession(RUN)}/turns`);
     const r2 = await localB.call("GET", `/sessions/v1/sessions/${docSession(RUN)}/metadata`);
     const listed = await localA.call("GET", "/sessions/v1/sessions?limit=200");
-    const inList = JSON.stringify(listed.body).includes(docSession(RUN));
+    // Absence from the list is only evidence if the list itself worked.
+    const listOk = ok(listed.status) && Array.isArray(listed.body?.sessions);
+    const inList = !listOk || JSON.stringify(listed.body).includes(docSession(RUN));
     // The refusals only mean something if the document really was stored: the inside agent's own upload status and
     // its read-back (canary present, as a boolean).
     const lines = insideLines().filter((l) => l.agent === pitA);
@@ -365,7 +385,7 @@ async function main() {
         canSee
           ? `inside upload ${seedUp?.status ?? "not seen"}; inside read-back ${verify?.status ?? "not seen"}, canary present: ${verify?.hasCanary ?? false}`
           : "inside upload unverified: set INSIDE_LOGS_CMD so the driver can read the inside agents' status lines",
-        `outside: turns ${r1.status}; metadata ${r2.status}; in outside list: ${inList}`,
+        `outside: turns ${r1.status}; metadata ${r2.status}; list ${listed.status}${listOk ? `, in outside list: ${inList}` : " (list failed, so exclusion isn't proven)"}`,
         "MANUAL: confirm the admin sees it in the dashboard (scenario 13).",
       ],
     );
@@ -405,17 +425,18 @@ async function main() {
   {
     const bad = await request(URL_, "POST", "/v1/register", `not-a-key-${RUN}`, { name: `${OUT_PREFIX}acc-x-${RUN}` });
     const notes = [`unknown enrollment key: ${bad.status}`];
-    let expired: string | undefined;
+    let expiredOk = true;
     if (process.env.POLICY_FILE) {
       const draft = JSON.parse(readFileSync(process.env.POLICY_FILE, "utf8").replace(/<sha256[^>]*>/g, "0".repeat(64)));
       const gid = draft.groups[0].gid;
       draft.enrollmentKeys.push({ id: `acc-expired-${RUN}`, gid, sha256: "f".repeat(64), guest: true, expiresAt: "2020-01-01T00:00:00Z" });
       const r = await request(URL_, "POST", "/admin/v1/explain", ADMIN, { policy: draft, as: { key: `acc-expired-${RUN}` }, op: "r", resource: { kind: "stream", id: `relaycast:channel/${localChannel}` } });
-      expired = r.body?.reason;
-      notes.push(`guest key with expiresAt in the past (draft policy, via explain): ${r.body?.decision} (${expired})`);
+      // Enabled, so it must really answer: a successful explain that denies with key_expired.
+      expiredOk = r.status === 200 && r.body?.decision === "deny" && r.body?.reason === "key_expired";
+      notes.push(`guest key with expiresAt in the past (draft policy, via explain): ${r.status} ${r.body?.decision ?? ""} (${r.body?.reason ?? r.body?.error?.code ?? r.body?.error ?? ""})`);
     } else notes.push("expired guest key: SKIPPED (set POLICY_FILE to check it against a draft policy; the deployment policy has no guest key)");
     notes.push("A revoked or expired guest key ending live tokens is covered by relaygate's unit tests (test/app.test.ts, enrollment key lifecycle).");
-    record(10, "unenrolled key refused; expired guest key can't register", bad.status === 401 && (expired === undefined || expired === "key_expired") ? "PASS" : "FAIL", notes);
+    record(10, "unenrolled key refused; expired guest key can't register", bad.status === 401 && expiredOk ? "PASS" : "FAIL", notes);
   }
 
   // --- 11. no fail-open --------------------------------------------------------------------------------------
@@ -459,8 +480,9 @@ async function main() {
     let restoredOnce = false;
     const restore = () => {
       if (restoredOnce) return;
-      restoredOnce = true;
+      // Marked done only once the command succeeds, so the exit handler retries a failed restore.
       execSync(process.env.RG_POLICY_RESTORE_CMD!, { stdio: "inherit" });
+      restoredOnce = true;
     };
     process.once("exit", restore);
     let flipped: string | undefined, allowed: any, restored: string | undefined, deniedAgain: any;

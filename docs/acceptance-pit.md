@@ -153,6 +153,7 @@ export INSIDE_LOGS_CMD='kubectl -n <inside namespace> logs -l app=acceptance-ins
 # Self-hosted Sessions (session-ingest + session-read-api): uploads use the native delivery protocol, whose
 # account id is derived from the org and workspace, and every read names the workspace:
 # export SESSIONS_ORG_ID=<org id>  SESSIONS_WORKSPACE_ID=<workspace id>
+set -o pipefail   # keep the driver's exit code through tee
 node scripts/acceptance/run.ts | tee acceptance-$(date +%Y%m%d-%H%M).log
 ```
 
