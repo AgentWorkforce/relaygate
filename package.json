@@ -31,5 +31,6 @@
   },
   "bin": {
     "relaygate-explain": "dist/explain-cli.js"
-  }
+  },
+  "license": "FSL-1.1-ALv2"
 }

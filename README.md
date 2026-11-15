@@ -72,3 +72,7 @@ Example policies with their cases: `examples/policy.pit.json` (with a guest)
 and `examples/policy.double-pit.json` (two groups: laptops outside the
 regulated boundary, cloud agents inside it).
 
+
+## License
+
+relaygate is licensed under the [Functional Source License, Version 1.1, ALv2 Future License](LICENSE) (FSL-1.1-ALv2). You may use, copy, modify and self-host it for any purpose except offering a product or service that competes with Agent Relay. Each version becomes available under the Apache License 2.0 two years after it is released.
