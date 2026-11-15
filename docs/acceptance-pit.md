@@ -130,6 +130,10 @@ it then runs two inside agents in-process.
 
 ### 3. Run the driver
 
+Sessions read tokens (`rth_at_read_…`) are short-lived: mint them just before
+the run. An expired one shows up as `upstream 401` in scenarios 6 and 8 (the gate
+allowed the read; Sessions refused the token).
+
 ```
 export OUTSIDE_KEY=<outside enrollment key>
 export ADMIN_TOKEN=<relaygate admin token>

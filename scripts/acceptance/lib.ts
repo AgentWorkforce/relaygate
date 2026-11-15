@@ -149,6 +149,8 @@ export interface Command {
   session?: string;
   /** A DM message id to try to reply under. */
   dm?: string;
+  /** Text the inside agent should find in a session it reads (logged as a boolean). */
+  marker?: string;
 }
 
 export const docChannel = (run: string, prefix: string) => `${prefix}acc-doc-${run}`;

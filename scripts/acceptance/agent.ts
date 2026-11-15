@@ -115,7 +115,10 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
     }
     case "read-session": {
       // Scenario 6: the boundary may read the outside's sessions.
-      if (cmd.session) await attempt("read.session", "GET", `/sessions/v1/sessions/${cmd.session}/events`);
+      if (cmd.session) {
+        const r = await gate.call("GET", `/sessions/v1/sessions/${cmd.session}/events`);
+        log(JSON.stringify({ agent: gate.name, run: cmd.run, attempt: "read.session", status: r.status, hasMarker: !!cmd.marker && JSON.stringify(r.body ?? "").includes(cmd.marker) }));
+      }
       return;
     }
   }

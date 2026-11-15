@@ -152,7 +152,8 @@ async function main() {
   // Outside setup: a channel and a session that exist before any inside agent writes, so none can claim them.
   await localA.call("POST", "/v1/channels", { name: localChannel, topic: "acceptance outside channel" });
   await localA.call("POST", `/v1/channels/${localChannel}/join`, {});
-  const up = await localA.sessionWrite(localSession, `outside work log ${RUN}`);
+  const marker = `outside work log ${RUN}`;
+  const up = await localA.sessionWrite(localSession, marker);
   let head = await auditHead();
   const start = head;
   const targets = (to: Gate) => ({ to: to.name, channel: localChannel, session: up.status === 404 ? undefined : localSession });
@@ -183,14 +184,23 @@ async function main() {
     } else {
       const peer = await localB.call("GET", `/sessions/v1/sessions/${localSession}/events`);
       const h = await auditHead();
-      await command(localA, pitA, { acc: "read-session", run: RUN, session: localSession });
+      await command(localA, pitA, { acc: "read-session", run: RUN, session: localSession, marker });
       const rows = await waitFor(pitA, h, ["session.read"]);
       const insideRead = rows.find((r) => r.action === "session.read" && r.resource_id === localSession);
+      // The gate's allow is logged before forwarding; the inside agent's own status line shows the read landed.
+      let actual: any;
+      for (let i = 0; i < 20 && !(actual = insideLines().find((l) => l.agent === pitA && l.attempt === "read.session")); i++) await sleep(1500);
+      const peerHas = JSON.stringify(peer.body ?? "").includes(marker);
+      const canSee = inline || !!process.env.INSIDE_LOGS_CMD;
       record(
         6,
         "outside session upload is stored; readable by another outside agent and by an inside agent",
-        ok(up.status) && ok(peer.status) && insideRead?.decision === "allow" ? "PASS" : "FAIL",
-        [`upload ${up.status}; outside peer read ${peer.status}; inside read ${insideRead?.decision ?? "not seen"}`, "MANUAL: confirm the admin sees it in the dashboard (scenario 13)."],
+        ok(up.status) && ok(peer.status) && peerHas && insideRead?.decision === "allow" && ok(actual?.status ?? 0) && actual?.hasMarker === true ? "PASS" : "FAIL",
+        [
+          `upload ${up.status}; outside peer read ${peer.status} (marker present: ${peerHas})`,
+          canSee ? `inside read: gate ${insideRead?.decision ?? "not seen"}, upstream ${actual?.status ?? "not seen"}, marker present: ${actual?.hasMarker ?? false}` : "inside read unverified: set INSIDE_LOGS_CMD",
+          "MANUAL: confirm the admin sees it in the dashboard (scenario 13).",
+        ],
         rows.filter((r) => r.action === "session.read").map(fmt),
       );
     }
@@ -201,9 +211,17 @@ async function main() {
     const h = await auditHead();
     await command(localA, pitA, { acc: "reply", run: RUN, channel: localChannel });
     const rows = await waitFor(pitA, h, ["dm.send", "channel.post", "thread.reply"]);
-    const attempts = rows.filter((r) => ["dm.send", "channel.post", "thread.reply"].includes(r.action));
-    const allDenied = attempts.length >= 2 && attempts.every((r) => r.decision === "deny");
-    record(2, "inside agent replies to the outside agent (DM, outside stream, thread): refused", allDenied ? "PASS" : "FAIL", [`${attempts.length} attempts, all denied: ${allDenied}`], attempts.map(fmt));
+    const kinds = ["dm.send", "channel.post", "thread.reply"];
+    const attempts = rows.filter((r) => kinds.includes(r.action));
+    const missing = kinds.filter((k) => !attempts.some((r) => r.action === k && r.decision === "deny"));
+    const allDenied = missing.length === 0 && attempts.every((r) => r.decision === "deny");
+    record(
+      2,
+      "inside agent replies to the outside agent (DM, outside stream, thread): refused",
+      allDenied ? "PASS" : "FAIL",
+      [`${attempts.length} attempts, all denied: ${attempts.every((r) => r.decision === "deny")}`, ...(missing.length ? [`no denied row for: ${missing.join(", ")}`] : [])],
+      attempts.map(fmt),
+    );
   }
 
   // --- 3. outside reads the inside document: refused --------------------------------------------------------
@@ -262,7 +280,7 @@ async function main() {
 
   // --- 5. the inside agents' unprompted side doors (after seeding): all refused -----------------------------
   {
-    const expected = ["dm.send", "channel.post", "session.write", "channel.create", "stream.register", "check"].filter((a) => a !== "session.write" || up.status !== 404);
+    const expected = ["dm.send", "thread.reply", "channel.post", "session.write", "channel.create", "stream.register", "check"].filter((a) => a !== "session.write" || up.status !== 404);
     const rowsA = await waitFor(pitA, start, expected);
     const rowsB = await waitFor(pitB, start, expected);
     // Every write the inside agents attempted, except seeding their own in-boundary document.
