@@ -258,6 +258,8 @@ describe("Relaycast proxy: review regressions", () => {
     expect((await h.call("GET", `/v1/messages/${id}`, pit)).status).toBe(200);
     (h.deps.policy() as any).streamOverrides.push({ id: "relaycast:inbox/pit-a", gid: 22, mode: "000", classify: false, acl: [] });
     expect((await h.call("GET", `/v1/messages/${id}`, pit)).status).toBe(403);
+    expect((await h.call("GET", "/v1/dm/conversations", pit)).body.data).toEqual([]);
+    expect((await h.call("GET", "/v1/inbox", pit)).body.data.unread_dms).toEqual([]);
   });
 
   it("never forwards `from` on a DM", async () => {

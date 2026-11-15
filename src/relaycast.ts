@@ -461,8 +461,10 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
   app.get("/v1/dm/conversations", async (c) => {
     const res = await forward(c, "GET", pathWithQuery(c));
     if (res.status !== 200) return pass(c, res);
-    // Group DMs aren't modelled by relaygate; only 1:1 conversations are listed.
-    const visible = asArray(dataOf(res.body)).filter((conv) => conv.type === undefined || conv.type === "dm" || conv.type === "direct");
+    // Group DMs aren't modelled by relaygate; only 1:1 conversations are listed, and only while the caller may read
+    // its own inbox (each entry carries the last message).
+    const inbox = canRead(deps, c.get("principal"), inboxStream(c.get("agent").name));
+    const visible = inbox ? asArray(dataOf(res.body)).filter((conv) => conv.type === undefined || conv.type === "dm" || conv.type === "direct") : [];
     return c.json({ ...(res.body as object), data: visible }, 200);
   });
 
@@ -501,7 +503,8 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
       ...data,
       unread_channels: asArray(data.unread_channels).filter(readable),
       mentions: asArray(data.mentions).filter(readable),
-      unread_dms: asArray(data.unread_dms),
+      // DM entries carry message text: they are the caller's inbox.
+      unread_dms: canRead(deps, principal, inboxStream(c.get("agent").name)) ? asArray(data.unread_dms) : [],
       recent_reactions: asArray(data.recent_reactions).filter(readable),
     };
     return c.json({ ...(res.body as object), data: filtered }, 200);
