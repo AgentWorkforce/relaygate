@@ -302,6 +302,55 @@ A second registration with the same name:
 
 The group never changes on re-registration.
 
+### Enrolling with a device token
+
+An agent run by a person's desktop app enrols with that person's relay-control
+device token instead of an enrollment key:
+
+```
+POST /v1/register
+Authorization: Bearer sh_at_...
+{"name": "<name>", "recovery": "<proof>"}
+
+200 {"agent_id": "...", "gid": 11, "token": "rg_...", "expires_at": "<ISO-8601>",
+     "user_id": "<control user id>"}
+```
+
+- relaygate introspects the device token with relay-control (as for Sessions,
+  "Control principals") and maps the person through `controlPrincipals`; the
+  agent gets that rule's `gid` and `groups`. A rule may set `namePrefix`, and
+  then names outside it answer `403 relaygate_name_scope`. Names starting
+  `ctl:` are reserved.
+- The token expires (`expires_at`): at the device token's own expiry, and at
+  most 24 hours after registration. Before then the app registers again with
+  the same `name` and `recovery`, which returns the same `agent_id` and a new
+  token and revokes the old one; that is also how a revoked device token, or a
+  person removed from the org, stops their agents within a day at most. An expired token answers `401 relaygate_unauthenticated`, the cue to
+  register again.
+- Re-registration with the same name works only for the same person (the
+  same relay-control user) and the same `recovery` proof; otherwise `409
+  relaygate_name_taken`.
+- Errors: `401 relaygate_unauthenticated` (an inactive device token), `403
+  relaygate_denied` (no `controlPrincipals` rule matches the person, or the
+  device token lacks the `cli:auth` scope), `403 relaygate_name_scope`, `409
+  relaygate_name_taken`, `503 relaygate_unavailable` (relay-control can't
+  answer).
+
+### Agent status and removal
+
+```
+PATCH /v1/agent           {"status"?, "persona"?, "metadata"?, "skills"?}
+DELETE /v1/agent
+Authorization: Bearer rg_...
+```
+
+`PATCH` updates the caller's own upstream agent (relaygate forwards it to
+Relaycast's `PATCH /v1/agents/<name>` with the workspace key); a
+`metadata.relaygate` key is dropped. `DELETE` removes the caller's upstream
+agent, revokes all of its `rg_` tokens and closes its sockets; the name stays
+reserved for that owner (the same enrollment key or person, with the recovery
+proof). An agent can only change itself.
+
 ### Humans behind a bridge
 
 Humans don't call relaygate. A bridge acts as its own principal in its group
@@ -379,7 +428,10 @@ Relaycast's realtime path (`POST /v1/agent/node-token`, then the
 the upstream socket itself, and:
 
 - forwards only `node.register` (forced to the agent's own node id, with no
-  capabilities), `node.heartbeat` and `delivery.ack` for the agent itself;
+  capabilities; every other field, such as `name`, `max_agents`, `tags`,
+  `version`, `machine_id`, `origin_surface` and `provider` `{name,
+  instance_id}`, passes through unchanged), `node.heartbeat` and
+  `delivery.ack` for the agent itself;
   any other client frame is refused with an `error` frame;
 - forwards a `deliver` only if it is for the agent and the agent may read its
   stream (`message.created` and `thread.reply` by `channel_name`, `dm.received`
@@ -396,6 +448,29 @@ proxied.
 **Open:** a dropped delivery is never acked to Relaycast by relaygate (an ack is
 cumulative and would acknowledge frames the client hasn't processed), so it may
 be redelivered on reconnect, and dropped again.
+
+### The delivery queue
+
+Relaycast keeps a durable delivery queue per agent; relaygate serves it with
+the caller's own upstream identity, filtered like everything else:
+
+```
+GET  /v1/deliveries?status=<queued|delivered|acked|failed|dead_lettered>&limit=<1..200>
+POST /v1/deliveries/:id/ack
+POST /v1/deliveries/:id/fail    {"error"?: string, "retryable"?: boolean}
+POST /v1/deliveries/:id/defer   {"available_at": "<ISO-8601>", "reason"?: string}
+Authorization: Bearer rg_...
+```
+
+Requests and responses are Relaycast's (`{ok, data}`; a delivery item is
+Relaycast's delivery record plus its `message`). relaygate places each item by
+its `channel_id`: a channel the caller may read is returned; a 1:1 DM is the
+caller's own inbox (returned if it may read its inbox); anything else (a group
+DM, an unknown channel, a channel it may not read) is never returned, and
+relaygate marks it failed upstream (`error: "relaygate_denied"`,
+`retryable: false`) so it isn't redelivered. `ack`, `fail` and `defer` act
+only on the caller's own deliveries (Relaycast checks ownership) and answer
+Relaycast's `404 delivery_not_found` for anyone else's.
 
 ### The sender's groups travel with the message
 
@@ -511,7 +586,9 @@ wins, and a user no rule matches is refused:
 ```
 
 `match` takes `kinds` (`device`, `read`), `orgIds`, `workspaceIds`, `roles`,
-`userIds` and `emails`. A read token minted without a role never matches a rule
+`userIds` and `emails`. A rule may also set `namePrefix`, which limits the
+agent names that person's desktop may enrol (see "Enrolling with a device
+token"). A read token minted without a role never matches a rule
 that needs one; without an email it uses the email relay-control last reported
 for that user (from a device-token introspection), and otherwise doesn't match
 an email rule.
