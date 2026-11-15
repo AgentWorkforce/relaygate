@@ -120,11 +120,13 @@ export function longestPrefix(id: string, policy: Policy) {
 
 export const groupName = (policy: Policy, gid: number) => policy.groups.find((g) => g.gid === gid)?.name ?? String(gid);
 
-export type Decision =
+/** Every decision carries the version of the policy it was evaluated under, for the audit row. */
+export type Decision = (
   | { status: "allow"; stage: "mode" | "classifier"; reason: string }
   | { status: "deny"; stage: "mode" | "classifier"; error: "relaygate_denied" | "relaygate_classified"; reason: string }
   | { status: "unavailable"; stage: "classifier"; reason: string }
-  | { status: "invalid"; reason: string };
+  | { status: "invalid"; reason: string }
+) & { policyVersion?: string };
 
 /** The whole decision for one request: mode check first, then the classifier when the contract requires it. */
 export async function decide(
@@ -135,9 +137,10 @@ export async function decide(
   streamId: string,
   content: string | undefined,
 ): Promise<Decision> {
-  const stream = resolveStream(streamId, deps.store, deps.policy());
-  if (!stream) return { status: "deny", stage: "mode", error: "relaygate_denied", reason: "unknown_stream" };
-  return decideResource(deps, agent, principal, op, { kind: "stream", ...stream }, content);
+  const policy = deps.policy();
+  const stream = resolveStream(streamId, deps.store, policy);
+  if (!stream) return { status: "deny", stage: "mode", error: "relaygate_denied", reason: "unknown_stream", policyVersion: policyVersion(policy) };
+  return decideResource(deps, agent, principal, op, { kind: "stream", ...stream }, content, policy);
 }
 
 export interface ResolvedResource extends Guarded {
@@ -156,8 +159,22 @@ export async function decideResource(
   op: Op,
   x: ResolvedResource,
   content: string | undefined,
+  snapshot?: Policy,
 ): Promise<Decision> {
-  const policy = deps.policy();
+  const policy = snapshot ?? deps.policy();
+  const d = await decideWith(deps, agent, principal, op, x, content, policy);
+  return { ...d, policyVersion: policyVersion(policy) };
+}
+
+async function decideWith(
+  deps: Deps,
+  agent: Agent,
+  principal: Principal,
+  op: Op,
+  x: ResolvedResource,
+  content: string | undefined,
+  policy: Policy,
+): Promise<Decision> {
   const result = check(principal, x, op, policy.ceilings);
   const modeReason = `${result.reason}:${x.source}`;
   if (!result.allowed) return { status: "deny", stage: "mode", error: "relaygate_denied", reason: modeReason };
@@ -397,7 +414,7 @@ export function createApp(deps: Deps) {
     const { op, resource, content } = parsed.data;
     const d = await decide(deps, agent, c.get("principal"), op, resource.id, content);
     const audit = (decision: "allow" | "deny" | "unavailable", stage: "mode" | "classifier" | null, reason: string) =>
-      store.audit({ agentId: agent.id, action: "check", op, resourceKind: resource.kind, resourceId: resource.id, decision, stage, reason });
+      store.audit({ agentId: agent.id, action: "check", op, resourceKind: resource.kind, resourceId: resource.id, decision, stage, reason, policyVersion: d.policyVersion });
 
     switch (d.status) {
       case "invalid":

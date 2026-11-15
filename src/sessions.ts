@@ -46,8 +46,8 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   const { store } = deps;
   type Ctx = Context<Env>;
 
-  const audit = (c: Ctx, action: string, op: Op, id: string | null, decision: "allow" | "deny" | "unavailable", stage: "mode" | "classifier" | null, reason: string) =>
-    store.audit({ agentId: c.get("agent").id, action, op, resourceKind: "session", resourceId: id, decision, stage, reason });
+  const audit = (c: Ctx, action: string, op: Op, id: string | null, decision: "allow" | "deny" | "unavailable", stage: "mode" | "classifier" | null, reason: string, policyVersion?: string) =>
+    store.audit({ policyVersion, agentId: c.get("agent").id, action, op, resourceKind: "session", resourceId: id, decision, stage, reason });
 
   const upstream = async (c: Ctx, method: string, path: string, body?: unknown) => {
     try {
@@ -87,13 +87,13 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   const refusal = (c: Ctx, id: string, d: Awaited<ReturnType<typeof decideWrite>>): Response | undefined => {
     switch (d.status) {
       case "allow":
-        audit(c, "session.write", "w", id, "allow", d.stage, d.reason);
+        audit(c, "session.write", "w", id, "allow", d.stage, d.reason, d.policyVersion);
         return undefined;
       case "deny":
-        audit(c, "session.write", "w", id, "deny", d.stage, d.reason);
+        audit(c, "session.write", "w", id, "deny", d.stage, d.reason, d.policyVersion);
         return deny(c, 403, d.error, { op: "w", resource: `session:${id}` });
       case "unavailable":
-        audit(c, "session.write", "w", id, "unavailable", d.stage, d.reason);
+        audit(c, "session.write", "w", id, "unavailable", d.stage, d.reason, d.policyVersion);
         return deny(c, 503, "relaygate_unavailable");
       case "invalid":
         return deny(c, 400, "relaygate_bad_request", { detail: d.reason });

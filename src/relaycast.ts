@@ -207,8 +207,8 @@ type Ctx = Context<Env>;
 export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUpstream): void {
   const { store } = deps;
 
-  const audit = (c: Ctx, action: string, op: Op | null, id: string | null, decision: "allow" | "deny" | "unavailable", stage: "mode" | "classifier" | null, reason: string) =>
-    store.audit({ agentId: c.get("agent").id, action, op, resourceKind: id ? "stream" : null, resourceId: id, decision, stage, reason });
+  const audit = (c: Ctx, action: string, op: Op | null, id: string | null, decision: "allow" | "deny" | "unavailable", stage: "mode" | "classifier" | null, reason: string, policyVersion?: string) =>
+    store.audit({ policyVersion, agentId: c.get("agent").id, action, op, resourceKind: id ? "stream" : null, resourceId: id, decision, stage, reason });
 
   const denied = (c: Ctx, op: Op, id: string) => deny(c, 403, "relaygate_denied", { op, resource: id });
 
@@ -248,13 +248,13 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
     const d = await decide(deps, c.get("agent"), c.get("principal"), "w", id, content);
     switch (d.status) {
       case "allow":
-        audit(c, action, "w", id, "allow", d.stage, d.reason);
+        audit(c, action, "w", id, "allow", d.stage, d.reason, d.policyVersion);
         return undefined;
       case "deny":
-        audit(c, action, "w", id, "deny", d.stage, d.reason);
+        audit(c, action, "w", id, "deny", d.stage, d.reason, d.policyVersion);
         return deny(c, 403, d.error, { op: "w", resource: id });
       case "unavailable":
-        audit(c, action, "w", id, "unavailable", d.stage, d.reason);
+        audit(c, action, "w", id, "unavailable", d.stage, d.reason, d.policyVersion);
         return deny(c, 503, "relaygate_unavailable");
       case "invalid":
         return deny(c, 400, "relaygate_bad_request", { detail: d.reason });

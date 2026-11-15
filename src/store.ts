@@ -67,6 +67,8 @@ export interface AuditEntry {
   decision: "allow" | "deny" | "unavailable";
   stage: "auth" | "mode" | "classifier" | "registration" | null;
   reason: string | null;
+  /** The policy the decision was evaluated under; defaults to the one in force now (for synchronous decisions). */
+  policyVersion?: string;
 }
 
 export class Store {
@@ -324,7 +326,7 @@ export class Store {
       .prepare(
         "INSERT INTO audit (at, agent_id, action, op, resource_kind, resource_id, decision, stage, reason, policy_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(now(), e.agentId, e.action, e.op, e.resourceKind, e.resourceId, e.decision, e.stage, e.reason, this.policyVersion());
+      .run(now(), e.agentId, e.action, e.op, e.resourceKind, e.resourceId, e.decision, e.stage, e.reason, e.policyVersion ?? this.policyVersion());
   }
 
   /** Audit rows after `after` (a seq), oldest first, with the agent's name. Never contains message content. */

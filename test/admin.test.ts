@@ -40,4 +40,24 @@ describe("GET /admin/v1/audit", () => {
 
     expect((await call("GET", "/admin/v1/audit", tok)).status).toBe(401);
   });
+
+  it("stamps a decision with the policy it was evaluated under, even if the policy reloads mid-decision", async () => {
+    let pol = policy("660");
+    let release!: () => void;
+    const slow = { classify: () => new Promise<{ decision: "allow"; reason: string }>((r) => (release = () => r({ decision: "allow", reason: "ok" }))) };
+    const store = new Store(":memory:");
+    const app = createApp({ store, policy: () => pol, classifier: () => slow, adminToken: ADMIN });
+    const call = async (path: string, token: string, body?: unknown) =>
+      (await app.request(path, { method: body ? "POST" : "GET", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: body && JSON.stringify(body) })).json() as Promise<any>;
+    pol = policy("662");
+    const tok = (await call("/v1/register", KEY, { name: "agent-1" })).token;
+    const before = (await call("/admin/v1/audit", ADMIN)).policy_version;
+    const pending = call("/v1/check", tok, { op: "w", resource: { kind: "stream", id: "x:1" }, content: "hi" });
+    await new Promise((r) => setTimeout(r, 20));
+    pol = policy("666");
+    release();
+    await pending;
+    const row = (await call("/admin/v1/audit", ADMIN)).rows.find((r: any) => r.action === "check");
+    expect(row.policy_version).toBe(before);
+  });
 });
