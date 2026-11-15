@@ -399,12 +399,19 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   // Revoking a token is always safe, whoever asks; the read API checks the token itself.
   app.post("/sessions/v1/auth/token/revoke", async (c) => {
     try {
+      const origin = c.req.header("origin");
       const res = await doFetch(new URL("v1/auth/token/revoke", slash(cfg.readUrl)), {
         method: "POST",
-        headers: { authorization: c.req.header("authorization") ?? "", "content-type": c.req.header("content-type") ?? "application/json" },
+        headers: { authorization: c.req.header("authorization") ?? "", "content-type": c.req.header("content-type") ?? "application/json", ...(origin ? { origin } : {}) },
         body: await c.req.text(),
       });
-      return new Response(await res.text(), { status: res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } });
+      // Browsers call this too: the read API's CORS headers come back unchanged.
+      const headers = new Headers({ "content-type": res.headers.get("content-type") ?? "application/json" });
+      for (const h of PASS_RESPONSE) {
+        const v = res.headers.get(h);
+        if (v) headers.set(h, v);
+      }
+      return new Response(await res.text(), { status: res.status, headers });
     } catch {
       return deny(c, 502, "relaygate_upstream_unavailable");
     }
@@ -462,7 +469,9 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     if (!named || named.some((x: any) => typeof x?.session_id !== "string" || !SESSION_ID.test(x.session_id))) {
       return deny(c, 400, "relaygate_bad_request", { detail: "sessions[] with session_id required" });
     }
-    const gate = await gateWrites(c, new Map(named.map((x: any) => [x.session_id, JSON.stringify(body)])));
+    // One serialisation shared by every session the selection names.
+    const content = JSON.stringify(body);
+    const gate = await gateWrites(c, new Map(named.map((x: any) => [x.session_id, content])));
     if (gate instanceof Response) return gate;
     return pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/delivery/sessions/selection", raw));
   });
@@ -486,6 +495,9 @@ export interface AdoptReport {
   unmatched: Array<{ sessionId: string; userId: string }>;
   /** Pages stopped early (upstream error); rerun to continue. */
   error?: string;
+  /** Set when the run stopped at maxPages with more to list: pass it back as `cursor` to continue. */
+  nextCursor?: string;
+  truncated: boolean;
 }
 
 /**
@@ -496,14 +508,21 @@ export interface AdoptReport {
 export async function adoptSessions(
   deps: Deps,
   cfg: SessionsConfig,
-  opts: { readToken: string; orgId: string; workspaceId: string; dryRun: boolean; maxPages?: number },
+  opts: { readToken: string; orgId: string; workspaceId: string; dryRun: boolean; maxPages?: number; cursor?: string },
 ): Promise<AdoptReport> {
   const doFetch = cfg.fetch ?? fetch;
   const base = cfg.readUrl.endsWith("/") ? cfg.readUrl : `${cfg.readUrl}/`;
-  const report: AdoptReport = { dryRun: opts.dryRun, scanned: 0, adopted: [], alreadyOwned: 0, noUploader: [], unmatched: [] };
+  const report: AdoptReport = { dryRun: opts.dryRun, scanned: 0, adopted: [], alreadyOwned: 0, noUploader: [], unmatched: [], truncated: false };
   const policy = deps.policy();
-  let cursor: string | undefined;
-  for (let page = 0; page < (opts.maxPages ?? 500); page++) {
+  let cursor: string | undefined = opts.cursor;
+  const maxPages = opts.maxPages ?? 500;
+  for (let page = 0; ; page++) {
+    if (page >= maxPages) {
+      // Stopped by the cap with more to list: say so, and hand back where to continue.
+      report.truncated = true;
+      report.nextCursor = cursor;
+      break;
+    }
     const q = new URLSearchParams({ workspace: opts.workspaceId, limit: "200", ...(cursor ? { cursor } : {}) });
     let body: any;
     try {

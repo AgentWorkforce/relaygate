@@ -138,6 +138,16 @@ describe("POST /admin/v1/sessions/adopt", () => {
     expect((await h.call("GET", "/sessions/v1/sessions/old-4/events", await h.mint("u-member"))).status).toBe(403);
   });
 
+  it("reports truncation at maxPages and continues from the returned cursor", async () => {
+    const h = harness();
+    const first = await h.call("POST", "/admin/v1/sessions/adopt", ADMIN, { ...adoptBody, maxPages: 1 });
+    expect(first.body).toMatchObject({ truncated: true, nextCursor: "c2" });
+    expect(first.body.adopted.map((a: any) => a.sessionId)).toEqual(["old-1"]);
+    const rest = await h.call("POST", "/admin/v1/sessions/adopt", ADMIN, { ...adoptBody, cursor: first.body.nextCursor });
+    expect(rest.body).toMatchObject({ truncated: false });
+    expect(rest.body.adopted.map((a: any) => a.sessionId)).toEqual(["old-4"]);
+  });
+
   it("needs the admin token, and reports an upstream refusal instead of adopting", async () => {
     const h = harness();
     expect((await h.call("POST", "/admin/v1/sessions/adopt", "rg_nope", adoptBody)).status).toBe(401);

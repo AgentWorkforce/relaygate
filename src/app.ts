@@ -322,7 +322,14 @@ export function createApp(deps: Deps) {
   });
 
   // Gives sessions uploaded before relaygate an owner, by their uploader (docs/contract.md, "Adopting existing sessions").
-  const AdoptBody = z.object({ readToken: z.string().min(8), orgId: z.string().min(1), workspaceId: z.string().min(1) });
+  const AdoptBody = z.object({
+    readToken: z.string().min(8),
+    orgId: z.string().min(1),
+    workspaceId: z.string().min(1),
+    /** Continue a run that stopped at maxPages (its report's nextCursor). */
+    cursor: z.string().min(1).optional(),
+    maxPages: z.number().int().positive().max(5000).optional(),
+  });
   app.post("/admin/v1/sessions/adopt", async (c) => {
     const refused = adminRefusal(c);
     if (refused) return refused;

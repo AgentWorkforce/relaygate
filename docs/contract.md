@@ -538,7 +538,9 @@ seen it; role isn't known here), and claims the session as `ctl:<userId>` in
 that rule's group. The report lists what it adopted, what was already owned,
 sessions with no uploader, and uploaders no rule matches (those stay unowned).
 `dryRun` only reports; without it the adoption is applied and audited
-(`session.adopt`). Rerunning it is safe.
+(`session.adopt`). Rerunning it is safe. A run lists at most `maxPages` pages
+(default 500); if it stops there, the report has `truncated: true` and a
+`nextCursor` to pass back as `cursor`.
 
 ## The classifier
 
