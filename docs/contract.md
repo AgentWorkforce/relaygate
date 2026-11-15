@@ -336,6 +336,15 @@ Authorization: Bearer sh_at_...
   relaygate_name_taken`, `503 relaygate_unavailable` (relay-control can't
   answer).
 
+How the desktop learns it is gate-only: relay-control's
+`GET /api/v1/workspaces/{id}/resolve` returns `urls.relaygateUrl` (a bare https
+origin) and omits `relaycastApiKey` when relay-control has
+`SELFHOST_RELAYGATE_PUBLIC_URL` set. The presence of `relaygateUrl` means
+gate-only: the client enrols at `<relaygateUrl>/v1/register` with its device
+token and sends all agent traffic to that origin. Credentials relaygate
+doesn't accept, such as a Relaycast `at_live_` agent token or a Relaycast node
+token (`nt_live_`) on `/v1/node/ws`, don't work through the gate.
+
 ### Agent status and removal
 
 ```
