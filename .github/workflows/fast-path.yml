@@ -64,10 +64,15 @@ jobs:
             ghcr.io/agentworkforce/relaygate:fast-${{ needs.test.outputs.sha }}
             ghcr.io/agentworkforce/relaygate:sha-${{ needs.test.outputs.sha }}
       - name: Summary
+        env:
+          REF: ${{ inputs.ref }}
+          SHA: ${{ needs.test.outputs.sha }}
+          REASON: ${{ inputs.reason }}
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           {
             echo "### relaygate fast path"
-            echo "- ref: \`${{ inputs.ref }}\` at \`${{ needs.test.outputs.sha }}\`"
-            echo "- reason: ${{ inputs.reason }}"
-            echo "- image: \`ghcr.io/agentworkforce/relaygate@${{ steps.build.outputs.digest }}\`"
+            echo "- ref: \`$REF\` at \`$SHA\`"
+            echo "- reason: $REASON"
+            echo "- image: \`ghcr.io/agentworkforce/relaygate@$DIGEST\`"
           } >> "$GITHUB_STEP_SUMMARY"
