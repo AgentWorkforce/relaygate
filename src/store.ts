@@ -117,6 +117,12 @@ export class Store {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS node_tokens_by_agent_token ON node_tokens (agent_token_hash);
+      CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        owner TEXT NOT NULL REFERENCES agents(id),
+        gid INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS audit (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         at TEXT NOT NULL,
@@ -211,6 +217,17 @@ export class Store {
       )
       .get(hash);
     return row ? toAgent(row) : undefined;
+  }
+
+  session(id: string): { id: string; owner: string; gid: number } | undefined {
+    const row = this.db.prepare("SELECT id, owner, gid FROM sessions WHERE id = ?").get(id);
+    return row ? { id: String(row.id), owner: String(row.owner), gid: Number(row.gid) } : undefined;
+  }
+
+  /** Records the first uploader as the session's owner; later calls never change it. Returns the stored row. */
+  claimSession(id: string, owner: string, gid: number): { id: string; owner: string; gid: number } {
+    this.db.prepare("INSERT OR IGNORE INTO sessions (id, owner, gid, created_at) VALUES (?, ?, ?, ?)").run(id, owner, gid, now());
+    return this.session(id)!;
   }
 
   upstreamAgent(agentId: string): { upstreamId: string; tokenSealed: string } | undefined {

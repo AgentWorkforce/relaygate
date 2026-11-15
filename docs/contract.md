@@ -408,7 +408,34 @@ these gids"), which keeps it unaware of what the gids mean.
 ## Session uploads
 
 A new session is owned by its first uploader and takes that uploader's group
-(see "Sessions keep their first owner"). Pit agents
+(see "Sessions keep their first owner"). Its mode and ACL come from the
+policy's `sessionDefaults` for that group (a group without one gets `600`),
+then any `sessionOverrides` entry for that session id, which is how a customer
+shares one session with a guest:
+
+```
+"sessionDefaults": [{"gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}]},
+                    {"gid": 22, "mode": "660"}],
+"sessionOverrides": [{"id": "<session id>", "acl": [{"gid": 44, "perm": "r"}]}]
+```
+
+The Sessions proxy is mounted at `/sessions`: a client's Sessions base URL
+becomes `https://<relaygate>/sessions` and the paths stay the same. relaygate
+calls Sessions with one service token (`rth_st_`, `rth:sync` and `rth:read`).
+
+| Route | Check |
+|---|---|
+| `POST /sessions/v1/sessions/:id/turns` | `w` on the session; `sessionOwner` on the body and every turn is set to the agent |
+| `POST /sessions/v1/ingest` | `w` on every session the batch names; all or nothing |
+| `GET /sessions/v1/sessions` | filtered to sessions the caller may read; the cursor passes through |
+| `GET /sessions/v1/sessions/:id/{events,turns,metadata,thread,catalog,timing,analysis,brief}` | `r` on the session |
+| `GET /sessions/v1/events?session=<id>` | exactly one `session`, `r` on it |
+
+A write is decided before anything is recorded, and a new session is claimed
+only when the whole request is allowed, so a refused upload never makes its
+sender an owner. Sessions that never came through relaygate have no owner and
+are invisible through it. Other Sessions routes (including the desktop
+uploader's `/v1/delivery/*`) answer `404 relaygate_route_not_proxied`. Pit agents
 run headless on Linux servers, so their sessions come from a headless uploader
 on that server, authenticated with the agent's `rg_` token, not from the
 desktop app.

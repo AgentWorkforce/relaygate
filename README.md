@@ -26,7 +26,7 @@ and the audit log. It also implements access lists (`acl`), guest enrollment
 keys (`guest`, `expiresAt`; revoking or expiring one ends its tokens), group
 ceilings and guest provenance. Build 2 adds the Relaycast proxy: point a
 Relaycast client's base URL at relaygate and use the `rg_` token (see
-"Proxied Relaycast routes" in the contract). The Sessions proxy comes next.
+"Proxied Relaycast routes" in the contract). The Sessions proxy is mounted at `/sessions`.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -37,6 +37,8 @@ Relaycast client's base URL at relaygate and use the `rg_` token (see
 | `RELAYCAST_URL` | none | Turns on the Relaycast proxy (REST allowlist and `/v1/node/ws`). |
 | `RELAYCAST_WORKSPACE_KEY` | none | `rk_live_` key relaygate uses to register agents upstream. Required with `RELAYCAST_URL`. |
 | `RELAYGATE_SECRET` | none | At least 32 characters; seals the upstream agent and node tokens at rest. Required with `RELAYCAST_URL`. |
+| `SESSIONS_URL` | none | Turns on the Sessions proxy at `/sessions`. |
+| `SESSIONS_TOKEN` | none | `rth_st_` service token (`rth:sync`, `rth:read`). Required with `SESSIONS_URL`. |
 | `ANTHROPIC_API_KEY` | none | Needed only when `classifier.model.enabled` is true. |
 
 Health: `GET /healthz` (process up) and `GET /readyz` (policy loaded, database
