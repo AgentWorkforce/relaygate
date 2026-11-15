@@ -12,7 +12,9 @@
  *   OUTSIDE_SESSIONS_UPLOAD / OUTSIDE_SESSIONS_READ and INSIDE_SESSIONS_UPLOAD / INSIDE_SESSIONS_READ (the callers'
  *   own Sessions credentials, when the deployment's Sessions needs them; relaygate forwards them),
  *   SESSIONS_ORG_ID + SESSIONS_WORKSPACE_ID (self-hosted Sessions: native uploads, workspace-scoped reads),
- *   INSIDE_LOGS_CMD (prints the remote inside agents' logs, e.g. kubectl logs; needed to verify their seed uploads).
+ *   INSIDE_LOGS_CMD (prints the remote inside agents' logs, e.g. kubectl logs; needed to verify their seed uploads),
+ *   SESSIONS_READ_REFRESH_CMD (prints fresh OUTSIDE_SESSIONS_READ= / INSIDE_SESSIONS_READ= lines; run before every
+ *   scenario that reads sessions, for deployments whose read tokens are short-lived).
  * Defaults match examples/policy.double-pit.json; nothing here is specific to a customer.
  */
 import { execSync } from "node:child_process";
@@ -102,6 +104,18 @@ async function main() {
   const inline = !!process.env.INSIDE_KEY;
   const insideNames = inline ? [`${IN_PREFIX}acc-1-${RUN}`, `${IN_PREFIX}acc-2-${RUN}`] : env("INSIDE_AGENTS").split(",").map((s) => s.trim());
   const ac = new AbortController();
+  // Shared by reference with every gate of a role, so a refresh reaches the in-process inside agents too.
+  const insideSessions = sessionsFromEnv(process.env.INSIDE_SESSIONS_UPLOAD, process.env.INSIDE_SESSIONS_READ);
+  const outsideSessions = sessionsFromEnv(process.env.OUTSIDE_SESSIONS_UPLOAD, process.env.OUTSIDE_SESSIONS_READ);
+  /** Re-mints short-lived Sessions read tokens, when the deployment's are (SESSIONS_READ_REFRESH_CMD). */
+  const refreshReads = () => {
+    if (!process.env.SESSIONS_READ_REFRESH_CMD) return;
+    const out = execSync(process.env.SESSIONS_READ_REFRESH_CMD, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] });
+    for (const line of out.split("\n")) {
+      const m = line.match(/^(OUTSIDE|INSIDE)_SESSIONS_READ=(\S+)$/);
+      if (m) (m[1] === "OUTSIDE" ? outsideSessions : insideSessions).read = m[2];
+    }
+  };
   // The inside agents' status lines (never content): captured in-process, or fetched with INSIDE_LOGS_CMD.
   const insideLog: string[] = [];
   const insideLines = (): any[] => {
@@ -115,6 +129,7 @@ async function main() {
       }
     });
   };
+  refreshReads();
   if (inline) {
     for (const name of insideNames) {
       void runAgent(
@@ -124,7 +139,7 @@ async function main() {
           name,
           recovery: randomBytes(16).toString("hex"),
           docChannelPrefix: DOC_PREFIX,
-          sessions: sessionsFromEnv(process.env.INSIDE_SESSIONS_UPLOAD, process.env.INSIDE_SESSIONS_READ),
+          sessions: insideSessions,
           log: (l: string) => insideLog.push(l),
         },
         ac.signal,
@@ -134,7 +149,6 @@ async function main() {
   const [pitA, pitB] = insideNames as [string, string];
 
   // Outside agents.
-  const outsideSessions = sessionsFromEnv(process.env.OUTSIDE_SESSIONS_UPLOAD, process.env.OUTSIDE_SESSIONS_READ);
   const localA = await enroll(URL_, OUTSIDE_KEY, `${OUT_PREFIX}acc-1-${RUN}`, randomBytes(16).toString("hex"), outsideSessions);
   const localB = await enroll(URL_, OUTSIDE_KEY, `${OUT_PREFIX}acc-2-${RUN}`, randomBytes(16).toString("hex"), outsideSessions);
   const localChannel = `${OUT_CH_PREFIX}acc-${RUN}`;
@@ -179,18 +193,20 @@ async function main() {
 
   // --- 6. outside session upload: stored, readable by the outside peer and by the inside ---------------------
   {
+    refreshReads();
     if (up.status === 404) {
       record(6, "outside session upload is stored and readable inside", "SKIP", ["Sessions proxy not enabled on this relaygate (/sessions 404)"]);
     } else {
-      const peer = await localB.call("GET", `/sessions/v1/sessions/${localSession}/events`);
+      const peerRead = await localB.sessionReadUntil(localSession, marker);
+      const peer = peerRead.res;
       const h = await auditHead();
       await command(localA, pitA, { acc: "read-session", run: RUN, session: localSession, marker });
       const rows = await waitFor(pitA, h, ["session.read"]);
       const insideRead = rows.find((r) => r.action === "session.read" && r.resource_id === localSession);
       // The gate's allow is logged before forwarding; the inside agent's own status line shows the read landed.
       let actual: any;
-      for (let i = 0; i < 20 && !(actual = insideLines().find((l) => l.agent === pitA && l.attempt === "read.session")); i++) await sleep(1500);
-      const peerHas = JSON.stringify(peer.body ?? "").includes(marker);
+      for (let i = 0; i < 40 && !(actual = insideLines().find((l) => l.agent === pitA && l.attempt === "read.session")); i++) await sleep(1500);
+      const peerHas = peerRead.found;
       const canSee = inline || !!process.env.INSIDE_LOGS_CMD;
       record(
         6,
@@ -226,6 +242,7 @@ async function main() {
 
   // --- 3. outside reads the inside document: refused --------------------------------------------------------
   {
+    refreshReads();
     const h = await auditHead();
     const ch = docChannel(RUN, DOC_PREFIX);
     const checks = [
@@ -258,6 +275,7 @@ async function main() {
     const askBlocked = ask.status === 403 && ask.body?.error?.code === "relaygate_classified";
     const answers = askBlocked ? [] : (await waitFor(pitA, h, ["dm.send"], 60_000)).filter((r) => r.op === "w" && ["dm.send", "thread.reply"].includes(r.action));
     await sleep(3000);
+    refreshReads();
     const found = await canarySweep([localA, localB], localChannel, localSession, frames);
     const realtimeOk = realtime || realtimeOptional;
     const answered = answers.length > 0 && answers.every((r) => r.decision === "deny");
@@ -303,6 +321,7 @@ async function main() {
     head = await auditHead();
   }
 
+  refreshReads();
   // --- 7. outside appends to an inside session: accepted, classified, not readable back ---------------------
   {
     const app = await localA.sessionWrite(docSession(RUN), `outside context for ${RUN}`);
@@ -323,6 +342,7 @@ async function main() {
 
   // --- 8. inside session: outside can't read it -------------------------------------------------------------
   {
+    refreshReads();
     const r1 = await localA.call("GET", `/sessions/v1/sessions/${docSession(RUN)}/turns`);
     const r2 = await localB.call("GET", `/sessions/v1/sessions/${docSession(RUN)}/metadata`);
     const listed = await localA.call("GET", "/sessions/v1/sessions?limit=200");

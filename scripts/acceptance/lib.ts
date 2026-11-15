@@ -85,8 +85,27 @@ export class Gate {
 
   /** Writes `text` into a session, in whichever upload protocol the deployment's Sessions speaks. */
   async sessionWrite(sessionId: string, text: string): Promise<Res> {
-    if (this.sessions.native) return this.call("POST", "/sessions/v1/delivery/batches", nativeBatch(this.sessions.native, sessionId, text));
-    return this.call("POST", `/sessions/v1/sessions/${sessionId}/turns`, { turns: [{ turnIndex: Date.now() % 100000, role: "assistant", content: text, ts: new Date().toISOString() }] });
+    const once = () =>
+      this.sessions.native
+        ? this.call("POST", "/sessions/v1/delivery/batches", nativeBatch(this.sessions.native, sessionId, text))
+        : this.call("POST", `/sessions/v1/sessions/${sessionId}/turns`, { turns: [{ turnIndex: Date.now() % 100000, role: "assistant", content: text, ts: new Date().toISOString() }] });
+    // A dropped connection is retried once; a duplicate test record is harmless.
+    const r = await once();
+    return r.status === 0 ? once() : r;
+  }
+
+  /**
+   * Reads a session until `needle` appears (Sessions may store uploads asynchronously) or the wait runs out.
+   * Returns the last response and whether the needle was found.
+   */
+  async sessionReadUntil(sessionId: string, needle: string, ms = 45_000): Promise<{ res: Res; found: boolean }> {
+    const start = Date.now();
+    for (;;) {
+      const res = await this.call("GET", `/sessions/v1/sessions/${sessionId}/events`);
+      const found = res.status >= 200 && res.status < 300 && JSON.stringify(res.body ?? "").includes(needle);
+      if (found || res.status === 403 || res.status === 401 || Date.now() - start > ms) return { res, found };
+      await sleep(3000);
+    }
   }
 
   async call(method: string, path: string, body?: unknown): Promise<Res> {
@@ -102,6 +121,15 @@ export class Gate {
 }
 
 export async function request(base: string, method: string, path: string, token: string | undefined, body?: unknown, extra: Record<string, string> = {}): Promise<Res> {
+  // A GET is idempotent: retry a dropped connection (port-forwards blip). Writes are never retried.
+  for (let attempt = 0; ; attempt++) {
+    const r = await requestOnce(base, method, path, token, body, extra);
+    if (r.status !== 0 || method !== "GET" || attempt >= 3) return r;
+    await sleep(1000 * (attempt + 1));
+  }
+}
+
+async function requestOnce(base: string, method: string, path: string, token: string | undefined, body: unknown, extra: Record<string, string>): Promise<Res> {
   try {
     const res = await fetch(`${base.replace(/\/$/, "")}${path}`, {
       method,

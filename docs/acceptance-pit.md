@@ -130,9 +130,15 @@ it then runs two inside agents in-process.
 
 ### 3. Run the driver
 
-Sessions read tokens (`rth_at_read_…`) are short-lived: mint them just before
-the run. An expired one shows up as `upstream 401` in scenarios 6 and 8 (the gate
-allowed the read; Sessions refused the token).
+Sessions read tokens (`rth_at_read_…`) can be short-lived (self-hosted Control
+issues them for 300 s). Give the driver `SESSIONS_READ_REFRESH_CMD`: a command
+that prints fresh `OUTSIDE_SESSIONS_READ=…` and `INSIDE_SESSIONS_READ=…` lines
+(for example by exchanging each user's device token at
+`POST /api/v1/workspaces/<ws>/session-read/session`). The driver runs it before
+every scenario that reads sessions. An expired token shows up as
+`upstream 401` in scenarios 6 and 8 (the gate allowed the read; Sessions
+refused the token). Self-hosted ingest is asynchronous, so the driver and the
+inside agents poll a session (up to 45 s) until the content they wrote appears.
 
 ```
 export OUTSIDE_KEY=<outside enrollment key>

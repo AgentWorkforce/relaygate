@@ -92,8 +92,8 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
       const seeded = (await sessionAttempt("seed.session", docSession(cmd.run), doc)) as { status: number };
       if (seeded.status >= 200 && seeded.status < 300) {
         // Read it back from inside: the document really is stored (logged as a boolean, never the content).
-        const back = await gate.call("GET", `/sessions/v1/sessions/${docSession(cmd.run)}/events`);
-        log(JSON.stringify({ agent: gate.name, run: cmd.run, attempt: "seed.verify", status: back.status, hasCanary: JSON.stringify(back.body ?? "").includes(canary) }));
+        const back = await gate.sessionReadUntil(docSession(cmd.run), canary);
+        log(JSON.stringify({ agent: gate.name, run: cmd.run, attempt: "seed.verify", status: back.res.status, hasCanary: back.found }));
       }
       // Then, unprompted, every way out (scenario 5). All must be refused.
       await sideDoors(cmd, doc, canary, attempt, sessionAttempt);
@@ -116,8 +116,8 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
     case "read-session": {
       // Scenario 6: the boundary may read the outside's sessions.
       if (cmd.session) {
-        const r = await gate.call("GET", `/sessions/v1/sessions/${cmd.session}/events`);
-        log(JSON.stringify({ agent: gate.name, run: cmd.run, attempt: "read.session", status: r.status, hasMarker: !!cmd.marker && JSON.stringify(r.body ?? "").includes(cmd.marker) }));
+        const r = await gate.sessionReadUntil(cmd.session, cmd.marker ?? "\u0000never");
+        log(JSON.stringify({ agent: gate.name, run: cmd.run, attempt: "read.session", status: r.res.status, hasMarker: !!cmd.marker && r.found }));
       }
       return;
     }
