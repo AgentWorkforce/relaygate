@@ -24,7 +24,9 @@ Build 1 implements registration, `rg_` tokens, the mode check, stream
 registration, `POST /v1/check`, the classifier (rules, then optionally Claude)
 and the audit log. It also implements access lists (`acl`), guest enrollment
 keys (`guest`, `expiresAt`; revoking or expiring one ends its tokens), group
-ceilings and guest provenance. The Relaycast and Sessions proxies come next.
+ceilings and guest provenance. Build 2 adds the Relaycast proxy: point a
+Relaycast client's base URL at relaygate and use the `rg_` token (see
+"Proxied Relaycast routes" in the contract). The Sessions proxy comes next.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -32,6 +34,9 @@ ceilings and guest provenance. The Relaycast and Sessions proxies come next.
 | `RELAYGATE_DB` | `/data/relaygate.db` | SQLite file for agents, tokens, streams and the audit log. |
 | `PORT` | `8080` | HTTP port. |
 | `RELAYGATE_ADMIN_TOKEN` | none | Enables `POST /admin/v1/explain` (operator "may X do op on Y, and why"). |
+| `RELAYCAST_URL` | none | Turns on the Relaycast proxy (REST allowlist and `/v1/node/ws`). |
+| `RELAYCAST_WORKSPACE_KEY` | none | `rk_live_` key relaygate uses to register agents upstream. Required with `RELAYCAST_URL`. |
+| `RELAYGATE_SECRET` | none | At least 32 characters; seals the upstream agent and node tokens at rest. Required with `RELAYCAST_URL`. |
 | `ANTHROPIC_API_KEY` | none | Needed only when `classifier.model.enabled` is true. |
 
 Health: `GET /healthz` (process up) and `GET /readyz` (policy loaded, database

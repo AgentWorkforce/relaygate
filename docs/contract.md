@@ -309,7 +309,12 @@ key.
 - An `rg_` token only works against relaygate. Relaycast and Sessions don't
   accept it.
 - relaygate calls Relaycast and Sessions with its own credentials, and passes
-  the acting agent's identity so upstream records the real author.
+  the acting agent's identity so upstream records the real author. Relaycast
+  has no act-as for agents, so relaygate registers each agent upstream under
+  the same name (with the workspace key, `auto_join_general: false`) and keeps
+  that agent's `at_live_` token sealed (AES-GCM, key from `RELAYGATE_SECRET`)
+  in its database. If Relaycast stops accepting the token, relaygate takes the
+  identity over with the workspace key and retries once.
 - Agents never receive a Relaycast or Sessions credential. An agent that has
   one can go around the gate, so a deployment must not hand them out.
 - Relaycast and Sessions accept traffic only from relaygate. On Kubernetes this
@@ -320,16 +325,63 @@ For clients, the change is a base URL. Bridges and MCP servers set
 their Relaycast and Sessions base URLs to relaygate and use the `rg_` token.
 The API paths are unchanged.
 
+### Proxied Relaycast routes
+
+relaygate forwards an allowlist; every other `/v1` route answers `404
+relaygate_route_not_proxied` without reaching Relaycast. Several Relaycast reads
+skip membership checks, so relaygate checks each one itself:
+
+| Route | Check |
+|---|---|
+| `GET /v1/agent`, `POST /v1/agents/heartbeat`, `/disconnect` | self |
+| `GET /v1/agents`, `GET /v1/agents/:name` | answered with the workspace key, filtered to agents whose inbox the caller may write or read |
+| `GET /v1/channels` | filtered to channels the caller may read |
+| `POST /v1/channels` | `w` on `relaycast:channel/<name>` |
+| `GET /v1/channels/:name`, `/messages`; `POST .../join` | `r` on the channel |
+| `POST /v1/channels/:name/leave`, `/mute`, `/unmute` | self |
+| `POST /v1/channels/:name/messages` | `w` on the channel (classifier as usual) |
+| `GET /v1/messages/:id`, `/replies`, `/reactions`; `POST .../read`; `DELETE .../reactions/:emoji` | `r` on the message's channel; a DM message only for its two participants |
+| `POST /v1/messages/:id/replies`, `/reactions` | `w` on the message's channel; refused under a DM (answer with `POST /v1/dm`) |
+| `POST /v1/dm` | `w` on `relaycast:inbox/<to>` |
+| `GET /v1/dm/conversations`, `GET /v1/dm/:cid/messages` | the caller's own 1:1 conversations (group DMs aren't proxied) |
+| `GET /v1/search`, `GET /v1/inbox` | filtered: channel hits the caller may read, DM hits it wrote |
+
+Channel names starting `dm-` (Relaycast's hidden DM channels) are never
+addressable as channels. On every write relaygate drops `from` (which lets a
+node post as another agent upstream), replaces `data.relaygate` with the
+verified sender card, and passes `data` and the `Idempotency-Key` header
+through unchanged. Message ids are Relaycast's.
+
+Errors on proxied routes use Relaycast's shape, so SDK clients surface them:
+`{"ok": false, "error": {"code": "relaygate_denied", "message": "..."}, "op":
+"w", "resource": "<id>"}`. The codes are the ones in "Errors clients can rely
+on".
+
 ### Realtime
 
 Relaycast's realtime path (`POST /v1/agent/node-token`, then the
-`/v1/node/ws` WebSocket) also goes through relaygate. relaygate mints and holds
-the upstream node token, proxies the WebSocket, and drops every pushed event
-the caller may not read. Without this, reads would leak through the event
-stream even with REST filtered.
+`/v1/node/ws` WebSocket) also goes through relaygate. `node-token` answers an
+`rgn_` token; relaygate mints and keeps the upstream `nt_live_` token, opens
+the upstream socket itself, and:
 
-When a token is revoked (re-registration, or an admin), relaygate closes every
-WebSocket opened with it.
+- forwards only `node.register` (forced to the agent's own node id, with no
+  capabilities), `node.heartbeat` and `delivery.ack` for the agent itself;
+  any other client frame is refused with an `error` frame;
+- forwards a `deliver` only if it is for the agent and the agent may read its
+  stream (`message.created` and `thread.reply` by `channel_name`, `dm.received`
+  by the agent's inbox); action invocations, context updates and group DMs
+  are dropped. Without this, reads would leak through the event stream even
+  with REST filtered.
+
+A node token works only while the `rg_` token that minted it does. When that
+token is revoked (re-registration, a guest key ending), relaygate closes every
+socket opened with it (close code `4401`), at once and at the latest on its
+next revalidation. Relaycast's `/v1/ws` refuses agent tokens and isn't
+proxied.
+
+**Open:** a dropped delivery is never acked to Relaycast by relaygate (an ack is
+cumulative and would acknowledge frames the client hasn't processed), so it may
+be redelivered on reconnect, and dropped again.
 
 ### The sender's groups travel with the message
 

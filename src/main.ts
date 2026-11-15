@@ -3,7 +3,9 @@ import { serve } from "@hono/node-server";
 import { createApp, sweepGuestKeys } from "./app.js";
 import { classifierFromPolicy, type Classifier } from "./classifier.js";
 import { loadPolicyFile, type Policy } from "./policy.js";
-import { Store } from "./store.js";
+import { NodeSockets } from "./realtime.js";
+import { RelaycastUpstream } from "./relaycast.js";
+import { SecretBox, Store } from "./store.js";
 
 const policyPath = process.env.RELAYGATE_POLICY;
 if (!policyPath) {
@@ -23,7 +25,10 @@ let mtime = statSync(policyPath).mtimeMs;
 setInterval(() => {
   // Guest keys that were revoked or have expired end their tokens even if no one calls with them.
   const ended = sweepGuestKeys(store, policy, Date.now());
-  if (ended.length > 0) console.log(JSON.stringify({ msg: "guest tokens ended", count: ended.length }));
+  if (ended.length > 0) {
+    console.log(JSON.stringify({ msg: "guest tokens ended", count: ended.length }));
+    sockets?.revalidate();
+  }
   try {
     const m = statSync(policyPath).mtimeMs;
     if (m === mtime) return;
@@ -42,14 +47,32 @@ if (adminToken !== undefined && adminToken.length < 24) {
   console.error("RELAYGATE_ADMIN_TOKEN must be at least 24 characters");
   process.exit(1);
 }
-const app = createApp({ store, policy: () => policy, classifier: () => classifier, adminToken });
+// The Relaycast proxy is on when RELAYCAST_URL is set; it needs the workspace key and a secret to seal agent tokens.
+let relaycast: RelaycastUpstream | undefined;
+if (process.env.RELAYCAST_URL) {
+  const workspaceKey = process.env.RELAYCAST_WORKSPACE_KEY;
+  const secret = process.env.RELAYGATE_SECRET;
+  if (!workspaceKey || !secret || secret.length < 32) {
+    console.error("RELAYCAST_URL needs RELAYCAST_WORKSPACE_KEY and RELAYGATE_SECRET (at least 32 characters)");
+    process.exit(1);
+  }
+  relaycast = new RelaycastUpstream({ url: process.env.RELAYCAST_URL, workspaceKey, box: new SecretBox(secret) }, store);
+}
+let sockets: NodeSockets | undefined;
+const deps = { store, policy: () => policy, classifier: () => classifier, adminToken, relaycast, onTokensRevoked: () => sockets?.revalidate() };
+const app = createApp(deps);
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
-  console.log(JSON.stringify({ msg: "relaygate listening", port: info.port, model_classifier: policy.classifier.model.enabled }));
+  console.log(JSON.stringify({ msg: "relaygate listening", port: info.port, model_classifier: policy.classifier.model.enabled, relaycast: !!relaycast }));
 });
+if (relaycast) {
+  sockets = new NodeSockets(deps, relaycast);
+  sockets.attach(server as unknown as import("node:http").Server);
+}
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
+    sockets?.close();
     server.close();
     store.close();
     process.exit(0);
