@@ -116,6 +116,7 @@ export class Store {
         upstream_sealed TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS node_tokens_by_agent_token ON node_tokens (agent_token_hash);
       CREATE TABLE IF NOT EXISTS audit (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         at TEXT NOT NULL,
@@ -226,12 +227,24 @@ export class Store {
       .run(agentId, upstreamId, tokenSealed, now());
   }
 
-  /** Issues an rgn_ node token bound to the rg_ token that asked for it. */
+  /**
+   * Issues an rgn_ node token bound to the rg_ token that asked for it, and prunes: rows bound to the agent's
+   * revoked rg_ tokens go, and only the newest few per rg_ token are kept (a token is used once, to open a socket).
+   */
   issueNodeToken(row: NodeTokenRow): string {
     const token = `rgn_${randomBytes(32).toString("base64url")}`;
     this.db
       .prepare("INSERT INTO node_tokens (hash, agent_id, agent_token_hash, node_id, upstream_sealed, created_at) VALUES (?, ?, ?, ?, ?, ?)")
       .run(sha256(token), row.agentId, row.agentTokenHash, row.nodeId, row.upstreamSealed, now());
+    this.db
+      .prepare("DELETE FROM node_tokens WHERE agent_id = ? AND agent_token_hash IN (SELECT hash FROM tokens WHERE agent_id = ? AND revoked = 1)")
+      .run(row.agentId, row.agentId);
+    this.db
+      .prepare(
+        `DELETE FROM node_tokens WHERE agent_token_hash = ? AND rowid NOT IN
+           (SELECT rowid FROM node_tokens WHERE agent_token_hash = ? ORDER BY rowid DESC LIMIT ${NODE_TOKENS_KEPT})`,
+      )
+      .run(row.agentTokenHash, row.agentTokenHash);
     return token;
   }
 
@@ -284,6 +297,7 @@ export class Store {
 }
 
 const now = () => new Date().toISOString();
+const NODE_TOKENS_KEPT = 5;
 
 function toAgent(row: Record<string, unknown>): Agent {
   return {

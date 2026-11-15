@@ -84,9 +84,20 @@ export class RelaycastUpstream {
 
   /** The agent's upstream at_live_ token, registering the agent upstream on first use. */
   async agentToken(agent: Agent): Promise<string> {
+    const stored = this.storedToken(agent);
+    if (stored) return stored;
+    // No row: register. A row that no longer opens (RELAYGATE_SECRET changed): take the identity over.
+    return this.enroll(agent, this.store.upstreamAgent(agent.id) !== undefined);
+  }
+
+  private storedToken(agent: Agent): string | undefined {
     const row = this.store.upstreamAgent(agent.id);
-    if (row) return this.cfg.box.open(row.tokenSealed);
-    return this.enroll(agent, false);
+    if (!row) return undefined;
+    try {
+      return this.cfg.box.open(row.tokenSealed);
+    } catch {
+      return undefined;
+    }
   }
 
   /** Registers the agent upstream, or takes its identity over when the name already exists there. Single-flight per agent. */
@@ -133,9 +144,14 @@ export class RelaycastUpstream {
 
   /** Calls Relaycast as the agent. A 401 means the stored token stopped working: recover it once and retry. */
   async asAgent(agent: Agent, method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<UpstreamResponse> {
-    const first = await this.raw(method, path, await this.agentToken(agent), body, headers);
+    const used = await this.agentToken(agent);
+    const first = await this.raw(method, path, used, body, headers);
     if (first.status !== 401) return first;
-    return this.raw(method, path, await this.enroll(agent, true), body, headers);
+    // If another request already rotated the token, use that one rather than rotating again (which would
+    // invalidate its retry). Concurrent takeovers are coalesced by enroll().
+    const current = this.storedToken(agent);
+    const next = current && current !== used ? current : await this.enroll(agent, true);
+    return this.raw(method, path, next, body, headers);
   }
 
   /** Calls Relaycast with the workspace key (only for reads relaygate filters itself). */
@@ -156,6 +172,8 @@ export const inboxStream = (agentName: string) => `relaycast:inbox/${agentName}`
 export const isDmChannelName = (name: string) => name.startsWith("dm-") || name.startsWith("dmch_");
 
 const CHANNEL_NAME = /^[A-Za-z0-9._-]{1,128}$/;
+/** A 1:1 DM conversation id (`dm_<pair key>`); group DMs use other prefixes and aren't proxied. */
+const DM_ID = /^dm_[\x21-\x7e]{1,256}$/;
 
 /** May this principal read the stream? Deterministic only (reads are never classified). */
 export function canRead(deps: Deps, principal: Principal, id: string): boolean {
@@ -247,16 +265,15 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
     return name && CHANNEL_NAME.test(name) && !isDmChannelName(name) ? name : undefined;
   };
 
-  /** Which stream a message lives in, from its channel id. Undefined for DM messages and unknown channels. */
-  const channelNames = new Map<string, string>();
-  const channelNameFor = async (c: Ctx, channelId: string): Promise<string | undefined> => {
-    const cached = channelNames.get(channelId);
-    if (cached) return cached;
+  /**
+   * A channel's current name from its id, looked up fresh every time (a cached name would keep a renamed channel's
+   * old permissions). Undefined when the channel isn't listed; an upstream failure is returned as is.
+   */
+  const channelNameFor = async (c: Ctx, channelId: string): Promise<string | undefined | UpstreamResponse> => {
     const list = await forward(c, "GET", "/v1/channels");
-    for (const ch of asArray(dataOf(list.body))) {
-      if (typeof ch.id === "string" && typeof ch.name === "string") channelNames.set(ch.id, ch.name);
-    }
-    return channelNames.get(channelId);
+    if (list.status !== 200) return list;
+    const ch = asArray(dataOf(list.body)).find((x) => x.id === channelId);
+    return typeof ch?.name === "string" ? ch.name : undefined;
   };
 
   /**
@@ -270,17 +287,22 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
     const res = await forward(c, "GET", `/v1/messages/${encodeURIComponent(messageId)}`);
     if (res.status !== 200) return res;
     const msg = dataOf(res.body) as Record<string, unknown>;
-    const name = typeof msg.channel_id === "string" ? await channelNameFor(c, msg.channel_id) : undefined;
-    if (name && !isDmChannelName(name)) return { id: channelStream(name) };
     const channelId = typeof msg.channel_id === "string" ? msg.channel_id : "";
-    return { authorOnly: true, author: String(msg.agent_name ?? ""), conversationId: channelId.startsWith("dmch_") ? `dm_${channelId.slice(5)}` : undefined };
+    // Only a positively identified DM channel takes the DM path; anything unresolved is refused.
+    if (channelId.startsWith("dmch_")) {
+      return { authorOnly: true, author: String(msg.agent_name ?? ""), conversationId: `dm_${channelId.slice(5)}` };
+    }
+    const name = channelId ? await channelNameFor(c, channelId) : undefined;
+    if (typeof name === "object") return name;
+    if (name && !isDmChannelName(name)) return { id: channelStream(name) };
+    return { status: 403, body: { ok: false, error: { code: "relaygate_denied", message: "relaygate could not place this message in a channel" } } };
   };
 
-  /** Whether the caller participates in a 1:1 DM conversation, by its own conversation list. */
+  /** Whether the caller participates in a 1:1 DM conversation. Relaycast checks participation on DM reads. */
   const inConversation = async (c: Ctx, conversationId: string | undefined): Promise<boolean> => {
-    if (!conversationId) return false;
-    const res = await forward(c, "GET", "/v1/dm/conversations?limit=100");
-    return res.status === 200 && asArray(dataOf(res.body)).some((conv) => conv.id === conversationId);
+    if (!conversationId || !DM_ID.test(conversationId)) return false;
+    const res = await forward(c, "GET", `/v1/dm/${encodeURIComponent(conversationId)}/messages?limit=1`);
+    return res.status === 200;
   };
 
   const MSG_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -422,6 +444,8 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
     const me = c.get("agent").name;
     const to = typeof body?.to === "string" ? (body.to === "@self" ? me : body.to.replace(/^@/, "")) : "";
     if (!body || !/^[A-Za-z0-9._:-]{1,128}$/.test(to)) return deny(c, 400, "relaygate_bad_request", { detail: "invalid recipient" });
+    // As on channel posts, `from` (a node-only sender override upstream) is never forwarded.
+    delete body.from;
     const id = inboxStream(to);
     const refused = await gateWrite(c, "dm.send", id, writeContent(body));
     if (refused) return refused;
@@ -439,7 +463,7 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
 
   app.get("/v1/dm/:cid/messages", async (c) => {
     const cid = c.req.param("cid");
-    if (!/^dm_[A-Za-z0-9_-]{1,200}$/.test(cid)) return deny(c, 404, "relaygate_route_not_proxied");
+    if (!DM_ID.test(cid)) return deny(c, 404, "relaygate_route_not_proxied");
     // Upstream checks participation; reading your own conversations is reading your own inbox.
     const refused = gateRead(c, "dm.messages", inboxStream(c.get("agent").name));
     return refused ?? pass(c, await forward(c, "GET", pathWithQuery(c)));

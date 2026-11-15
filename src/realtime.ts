@@ -105,7 +105,16 @@ export class NodeSockets {
   private open(client: WebSocket, agent: Agent, row: NodeTokenRow): void {
     const target = new URL("v1/node/ws", this.upstream.cfg.url.endsWith("/") ? this.upstream.cfg.url : `${this.upstream.cfg.url}/`);
     target.protocol = target.protocol === "https:" ? "wss:" : "ws:";
-    target.searchParams.set("token", this.upstream.cfg.box.open(row.upstreamSealed));
+    let upstreamToken: string;
+    try {
+      upstreamToken = this.upstream.cfg.box.open(row.upstreamSealed);
+    } catch {
+      // Sealed under a different RELAYGATE_SECRET: this node token is dead; the client mints a new one.
+      this.deps.store.audit({ agentId: agent.id, action: "node_ws", op: null, resourceKind: null, resourceId: null, decision: "deny", stage: "auth", reason: "node_token_unsealable" });
+      client.close(4401, "node token no longer valid");
+      return;
+    }
+    target.searchParams.set("token", upstreamToken);
     const up = new WebSocket(target);
     const conn: Conn = { agent, row, client, upstream: up };
     this.conns.add(conn);

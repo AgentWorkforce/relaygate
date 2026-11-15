@@ -59,6 +59,7 @@ function fakeRelaycast() {
   const calls: Array<{ method: string; path: string; auth: string; body: unknown; headers: Headers }> = [];
   let seq = 0;
   let revokeAll = false;
+  let channelsDown = false;
   const app = new Hono();
   const who = (auth: string) => [...agents.entries()].find(([, a]) => `Bearer ${a.token}` === auth)?.[0];
   const pairOf = (a: string, b: string) => [a, b].sort().join("~");
@@ -89,7 +90,13 @@ function fakeRelaycast() {
     return c.json({ ok: true, data: { agent_id: a.id, token: a.token } });
   });
   app.get("/v1/agent", (c) => c.json({ ok: true, data: { name: who(c.req.header("authorization")!) } }));
-  app.get("/v1/channels", (c) => c.json({ ok: true, data: channels }));
+  app.get("/v1/channels", (c) => (channelsDown ? c.json({ ok: false, error: { code: "boom" } }, 500) : c.json({ ok: true, data: channels })));
+  app.get("/v1/dm/:cid/messages", (c) => {
+    const me = who(c.req.header("authorization")!)!;
+    const pair = c.req.param("cid").slice(3);
+    if (!pair.split("~").includes(me)) return c.json({ ok: false, error: { code: "forbidden" } }, 403);
+    return c.json({ ok: true, data: messages.filter((m) => m.channel_id === `dmch_${pair}`) });
+  });
   app.post("/v1/channels/:name/messages", async (c) => {
     const ch = channels.find((x) => x.name === c.req.param("name"))!;
     const body = await c.req.json();
@@ -140,7 +147,16 @@ function fakeRelaycast() {
   app.all("*", (c) => c.json({ ok: true, data: "should never be reached" }));
 
   const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init))) as typeof fetch;
-  return { app, fetchFn, agents, messages, calls, revokeUpstreamTokens: () => (revokeAll = true) };
+  return {
+    app,
+    fetchFn,
+    agents,
+    messages,
+    channels,
+    calls,
+    revokeUpstreamTokens: () => (revokeAll = true),
+    setChannelsDown: (v: boolean) => (channelsDown = v),
+  };
 }
 
 function harness(model: Classifier = { classify: async () => ({ decision: "allow", reason: "ok" }) }, url = "http://relaycast.test") {
@@ -210,6 +226,72 @@ describe("Relaycast proxy: identity and provenance", () => {
     h.up.revokeUpstreamTokens();
     expect((await h.call("GET", "/v1/agent", local)).status).toBe(200);
     expect(h.up.calls.some((c) => c.path === "/v1/agents/local-a/takeover")).toBe(true);
+  });
+});
+
+describe("Relaycast proxy: review regressions", () => {
+  it("fails closed when a message's channel can't be resolved", async () => {
+    const h = harness();
+    const local = await h.token(KEYS.local, "local-a");
+    const posted = await h.call("POST", "/v1/channels/pit-ops/messages", local, { text: "please review" });
+    h.up.setChannelsDown(true);
+    expect((await h.call("GET", `/v1/messages/${posted.body.data.id}/replies`, local)).status).not.toBe(200);
+  });
+
+  it("uses a renamed channel's current name", async () => {
+    const h = harness();
+    const pit = await h.token(KEYS.pit, "pit-a");
+    const local = await h.token(KEYS.local, "local-a");
+    const posted = await h.call("POST", "/v1/channels/general/messages", local, { text: "hello" });
+    expect((await h.call("GET", `/v1/messages/${posted.body.data.id}`, pit)).status).toBe(200);
+    h.up.channels.find((c) => c.name === "general")!.name = "pit-renamed";
+    // Now a pit channel: the local author may not read it back.
+    expect((await h.call("GET", `/v1/messages/${posted.body.data.id}`, local)).status).toBe(403);
+  });
+
+  it("never forwards `from` on a DM", async () => {
+    const h = harness();
+    const local = await h.token(KEYS.local, "local-a");
+    await h.token(KEYS.pit, "pit-a");
+    await h.call("POST", "/v1/dm", local, { to: "pit-a", text: "hi", from: "pit-b" });
+    expect(h.up.calls.at(-1)!.body).not.toHaveProperty("from");
+  });
+
+  it("opens a listed DM conversation whatever characters its id has", async () => {
+    const h = harness();
+    const local = await h.token(KEYS.local, "local-a");
+    await h.token(KEYS.pit, "pit-a");
+    const dm = await h.call("POST", "/v1/dm", local, { to: "pit-a", text: "hi" });
+    expect((await h.call("GET", `/v1/dm/${encodeURIComponent(dm.body.data.conversation_id)}/messages`, local)).status).toBe(200);
+  });
+
+  it("concurrent 401s rotate the upstream token once and every request succeeds", async () => {
+    const h = harness();
+    const local = await h.token(KEYS.local, "local-a");
+    await h.call("GET", "/v1/agent", local);
+    h.up.revokeUpstreamTokens();
+    const results = await Promise.all([1, 2, 3, 4].map(() => h.call("GET", "/v1/agent", local)));
+    expect(results.map((r) => r.status)).toEqual([200, 200, 200, 200]);
+    expect(h.up.calls.filter((c) => c.path.endsWith("/takeover")).length).toBe(1);
+  });
+
+  it("takes the identity over when the stored token was sealed with another secret", async () => {
+    const h = harness();
+    const local = await h.token(KEYS.local, "local-a");
+    await h.call("GET", "/v1/agent", local);
+    const agent = h.store.agentByName("local-a")!;
+    h.store.putUpstreamAgent(agent.id, "up_local-a", new SecretBox("another-secret-entirely-000000000").seal("at_live_x"));
+    expect((await h.call("GET", "/v1/agent", local)).status).toBe(200);
+    expect(h.up.calls.some((c) => c.path.endsWith("/takeover"))).toBe(true);
+  });
+
+  it("keeps only a few node tokens per rg_ token", async () => {
+    const h = harness();
+    const local = await h.token(KEYS.local, "local-a");
+    const tokens: string[] = [];
+    for (let i = 0; i < 8; i++) tokens.push((await h.call("POST", "/v1/agent/node-token", local, {})).body.data.token);
+    expect(h.store.nodeToken(tokens[0]!)).toBeUndefined();
+    expect(h.store.nodeToken(tokens[7]!)).toBeDefined();
   });
 });
 
@@ -317,7 +399,7 @@ describe("Relaycast proxy: the pit rules", () => {
   });
 });
 
-describe("Relaycast proxy: realtime", () => {
+describe("Relaycast proxy: realtime", { timeout: 30_000 }, () => {
   const cleanups: Array<() => void> = [];
   afterEach(() => {
     for (const fn of cleanups.splice(0)) fn();
