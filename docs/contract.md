@@ -433,9 +433,10 @@ calls Sessions with one service token (`rth_st_`, `rth:sync` and `rth:read`).
 
 A write is decided before anything is recorded; the classifier sees every
 forwarded field, not only `content`. New sessions are claimed in one
-transaction only when the whole request is allowed, and released if Sessions
-doesn't accept the upload, so neither a refused nor a failed upload makes its
-sender an owner. A session override changes mode and ACL only, never the
+transaction only when the whole request is allowed, so a refused upload never
+makes its sender an owner. A claim is never released, even if Sessions rejects
+the upload: the uploader chose the session id and is the one who retries, and
+releasing could hand a session another upload filled to a different group. A session override changes mode and ACL only, never the
 owning group, which is what ceilings are checked against. Sessions that never came through relaygate have no owner and
 are invisible through it. Other Sessions routes (including the desktop
 uploader's `/v1/delivery/*`) answer `404 relaygate_route_not_proxied`. Pit agents

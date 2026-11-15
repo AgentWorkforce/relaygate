@@ -159,19 +159,11 @@ describe("Sessions proxy: reads", () => {
 });
 
 describe("Sessions proxy: review regressions", () => {
-  it("a failed first upload leaves no owner behind", async () => {
+  it("a failed first upload keeps the session with its uploader, who can retry; no one else gets it", async () => {
     const w = await world();
     expect((await w.turns(w.local, "s-fail")).status).toBe(400);
-    expect(w.store.session("s-fail")).toBeUndefined();
-  });
-
-  it("a failed upload never releases a session another upload filled", async () => {
-    const store = new Store(":memory:");
-    const a = store.createAgent("local-a", 11, "local", undefined);
-    store.claimSessions(["s1"], a.id, 11);
-    store.confirmSessions(["s1"]);
-    store.releaseSessions(["s1"], a.id);
-    expect(store.session("s1")?.owner).toBe(a.id);
+    expect(w.store.session("s-fail")?.owner).toBe(w.store.agentByName("local-a")?.id);
+    expect((await w.turns(w.pit, "s-fail")).status).toBe(403);
   });
 
   it("the classifier sees top-level fields too", async () => {

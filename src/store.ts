@@ -121,7 +121,6 @@ export class Store {
         id TEXT PRIMARY KEY,
         owner TEXT NOT NULL REFERENCES agents(id),
         gid INTEGER NOT NULL,
-        confirmed INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS audit (
@@ -248,18 +247,6 @@ export class Store {
       this.db.exec("ROLLBACK");
       throw error;
     }
-  }
-
-  /** Marks sessions as holding accepted content: their claims are never released after this. */
-  confirmSessions(ids: string[]): void {
-    const upd = this.db.prepare("UPDATE sessions SET confirmed = 1 WHERE id = ? AND confirmed = 0");
-    for (const id of ids) upd.run(id);
-  }
-
-  /** Releases this owner's claims that no accepted upload has confirmed. */
-  releaseSessions(ids: string[], owner: string): void {
-    const del = this.db.prepare("DELETE FROM sessions WHERE id = ? AND owner = ? AND confirmed = 0");
-    for (const id of ids) del.run(id, owner);
   }
 
   upstreamAgent(agentId: string): { upstreamId: string; tokenSealed: string } | undefined {

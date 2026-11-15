@@ -103,7 +103,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   /**
    * Decides every session a request writes, then claims the new ones in one transaction. If another uploader got
    * one of them first (while the classifier ran), nothing is claimed and the whole request is decided again against
-   * the real owners. Returns the ids this request claimed, so a failed upload can release them.
+   * the real owners. Returns the ids this request claimed.
    */
   const gateWrites = async (c: Ctx, writes: Map<string, string>, attempt = 0): Promise<Response | string[]> => {
     const fresh: string[] = [];
@@ -120,31 +120,12 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     return gateWrites(c, writes, attempt + 1);
   };
 
-  /** Uploads in flight per session, so a failed upload never releases a claim a concurrent one relies on. */
-  const inflight = new Map<string, number>();
-
   /**
-   * Forwards an upload. An accepted upload confirms every session it wrote (its claim is then permanent). A failed
-   * one releases the sessions it claimed, unless they are confirmed or another upload to them is still in flight
-   * (that one confirms or releases when it finishes).
+   * Forwards an upload. Claims are never released, even when Sessions rejects the upload: releasing could hand a
+   * session that a concurrent upload filled to another group. A failed first upload leaves the session with the
+   * agent that will retry it (session ids are chosen by the uploader).
    */
-  const upload = async (c: Ctx, written: string[], claimed: string[], path: string, body: unknown) => {
-    for (const id of written) inflight.set(id, (inflight.get(id) ?? 0) + 1);
-    let res: Awaited<ReturnType<typeof upstream>> | undefined;
-    try {
-      res = await upstream(c, "POST", path, body);
-    } finally {
-      for (const id of written) {
-        const n = (inflight.get(id) ?? 1) - 1;
-        if (n === 0) inflight.delete(id);
-        else inflight.set(id, n);
-      }
-      const ok = res !== undefined && res.status >= 200 && res.status < 300;
-      if (ok) store.confirmSessions(written);
-      else store.releaseSessions(claimed.filter((id) => !inflight.has(id)), c.get("agent").id);
-    }
-    return pass(c, res);
-  };
+  const upload = async (c: Ctx, path: string, body: unknown) => pass(c, await upstream(c, "POST", path, body));
 
   const gateRead = (c: Ctx, id: string) => {
     const ok = SESSION_ID.test(id) && canRead(c, id);
@@ -164,7 +145,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     // The classifier sees everything that is forwarded, not only `content`.
     const gate = await gateWrites(c, new Map([[id, JSON.stringify(forwarded)]]));
     if (gate instanceof Response) return gate;
-    return upload(c, [id], gate, `/v1/sessions/${encodeURIComponent(id)}/turns`, forwarded);
+    return upload(c, `/v1/sessions/${encodeURIComponent(id)}/turns`, forwarded);
   });
 
   // Batch upload. Every session a batch touches must be writable, or nothing is forwarded.
@@ -188,7 +169,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     const { records: _records, ...envelope } = body as Record<string, unknown>;
     const gate = await gateWrites(c, new Map([...bySession].map(([id, rs]) => [id, JSON.stringify({ ...envelope, records: rs })])));
     if (gate instanceof Response) return gate;
-    return upload(c, [...bySession.keys()], gate, "/v1/ingest", { ...envelope, records });
+    return upload(c, "/v1/ingest", { ...envelope, records });
   });
 
   // List and search: only sessions the caller may read. Filtering after the fact means a page can come back short.
