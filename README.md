@@ -41,6 +41,10 @@ Relaycast client's base URL at relaygate and use the `rg_` token (see
 | `SESSIONS_UPLOAD_URL`, `SESSIONS_READ_URL` | `SESSIONS_URL` | Separate upload and read origins. |
 | `SESSIONS_HOSTS` | none | Comma-separated hosts whose requests are Sessions requests at the root path (a history origin pointed at relaygate). |
 | `SESSIONS_TOKEN` | none | Optional fallback Sessions credential for callers that send none; callers normally forward their own in `Authorization`, with their rg_ token in `X-Relaygate-Token`. |
+| `RELAYCONTROL_INTROSPECT_URL` | none | Turns on Control principals (desktop device tokens, dashboard read tokens) on Sessions routes. |
+| `RELAYCONTROL_INTROSPECT_SECRET` | none | relay-control's introspection secret. Required with the URL. |
+| `SESSION_INGEST_AUDIENCE` | none | The audience device tokens are introspected for (the Sessions ingest origin relay-control accepts). Required with the URL. |
+| `SESSIONS_INTERNAL_SECRET` | none | The read API's internal secret; when set, relaygate checks relay-control's mint calls against it. |
 | `ANTHROPIC_API_KEY` | none | Needed only when `classifier.model.enabled` is true. |
 
 Health: `GET /healthz` (process up) and `GET /readyz` (policy loaded, database

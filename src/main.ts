@@ -6,6 +6,7 @@ import { loadPolicyFile, type Policy } from "./policy.js";
 import { NodeSockets } from "./realtime.js";
 import { RelaycastUpstream } from "./relaycast.js";
 import { routeSessionsHosts } from "./sessions.js";
+import { ControlAuth } from "./control.js";
 import { SecretBox, Store } from "./store.js";
 
 const policyPath = process.env.RELAYGATE_POLICY;
@@ -70,15 +71,26 @@ if (uploadUrl || readUrl) {
     process.exit(1);
   }
   const hosts = (process.env.SESSIONS_HOSTS ?? "").split(",").map((h) => h.trim()).filter(Boolean);
-  sessions = { uploadUrl, readUrl, token: process.env.SESSIONS_TOKEN || undefined, hosts };
+  sessions = { uploadUrl, readUrl, token: process.env.SESSIONS_TOKEN || undefined, hosts, internalSecret: process.env.SESSIONS_INTERNAL_SECRET || undefined };
+}
+// relay-control principals (desktop device tokens, dashboard read tokens) are on when the introspection URL is set.
+let control: ControlAuth | undefined;
+if (process.env.RELAYCONTROL_INTROSPECT_URL) {
+  const secret = process.env.RELAYCONTROL_INTROSPECT_SECRET;
+  const audience = process.env.SESSION_INGEST_AUDIENCE;
+  if (!secret || !audience) {
+    console.error("RELAYCONTROL_INTROSPECT_URL needs RELAYCONTROL_INTROSPECT_SECRET and SESSION_INGEST_AUDIENCE");
+    process.exit(1);
+  }
+  control = new ControlAuth({ introspectUrl: process.env.RELAYCONTROL_INTROSPECT_URL, introspectSecret: secret, audience }, store);
 }
 let sockets: NodeSockets | undefined;
-const deps = { store, policy: () => policy, classifier: () => classifier, adminToken, relaycast, sessions, onTokensRevoked: () => sockets?.revalidate() };
+const deps = { store, policy: () => policy, classifier: () => classifier, adminToken, relaycast, sessions, control, onTokensRevoked: () => sockets?.revalidate() };
 const app = createApp(deps);
 
 const fetchFn = sessions?.hosts?.length ? routeSessionsHosts(app.fetch, sessions.hosts) : app.fetch;
 const server = serve({ fetch: fetchFn, port }, (info) => {
-  console.log(JSON.stringify({ msg: "relaygate listening", port: info.port, model_classifier: policy.classifier.model.enabled, relaycast: !!relaycast, sessions: !!sessions, sessions_hosts: sessions?.hosts ?? [] }));
+  console.log(JSON.stringify({ msg: "relaygate listening", port: info.port, model_classifier: policy.classifier.model.enabled, relaycast: !!relaycast, sessions: !!sessions, sessions_hosts: sessions?.hosts ?? [], control_principals: !!control }));
 });
 if (relaycast) {
   sockets = new NodeSockets(deps, relaycast);

@@ -304,10 +304,10 @@ describe("Sessions proxy: the caller's own credential", () => {
     expect((await w.call("GET", "/sessions/v1/events", w.local)).status).toBe(400);
   });
 
-  it("refuses aggregate read routes it doesn't model", async () => {
+  it("refuses aggregate reads to groups the policy doesn't name in sessionAggregates", async () => {
     const w = await world();
     for (const path of ["/sessions/v1/sessions/users", "/sessions/v1/digest/daily", "/sessions/v1/sessions/activity"]) {
-      expect((await w.call("GET", path, w.local)).status, path).toBe(404);
+      expect((await w.call("GET", path, w.local)).status, path).toBe(403);
     }
   });
 

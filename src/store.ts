@@ -125,6 +125,14 @@ export class Store {
         gid INTEGER NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS control_read_tokens (
+        hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        org_id TEXT NOT NULL,
+        workspace_id TEXT,
+        role TEXT,
+        expires_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS audit (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         at TEXT NOT NULL,
@@ -250,6 +258,40 @@ export class Store {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  /** The relaygate agent standing for a relay-control user (`ctl:<userId>`), created on first sight. */
+  ensureControlAgent(userId: string, gid: number): Agent {
+    const name = `ctl:${userId}`;
+    const existing = this.agentByName(name);
+    if (existing) {
+      if (existing.gid !== gid) {
+        this.db.prepare("UPDATE agents SET gid = ? WHERE id = ?").run(gid, existing.id);
+        existing.gid = gid;
+      }
+      return existing;
+    }
+    return this.createAgent(name, gid, "control", undefined);
+  }
+
+  putControlReadToken(row: { hash: string; userId: string; orgId: string; workspaceId: string | null; role: string | null; expiresAt: number }): void {
+    this.db
+      .prepare(
+        `INSERT INTO control_read_tokens (hash, user_id, org_id, workspace_id, role, expires_at) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(hash) DO UPDATE SET user_id = excluded.user_id, org_id = excluded.org_id, workspace_id = excluded.workspace_id, role = excluded.role, expires_at = excluded.expires_at`,
+      )
+      .run(row.hash, row.userId, row.orgId, row.workspaceId, row.role, row.expiresAt);
+  }
+
+  controlReadToken(hash: string, now: number): { userId: string; orgId: string; workspaceId: string | null; role: "owner" | "admin" | "member" | null; expiresAt: number } | undefined {
+    const row = this.db.prepare("SELECT user_id, org_id, workspace_id, role, expires_at FROM control_read_tokens WHERE hash = ? AND expires_at > ?").get(hash, now);
+    return row
+      ? { userId: String(row.user_id), orgId: String(row.org_id), workspaceId: row.workspace_id === null ? null : String(row.workspace_id), role: row.role === null ? null : (String(row.role) as "owner"), expiresAt: Number(row.expires_at) }
+      : undefined;
+  }
+
+  pruneControlReadTokens(now: number): void {
+    this.db.prepare("DELETE FROM control_read_tokens WHERE expires_at <= ?").run(now);
   }
 
   upstreamAgent(agentId: string): { upstreamId: string; tokenSealed: string } | undefined {

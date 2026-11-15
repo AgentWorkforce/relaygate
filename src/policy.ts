@@ -68,6 +68,31 @@ export const PolicySchema = z.object({
    * An override can't move a session to another group: its owning group is what ceilings are checked against.
    */
   sessionOverrides: z.array(z.object({ id: z.string().min(1), mode: Mode.optional(), acl: AclSchema }).strict()).default([]),
+  /**
+   * relay-control users without an rg_ token (the desktop app's device token, dashboard read tokens), mapped to
+   * groups: the first rule whose every given field matches wins; no match means refused.
+   */
+  controlPrincipals: z
+    .array(
+      z.object({
+        match: z
+          .object({
+            kinds: z.array(z.enum(["device", "read"])).min(1).optional(),
+            orgIds: z.array(z.string().min(1)).min(1).optional(),
+            workspaceIds: z.array(z.string().min(1)).min(1).optional(),
+            roles: z.array(z.enum(["owner", "admin", "member"])).min(1).optional(),
+            userIds: z.array(z.string().min(1)).min(1).optional(),
+            emails: z.array(z.string().min(3)).min(1).optional(),
+          })
+          .strict()
+          .default({}),
+        gid: Gid,
+        groups: z.array(Gid).default([]),
+      }),
+    )
+    .default([]),
+  /** Who may read Sessions aggregates that span every session (per-person usage, activity, digests). */
+  sessionAggregates: z.object({ gids: z.array(Gid).default([]) }).default({ gids: [] }),
   /** Per group, the groups whose resources it may never touch, whatever the mode or ACL says. */
   ceilings: z.array(z.object({ gid: Gid, never: z.array(Gid).min(1) })).default([]),
   classifier: z
@@ -111,6 +136,8 @@ export function parsePolicy(raw: unknown): Policy {
     ...policy.sessionOverrides.flatMap((o) =>
       o.acl.map((e) => ({ where: `session override ${o.id}`, gid: e.gid })),
     ),
+    ...policy.controlPrincipals.flatMap((rule, i) => [rule.gid, ...rule.groups].map((gid) => ({ where: `control principal rule ${i}`, gid }))),
+    ...policy.sessionAggregates.gids.map((gid) => ({ where: "sessionAggregates", gid })),
     ...policy.ceilings.flatMap((c) => [c.gid, ...c.never].map((gid) => ({ where: `ceiling for ${c.gid}`, gid }))),
   ].filter((r) => !gids.has(r.gid));
   if (unknown.length > 0) {
