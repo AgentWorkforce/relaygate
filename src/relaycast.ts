@@ -26,7 +26,9 @@ const MESSAGES: Record<string, string> = {
 /** Errors on proxied routes use Relaycast's shape, so SDK clients surface relaygate's code and message. */
 export function deny(c: Context, status: 400 | 401 | 403 | 404 | 409 | 413 | 415 | 502 | 503, code: string, extra: Record<string, unknown> = {}) {
   const detail = typeof extra.detail === "string" ? `: ${extra.detail}` : "";
-  return c.json({ ok: false, error: { code, message: `${MESSAGES[code] ?? code}${detail}` }, ...extra }, status);
+  // relaygate couldn't decide (classifier, relay-control, an upstream): worth retrying shortly.
+  const headers = status === 503 || status === 502 ? { "retry-after": "1" } : undefined;
+  return c.json({ ok: false, error: { code, message: `${MESSAGES[code] ?? code}${detail}` }, ...extra }, status, headers);
 }
 
 export interface RelaycastConfig {
@@ -50,6 +52,8 @@ export class UpstreamError extends Error {
 interface UpstreamResponse {
   status: number;
   body: unknown;
+  /** Retry-After from Relaycast (rate limits, overload), passed back to the caller. */
+  retryAfter?: string;
 }
 
 export class RelaycastUpstream {
@@ -80,7 +84,7 @@ export class RelaycastUpstream {
     } catch {
       parsed = { ok: false, error: { code: "upstream_not_json" } };
     }
-    return { status: res.status, body: parsed };
+    return { status: res.status, body: parsed, retryAfter: res.headers.get("retry-after") ?? undefined };
   }
 
   /** The agent's upstream at_live_ token, registering the agent upstream on first use. */
@@ -212,7 +216,7 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
 
   const denied = (c: Ctx, op: Op, id: string) => deny(c, 403, "relaygate_denied", { op, resource: id });
 
-  const pass = (c: Ctx, r: UpstreamResponse) => c.json(r.body as object, r.status as 200);
+  const pass = (c: Ctx, r: UpstreamResponse) => c.json(r.body as object, r.status as 200, r.retryAfter ? { "retry-after": r.retryAfter } : undefined);
 
   const forward = async (c: Ctx, method: string, path: string, body?: unknown) => {
     try {

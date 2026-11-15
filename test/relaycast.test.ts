@@ -456,6 +456,14 @@ describe("Relaycast proxy: desktop broker routes", () => {
     expect(h.up.calls.at(-1)).toMatchObject({ method: "POST", path: "/v1/deliveries/dl1/ack" });
   });
 
+  it("passes Relaycast's Retry-After back", async () => {
+    const h = harness();
+    const local = await h.token(KEYS.local, "local-a");
+    const res = await h.app.request("/v1/deliveries/busy/ack", { method: "POST", headers: { authorization: `Bearer ${local}`, "content-type": "application/json" }, body: "{}" });
+    expect(res.status).toBe(429);
+    expect(res.headers.get("retry-after")).toBe("7");
+  });
+
   it("lets an agent update and remove only itself; removal ends its tokens", async () => {
     const h = harness();
     const local = await h.token(KEYS.local, "local-a");

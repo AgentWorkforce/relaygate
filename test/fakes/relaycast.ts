@@ -133,7 +133,11 @@ export function fakeRelaycast() {
     failed.push({ id: c.req.param("id"), body: await c.req.json().catch(() => ({})) });
     return c.json({ ok: true, data: { id: c.req.param("id"), status: "failed" } });
   });
-  app.post("/v1/deliveries/:id/ack", (c) => c.json({ ok: true, data: { id: c.req.param("id"), status: "acked" } }));
+  app.post("/v1/deliveries/:id/ack", (c) =>
+    c.req.param("id") === "busy"
+      ? c.json({ ok: false, error: { code: "rate_limited" } }, 429, { "retry-after": "7" })
+      : c.json({ ok: true, data: { id: c.req.param("id"), status: "acked" } }),
+  );
   app.patch("/v1/agents/:name", async (c) => c.json({ ok: true, data: { name: c.req.param("name"), ...(await c.req.json()) } }));
   app.delete("/v1/agents/:name", (c) => {
     agents.delete(c.req.param("name"));
