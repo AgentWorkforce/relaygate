@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import type { AclEntry } from "./mode.js";
 
 export const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
 
@@ -16,6 +17,8 @@ export interface Agent {
   /** The enrollment key the agent registered with; its supplementary groups come from the current policy. */
   keyId: string;
   recoveryHash: string | null;
+  /** Enrolled with a guest key. Kept on the agent so removing the key from the policy can't make a guest a member. */
+  guest: boolean;
 }
 
 export interface StreamRow {
@@ -24,6 +27,7 @@ export interface StreamRow {
   gid: number;
   mode: string;
   classify: boolean;
+  acl: AclEntry[];
 }
 
 export interface AuditEntry {
@@ -50,6 +54,7 @@ export class Store {
         gid INTEGER NOT NULL,
         key_id TEXT NOT NULL,
         recovery_hash TEXT,
+        guest INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS tokens (
@@ -64,6 +69,7 @@ export class Store {
         gid INTEGER NOT NULL,
         mode TEXT NOT NULL,
         classify INTEGER NOT NULL,
+        acl TEXT NOT NULL DEFAULT '[]',
         updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS audit (
@@ -79,6 +85,14 @@ export class Store {
         reason TEXT
       );
     `);
+    // Databases from build 1 predate these columns.
+    this.addColumn("agents", "guest", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumn("streams", "acl", "TEXT NOT NULL DEFAULT '[]'");
+  }
+
+  private addColumn(table: string, column: string, decl: string): void {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all().map((c) => String(c.name));
+    if (!cols.includes(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
   }
 
   ping(): boolean {
@@ -86,21 +100,22 @@ export class Store {
   }
 
   agentByName(name: string): Agent | undefined {
-    const row = this.db.prepare("SELECT id, name, gid, key_id, recovery_hash FROM agents WHERE name = ?").get(name);
+    const row = this.db.prepare("SELECT id, name, gid, key_id, recovery_hash, guest FROM agents WHERE name = ?").get(name);
     return row ? toAgent(row) : undefined;
   }
 
-  createAgent(name: string, gid: number, keyId: string, recovery: string | undefined): Agent {
+  createAgent(name: string, gid: number, keyId: string, recovery: string | undefined, guest = false): Agent {
     const agent: Agent = {
       id: `ag_${randomUUID()}`,
       name,
       gid,
       keyId,
       recoveryHash: recovery ? sha256(recovery) : null,
+      guest,
     };
     this.db
-      .prepare("INSERT INTO agents (id, name, gid, key_id, recovery_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(agent.id, agent.name, agent.gid, agent.keyId, agent.recoveryHash, now());
+      .prepare("INSERT INTO agents (id, name, gid, key_id, recovery_hash, guest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(agent.id, agent.name, agent.gid, agent.keyId, agent.recoveryHash, agent.guest ? 1 : 0, now());
     return agent;
   }
 
@@ -108,6 +123,14 @@ export class Store {
   revokeTokens(agentId: string): string[] {
     const rows = this.db.prepare("SELECT hash FROM tokens WHERE agent_id = ? AND revoked = 0").all(agentId);
     this.db.prepare("UPDATE tokens SET revoked = 1 WHERE agent_id = ?").run(agentId);
+    return rows.map((r) => String(r.hash));
+  }
+
+  /** Revokes every token issued to agents enrolled with the key; returns the revoked hashes. */
+  revokeKeyTokens(keyId: string): string[] {
+    const q = "FROM tokens WHERE revoked = 0 AND agent_id IN (SELECT id FROM agents WHERE key_id = ?)";
+    const rows = this.db.prepare(`SELECT hash ${q}`).all(keyId);
+    this.db.prepare(`UPDATE tokens SET revoked = 1 WHERE revoked = 0 AND agent_id IN (SELECT id FROM agents WHERE key_id = ?)`).run(keyId);
     return rows.map((r) => String(r.hash));
   }
 
@@ -120,14 +143,14 @@ export class Store {
   agentForToken(token: string): Agent | undefined {
     const row = this.db
       .prepare(
-        "SELECT a.id, a.name, a.gid, a.key_id, a.recovery_hash FROM tokens t JOIN agents a ON a.id = t.agent_id WHERE t.hash = ? AND t.revoked = 0",
+        "SELECT a.id, a.name, a.gid, a.key_id, a.recovery_hash, a.guest FROM tokens t JOIN agents a ON a.id = t.agent_id WHERE t.hash = ? AND t.revoked = 0",
       )
       .get(sha256(token));
     return row ? toAgent(row) : undefined;
   }
 
   stream(id: string): StreamRow | undefined {
-    const row = this.db.prepare("SELECT id, owner, gid, mode, classify FROM streams WHERE id = ?").get(id);
+    const row = this.db.prepare("SELECT id, owner, gid, mode, classify, acl FROM streams WHERE id = ?").get(id);
     if (!row) return undefined;
     return {
       id: String(row.id),
@@ -135,16 +158,17 @@ export class Store {
       gid: Number(row.gid),
       mode: String(row.mode),
       classify: Number(row.classify) === 1,
+      acl: JSON.parse(String(row.acl)) as AclEntry[],
     };
   }
 
   putStream(s: StreamRow): void {
     this.db
       .prepare(
-        `INSERT INTO streams (id, owner, gid, mode, classify, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET gid = excluded.gid, mode = excluded.mode, classify = excluded.classify, updated_at = excluded.updated_at`,
+        `INSERT INTO streams (id, owner, gid, mode, classify, acl, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET gid = excluded.gid, mode = excluded.mode, classify = excluded.classify, acl = excluded.acl, updated_at = excluded.updated_at`,
       )
-      .run(s.id, s.owner, s.gid, s.mode, s.classify ? 1 : 0, now());
+      .run(s.id, s.owner, s.gid, s.mode, s.classify ? 1 : 0, JSON.stringify(s.acl), now());
   }
 
   audit(e: AuditEntry): void {
@@ -173,5 +197,6 @@ function toAgent(row: Record<string, unknown>): Agent {
     gid: Number(row.gid),
     keyId: String(row.key_id),
     recoveryHash: row.recovery_hash === null ? null : String(row.recovery_hash),
+    guest: Number(row.guest) === 1,
   };
 }

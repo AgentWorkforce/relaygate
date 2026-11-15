@@ -11,6 +11,11 @@ const Mode = z
   .string()
   .regex(/^[0246]{3}$/, "mode is three octal digits using only 4 (read) and 2 (write); 1 is reserved");
 
+const Gid = z.number().int().nonnegative();
+
+/** Extra group entries that only add access (docs/contract.md, "Access lists"). */
+export const AclSchema = z.array(z.object({ gid: Gid, perm: z.enum(["r", "w", "rw"]) })).default([]);
+
 const Sha256 = z.string().regex(/^[0-9a-f]{64}$/, "sha256 as 64 lowercase hex characters");
 
 export const PolicySchema = z.object({
@@ -27,6 +32,10 @@ export const PolicySchema = z.object({
       sha256: Sha256,
       namePrefix: z.string().min(1).optional(),
       revoked: z.boolean().default(false),
+      /** After this instant the key enrolls no one (and, for a guest key, its tokens stop working). */
+      expiresAt: z.iso.datetime({ offset: true }).optional(),
+      /** A guest key: revoking or expiring it ends every token issued from it, and its agents carry `guest: true`. */
+      guest: z.boolean().default(false),
     }),
   ),
   streamDefaults: z
@@ -36,6 +45,7 @@ export const PolicySchema = z.object({
         gid: z.number().int().nonnegative(),
         mode: Mode,
         classify: z.boolean().default(false),
+        acl: AclSchema,
       }),
     )
     .default([]),
@@ -46,9 +56,12 @@ export const PolicySchema = z.object({
         gid: z.number().int().nonnegative(),
         mode: Mode,
         classify: z.boolean().default(false),
+        acl: AclSchema,
       }),
     )
     .default([]),
+  /** Per group, the groups whose resources it may never touch, whatever the mode or ACL says. */
+  ceilings: z.array(z.object({ gid: Gid, never: z.array(Gid).min(1) })).default([]),
   classifier: z
     .object({
       rules: z
@@ -82,12 +95,34 @@ export function parsePolicy(raw: unknown): Policy {
     ),
     ...policy.streamDefaults.map((d) => ({ where: `stream default ${d.prefix}`, gid: d.gid })),
     ...policy.streamOverrides.map((o) => ({ where: `stream override ${o.id}`, gid: o.gid })),
+    ...[...policy.streamDefaults.map((d) => ({ where: `stream default ${d.prefix}`, acl: d.acl })),
+      ...policy.streamOverrides.map((o) => ({ where: `stream override ${o.id}`, acl: o.acl }))].flatMap((x) =>
+      x.acl.map((e) => ({ where: `${x.where} acl`, gid: e.gid })),
+    ),
+    ...policy.ceilings.flatMap((c) => [c.gid, ...c.never].map((gid) => ({ where: `ceiling for ${c.gid}`, gid }))),
   ].filter((r) => !gids.has(r.gid));
   if (unknown.length > 0) {
     throw new Error(`policy names groups it doesn't define: ${unknown.map((u) => `${u.where} (gid ${u.gid})`).join(", ")}`);
   }
+  // A key can't put an agent into a group its own ceiling forbids: the ceiling would always win, so it's a mistake.
+  for (const k of policy.enrollmentKeys) {
+    const mine = [k.gid, ...k.groups];
+    for (const c of policy.ceilings.filter((c) => mine.includes(c.gid))) {
+      const clash = c.never.find((g) => mine.includes(g));
+      if (clash !== undefined) {
+        throw new Error(`enrollment key ${k.id} enrolls into gid ${clash}, which the ceiling for gid ${c.gid} forbids`);
+      }
+    }
+  }
   for (const rule of policy.classifier.rules) new RegExp(rule.pattern, rule.flags);
   return policy;
+}
+
+export type EnrollmentKey = Policy["enrollmentKeys"][number];
+
+/** Whether the key can still enroll agents at `now` (milliseconds since the epoch). */
+export function keyUsable(key: EnrollmentKey, now: number): boolean {
+  return !key.revoked && (key.expiresAt === undefined || Date.parse(key.expiresAt) > now);
 }
 
 export function loadPolicyFile(path: string): Policy {
