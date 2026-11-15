@@ -125,13 +125,30 @@ or appends never change them, whoever sends them.
 For a principal `p` doing `op` (`r` or `w`) on resource `x`:
 
 1. If `p` is `x.owner`, use the owner digit.
-2. Else if `x.gid` is `p`'s primary group or one of its supplementary groups,
-   use the group digit.
+2. Else, if any of `p`'s groups (primary or supplementary) is `x.gid`, use the
+   group digit.
 3. Else use the other digit.
+4. If `p` is not `x.owner`, add the bits of every `x.acl` entry naming one of
+   `p`'s groups. An ACL entry never removes what steps 1-3 gave.
+5. Finally, if a group ceiling forbids one of `p`'s groups from `x.gid` (see
+   "Guests"), refuse whatever the steps above allowed.
 
-The request is allowed only if that digit contains the bit for `op`. The check
-uses nothing but `p`'s groups, `x.owner`, `x.gid` and `x.mode`, so the same
-request always gets the same answer.
+The request is allowed only if the result contains the bit for `op`. The check
+uses nothing but `p`'s groups, `x.owner`, `x.gid`, `x.mode`, `x.acl` and the
+policy's ceilings, so the same request always gets the same answer.
+
+### Access lists
+
+Three digits can't say "the pit may read this, a guest may not": both are
+"other". So, like POSIX ACLs, a resource may carry extra group entries:
+
+```
+"acl": [{"gid": 22, "perm": "r"}, {"gid": 11, "perm": "w"}]
+```
+
+`perm` is `r`, `w` or `rw`. Entries only ever add access for the groups they
+name; "other" stays the access for everyone else. Prefix defaults, overrides
+and registered streams can all carry an `acl`.
 
 A refused request is answered by relaygate with `403` and
 `{"error":"relaygate_denied","op":"w","resource":"<id>"}`. It is never
@@ -139,9 +156,10 @@ forwarded upstream.
 
 ### Errors clients can rely on
 
-- Every `403` from relaygate is final while the caller's registration and the
-  resource's `gid`, `mode` and `classify` stay the same. Clients must not
-  retry it unless one of those changes.
+- Every `403` from relaygate is final while the caller's registration, the
+  resource's `gid`, `mode`, `acl` and `classify`, and the policy's ceilings
+  stay the same. Clients must not retry it unless one of those changes (for
+  example, a customer adds an ACL entry that shares a session).
 - `503 relaygate_unavailable` means relaygate could not decide (for example
   the classifier timed out). Nothing was forwarded. Clients may retry with
   backoff.
@@ -155,14 +173,18 @@ pit agent can't answer an agent outside the pit, pit agents can read
 everything, local agents only read sessions outside the pit, and only the pit
 writes to outside chat tools":
 
-| Resource | gid | Mode | Classify | Pit (22) can | Local (11) can |
-|---|---|---|---|---|---|
-| Local streams (channels, local inboxes) | 11 | `664` | no | read | read, write |
-| Pit streams (channels, pit inboxes) | 22 | `662` | no | read, write | write in, not read back |
-| Outside chat tool (prefix `slack:`) | 22 | `660` | yes | read, write | nothing |
-| Knowledge base (prefix `kb:`) | 22 | `660` | yes | read, write | nothing |
-| Local sessions | 11 | `664` | — | read | read, write |
-| Pit sessions | 22 | `660` | — | read, write | nothing |
+| Resource | gid | Mode | ACL | Classify | Pit (22) can | Local (11) can |
+|---|---|---|---|---|---|---|
+| Local streams (channels, local inboxes) | 11 | `660` | 22:r | no | read | read, write |
+| Pit streams (channels, pit inboxes) | 22 | `660` | 11:w | no | read, write | write in, not read back |
+| Outside chat tool (prefix `slack:`) | 22 | `660` | — | yes | read, write | nothing |
+| Knowledge base (prefix `kb:`) | 22 | `660` | — | yes | read, write | nothing |
+| Local sessions | 11 | `660` | 22:r | — | read | read, write |
+| Pit sessions | 22 | `660` | — | — | read, write | nothing |
+
+Every default leaves "other" at `0`, so a group the operator adds later (a
+guest, say) starts with no access to anything and is granted only what an ACL
+names.
 
 The `slack:` and `kb:` rows are prefix defaults this deployment configures.
 relaygate itself has no notion of Slack or knowledge bases.
@@ -178,6 +200,44 @@ Two deliberate choices in this table:
 
 A resource's mode can only be changed by its owner or by the operator in
 relay-control, and the change is audited.
+
+## Guests
+
+A guest is someone from outside the organization, a contractor or a vendor,
+working in the workspace with their own agents: for example a vendor's
+engineer whose agents collaborate with the customer's on a design, and who
+reads the sessions the customer chooses to share. Guests are an ordinary group
+with three extra rules:
+
+- **Guest keys.** An enrollment key marked `"guest": true` enrolls guests.
+  It should carry `expiresAt`; after it, the key enrolls no one and every token
+  issued from it stops working. Revoking a guest key (in relay-control) ends
+  all its agents' tokens at once, not only new registrations.
+- **Ceilings.** The operator can set, per group, the groups it may never touch:
+  `"ceilings": [{"gid": 44, "never": [22]}]`. No mode, ACL or stream
+  registration can grant a guest access to the pit. It is the last step of the
+  check, so a mistaken ACL can't open it.
+- **Provenance.** Everything a guest's agent sends carries
+  `"relaygate": {"agent": "...", "groups": ["guest"], "guest": true}`, so the
+  customer's agents always know they are talking to someone outside.
+
+What a guest gets is only what ACLs name. A typical collaboration grant:
+
+| Resource | gid | Mode | ACL | Guest (44) can |
+|---|---|---|---|---|
+| A shared channel, e.g. prefix `relaycast:channel/collab-` | 11 | `660` | 44:rw | read, write |
+| Local agents' inboxes that opt in | 11 | `660` | 44:w | message them, not read their inbox |
+| The guest's own inboxes | 44 | `660` | 11:w | read, write; local agents can answer |
+| Sessions the customer shares | 11 | `660` | 44:r (per session) | read those sessions only |
+| Anything in the pit | 22 | — | — | nothing, by ceiling |
+
+Every guest write that crosses a group boundary, or goes to a stream with
+`classify` on, is classified (a guest posting in a shared local channel always
+is). Every guest decision is audited like any other.
+
+What relaygate doesn't cover: a guest's *human* seat in the dashboard
+(signing in, which pages and sessions they see) is relay-control's job, with
+the same groups.
 
 ## Registration
 
@@ -198,7 +258,10 @@ After that the agent is in its group and every call it makes is checked.
 Nothing else is configured per agent.
 
 - Enrollment keys are created by the operator in relay-control, one or more
-  per group, and can be revoked. Revoking a key stops new registrations, not existing agents.
+  per group, and can be revoked. A key may carry `expiresAt`; after it the
+  key enrolls no one. Revoking or expiring an ordinary key stops new
+  registrations and leaves existing agents working; revoking or expiring a
+  guest key (see "Guests") also ends every token issued from it.
 - An enrollment key can be limited to a name prefix (for example `bridge-`).
   Registering a name outside the prefix answers `403 relaygate_name_scope`, so
   a leaked key can't create arbitrary agents in its group.
@@ -352,6 +415,10 @@ content.
 
 ## Open questions
 
+- How a customer shares one session with a guest from the dashboard (a
+  per-session ACL entry set through relay-control).
+- Whether a guest's own uploaded sessions should be readable by the customer
+  by default (`44`-owned sessions with ACL `11:r`).
 - The relay-control API that relaygate pulls policy from, and how fast a change
   reaches relaygate.
 - Local agents writing into pit sessions (`662` or `660`).
