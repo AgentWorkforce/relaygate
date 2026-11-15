@@ -98,7 +98,7 @@ export class Gate {
    * Reads a session until `needle` appears (Sessions may store uploads asynchronously) or the wait runs out.
    * Returns the last response and whether the needle was found.
    */
-  async sessionReadUntil(sessionId: string, needle: string, ms = 45_000): Promise<{ res: Res; found: boolean }> {
+  async sessionReadUntil(sessionId: string, needle: string, ms = ingestWaitMs()): Promise<{ res: Res; found: boolean }> {
     const start = Date.now();
     for (;;) {
       const res = await this.call("GET", `/sessions/v1/sessions/${sessionId}/events`);
@@ -157,6 +157,12 @@ export async function enroll(base: string, key: string, name: string, recovery: 
 }
 
 export const dataOf = (r: Res): any => (r.body && typeof r.body === "object" && "data" in r.body ? r.body.data : r.body);
+
+/**
+ * How long to wait for an upload to become readable. Self-hosted Sessions makes uploads readable on its indexer's
+ * reconcile tick (every 5 minutes by default), so set ACCEPTANCE_INGEST_WAIT_MS=360000 there.
+ */
+export const ingestWaitMs = () => Number(process.env.ACCEPTANCE_INGEST_WAIT_MS || 45_000);
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

@@ -25,7 +25,7 @@ const KEYS = { local: "enroll-local-dryrun-000000000000", pit: "enroll-pit-dryru
 const ADMIN = "admin-token-dryrun-000000000000";
 const closers: Array<() => void> = [];
 
-const DEPLOYMENT_VARS = /^(RG_|SESSIONS_READ_REFRESH_CMD$|INSIDE_LOGS_CMD$|INSIDE_AGENTS$|RELAYCAST_DIRECT_URL$|OUTSIDE_|INSIDE_SESSIONS_|ADMIN_TOKEN$|POLICY_FILE$)/;
+const DEPLOYMENT_VARS = /^(RG_|SESSIONS_READ_REFRESH_CMD$|INSIDE_LOGS_CMD$|INSIDE_AGENTS$|RELAYCAST_DIRECT_URL$|DIRECT_SESSIONS_READ_URL$|OUTSIDE_|INSIDE_SESSIONS_|ADMIN_TOKEN$|POLICY_FILE$)/;
 function withoutDeploymentHooks(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(env).filter(([k]) => !DEPLOYMENT_VARS.test(k)));
 }
@@ -64,7 +64,9 @@ describe("acceptance driver dry run", { timeout: 300_000 }, () => {
     const out = await new Promise<{ code: number | null; text: string }>((resolve) => {
       const child = spawn(process.execPath, ["--import", "tsx", "scripts/acceptance/run.ts"], {
         // Never inherit the operator's deployment hooks: this run targets in-process stand-ins only.
-        env: { ...withoutDeploymentHooks(process.env), RELAYGATE_URL: gateUrl, OUTSIDE_KEY: KEYS.local, INSIDE_KEY: KEYS.pit, ADMIN_TOKEN: ADMIN, POLICY_FILE: policyFile, RUN_ID: "dry-1_a", SESSIONS_ORG_ID: "org-dry", SESSIONS_WORKSPACE_ID: "ws-dry", ACCEPTANCE_REALTIME: "optional" },
+        env: { ...withoutDeploymentHooks(process.env), RELAYGATE_URL: gateUrl, OUTSIDE_KEY: KEYS.local, INSIDE_KEY: KEYS.pit, ADMIN_TOKEN: ADMIN, POLICY_FILE: policyFile, RUN_ID: "dry-1_a", SESSIONS_ORG_ID: "org-dry", SESSIONS_WORKSPACE_ID: "ws-dry", ACCEPTANCE_REALTIME: "optional",
+          // The stand-in Sessions accepts any token and is reachable directly: scenario 14 must catch that bypass.
+          OUTSIDE_SESSIONS_READ: "rth_at_read_dry", DIRECT_SESSIONS_READ_URL: ssUrl },
       });
       let text = "";
       child.stdout.on("data", (d) => (text += d));
@@ -73,7 +75,9 @@ describe("acceptance driver dry run", { timeout: 300_000 }, () => {
     });
     const verdicts = Object.fromEntries([...out.text.matchAll(/^\[(PASS|FAIL|SKIP|MANUAL)\] (\d+)\./gm)].map((m) => [m[2], m[1]]));
     if (out.code !== 0) console.log(out.text);
-    expect(verdicts).toMatchObject({ "1": "PASS", "2": "PASS", "3": "PASS", "4": "PASS", "5": "PASS", "6": "PASS", "7": "PASS", "8": "PASS", "9": "PASS", "10": "PASS", "13": "MANUAL" });
-    expect(out.code).toBe(0);
+    expect(verdicts).toMatchObject({ "1": "PASS", "2": "PASS", "3": "PASS", "4": "PASS", "5": "PASS", "6": "PASS", "7": "PASS", "8": "PASS", "9": "PASS", "10": "PASS", "13": "MANUAL", "14": "FAIL" });
+    expect(out.text).toMatch(/INSIDE SESSION READABLE WITHOUT relaygate/);
+    // The only failure is the bypass the stand-in deliberately allows.
+    expect(out.code).toBe(1);
   });
 });
