@@ -388,14 +388,15 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
     const items = asArray(dataOf(res.body));
     const principal = c.get("principal");
     const me = c.get("agent").name;
+    // Channel names, looked up once and only if an item needs one. A failed lookup aborts the whole answer
+    // (nothing is failed upstream): only a successful lookup can establish that an item is not readable.
     let names: Map<string, string> | undefined;
-    const channelName = async (id: string) => {
-      if (!names) {
-        const list = await forward(c, "GET", "/v1/channels");
-        names = new Map(asArray(dataOf(list.body)).flatMap((ch) => (typeof ch.id === "string" && typeof ch.name === "string" ? [[ch.id, ch.name] as [string, string]] : [])));
-      }
-      return names.get(id);
-    };
+    if (items.some((i) => typeof i.channel_id === "string" && !i.channel_id.startsWith("dmch_"))) {
+      const list = await forward(c, "GET", "/v1/channels");
+      if (list.status !== 200 || !Array.isArray(dataOf(list.body))) return pass(c, list.status === 200 ? { status: 502, body: { ok: false, error: { code: "relaygate_upstream_unavailable" } } } : list);
+      names = new Map(asArray(dataOf(list.body)).flatMap((ch) => (typeof ch.id === "string" && typeof ch.name === "string" ? [[ch.id, ch.name] as [string, string]] : [])));
+    }
+    const channelName = async (id: string) => names?.get(id);
     const kept: Array<Record<string, unknown>> = [];
     const refused: string[] = [];
     for (const item of items) {

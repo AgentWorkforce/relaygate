@@ -456,6 +456,16 @@ describe("Relaycast proxy: desktop broker routes", () => {
     expect(h.up.calls.at(-1)).toMatchObject({ method: "POST", path: "/v1/deliveries/dl1/ack" });
   });
 
+  it("a failed channel lookup fails the listing, never the deliveries", async () => {
+    const h = harness();
+    const local = await h.token(KEYS.local, "local-a");
+    h.up.deliveries.push({ id: "dl1", agent: "local-a", channel_id: "ch_general", message: { text: "general" } });
+    h.up.setChannelsDown(true);
+    const res = await h.call("GET", "/v1/deliveries", local);
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    expect(h.up.failed).toEqual([]);
+  });
+
   it("passes Relaycast's Retry-After back", async () => {
     const h = harness();
     const local = await h.token(KEYS.local, "local-a");

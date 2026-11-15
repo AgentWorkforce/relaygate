@@ -75,11 +75,18 @@ export interface AuditEntry {
 
 export class Store {
   private db: DatabaseSync;
+  /** The agent columns this database has (all of them, once migrated). */
+  private agentCols = "id, name, gid, key_id, recovery_hash, guest, groups";
 
   /** `readOnly` opens an existing database without creating or migrating anything (for the explain CLI). */
   constructor(path: string, opts: { readOnly?: boolean } = {}) {
     this.db = new DatabaseSync(path, { readOnly: opts.readOnly ?? false });
-    if (opts.readOnly) return;
+    if (opts.readOnly) {
+      // A read-only database isn't migrated: read the agent columns it has (an older one lacks guest/groups).
+      const cols = new Set(this.db.prepare("PRAGMA table_info(agents)").all().map((c) => String(c.name)));
+      this.agentCols = `id, name, gid, key_id, recovery_hash, ${cols.has("guest") ? "guest" : "0 AS guest"}, ${cols.has("groups") ? "groups" : "NULL AS groups"}`;
+      return;
+    }
     this.db.exec(`
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS agents (
@@ -173,7 +180,7 @@ export class Store {
   }
 
   agentByName(name: string): Agent | undefined {
-    const row = this.db.prepare("SELECT id, name, gid, key_id, recovery_hash, guest, groups FROM agents WHERE name = ?").get(name);
+    const row = this.db.prepare(`SELECT ${this.agentCols} FROM agents WHERE name = ?`).get(name);
     return row ? toAgent(row) : undefined;
   }
 

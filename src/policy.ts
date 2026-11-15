@@ -145,7 +145,11 @@ export function parsePolicy(raw: unknown): Policy {
   if (unknown.length > 0) {
     throw new Error(`policy names groups it doesn't define: ${unknown.map((u) => `${u.where} (gid ${u.gid})`).join(", ")}`);
   }
-  // A key can't put an agent into a group its own ceiling forbids: the ceiling would always win, so it's a mistake.
+  // `device:<userId>` and `control` mark agents relaygate enrols from relay-control identities; no policy key may use them.
+  for (const k of policy.enrollmentKeys) {
+    if (k.id === "control" || k.id.startsWith("device:")) throw new Error(`enrollment key id ${k.id} is reserved (control, device:*)`);
+  }
+    // A key can't put an agent into a group its own ceiling forbids: the ceiling would always win, so it's a mistake.
   for (const k of policy.enrollmentKeys) {
     const mine = [k.gid, ...k.groups];
     for (const c of policy.ceilings.filter((c) => mine.includes(c.gid))) {
