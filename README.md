@@ -33,7 +33,7 @@ Relaycast client's base URL at relaygate and use the `rg_` token (see
 | `RELAYGATE_POLICY` | required | Path to the operator policy JSON (see `examples/policy.pit.json`). Reloaded when it changes; a bad edit keeps the previous policy. |
 | `RELAYGATE_DB` | `/data/relaygate.db` | SQLite file for agents, tokens, streams and the audit log. |
 | `PORT` | `8080` | HTTP port. |
-| `RELAYGATE_ADMIN_TOKEN` | none | Enables `POST /admin/v1/explain` (operator "may X do op on Y, and why"). |
+| `RELAYGATE_ADMIN_TOKEN` | none | Enables the operator endpoints: `POST /admin/v1/explain` ("may X do op on Y, and why") and `GET /admin/v1/audit` (content-free audit rows with the policy version). |
 | `RELAYCAST_URL` | none | Turns on the Relaycast proxy (REST allowlist and `/v1/node/ws`). |
 | `RELAYCAST_WORKSPACE_KEY` | none | `rk_live_` key relaygate uses to register agents upstream. Required with `RELAYCAST_URL`. |
 | `RELAYGATE_SECRET` | none | At least 32 characters; seals the upstream agent and node tokens at rest. Required with `RELAYCAST_URL`. |
