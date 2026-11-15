@@ -29,27 +29,71 @@ export interface SessionsConfig {
   readUrl: string;
   /** Optional service credential, used only for callers that send no Sessions credential of their own. */
   token?: string;
+  /**
+   * Browser origins allowed to read Sessions directly (the read API's own CORS list). relaygate adds the CORS headers
+   * to responses it produces itself (refusals, errors), so the dashboard sees the real status instead of a CORS error.
+   */
+  corsOrigins?: string[];
   /** Hosts whose requests are Sessions requests at the root path (no /sessions prefix). */
   hosts?: string[];
+  /**
+   * The read API's internal secret (READ_API_INTERNAL_SECRET). When set, relaygate checks relay-control's mint calls
+   * against it before forwarding them; the read API checks it again either way.
+   */
+  internalSecret?: string;
   fetch?: typeof fetch;
 }
 
 /** Request headers forwarded to Sessions besides Authorization. Trust headers (x-relay-ingest-*) never are. */
-const PASS_REQUEST = ["content-type", "content-encoding", "accept", "x-agent-relay-capture-policy-revision", "x-correlation-id", "idempotency-key"];
+const PASS_REQUEST = ["content-type", "content-encoding", "accept", "origin", "x-agent-relay-capture-policy-revision", "x-correlation-id", "idempotency-key"];
 /** Response headers passed back to the caller. */
-const PASS_RESPONSE = ["content-type", "retry-after", "x-relay-admission", "x-relayhistory-workspace-id", "x-sessions-read-continuation", "x-correlation-id"];
+const PASS_RESPONSE = [
+  "content-type",
+  "retry-after",
+  "x-relay-admission",
+  "x-relayhistory-workspace-id",
+  "x-sessions-read-continuation",
+  "x-correlation-id",
+  "access-control-allow-origin",
+  "access-control-allow-credentials",
+  "access-control-allow-headers",
+  "access-control-allow-methods",
+  "access-control-expose-headers",
+  "access-control-max-age",
+  "vary",
+];
+/** Marks a request that arrived on a Sessions host (set by routeSessionsHosts, never trusted from a client). */
+const HOST_MOUNTED = "x-relaygate-host-mounted";
 /** The largest upload body relaygate inspects (wire and decoded); Sessions' own cap is 2 MiB. */
 const MAX_UPLOAD = 4 * 1024 * 1024;
+
+/**
+ * Adds CORS headers to Sessions responses relaygate produces itself (refusals, auth errors) for allowed browser
+ * origins. Responses from the read API keep its own CORS headers.
+ */
+export function sessionsCors(cfg: SessionsConfig) {
+  const allowed = new Set((cfg.corsOrigins ?? []).map((o) => o.replace(/\/$/, "")));
+  return async (c: Context, next: () => Promise<void>) => {
+    await next();
+    const origin = c.req.header("origin");
+    if (!origin || !allowed.has(origin) || c.res.headers.has("access-control-allow-origin")) return;
+    c.res.headers.set("access-control-allow-origin", origin);
+    c.res.headers.append("vary", "Origin");
+  };
+}
 
 /** Serves Sessions paths at the root for the configured hosts, by mapping them under /sessions. */
 export function routeSessionsHosts(fetchFn: (req: Request) => Response | Promise<Response>, hosts: string[] = []) {
   const set = new Set(hosts.map((h) => h.toLowerCase()));
   return (req: Request): Response | Promise<Response> => {
     const host = (req.headers.get("host") ?? new URL(req.url).host).toLowerCase().replace(/:\d+$/, "");
-    if (!set.has(host)) return fetchFn(req);
+    const headers = new Headers(req.headers);
+    headers.delete(HOST_MOUNTED);
+    if (!set.has(host)) return fetchFn(new Request(req, { headers }));
     const url = new URL(req.url);
     url.pathname = `/sessions${url.pathname}`;
-    return fetchFn(new Request(url, req));
+    headers.set(HOST_MOUNTED, "1");
+    return fetchFn(new Request(url, { method: req.method, headers, body: req.body, duplex: "half" } as RequestInit));
   };
 }
 
@@ -84,6 +128,8 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   /** The caller's own Sessions credential, or the configured service one, or none. */
   const credential = (c: Ctx): string | undefined => {
     const auth = c.req.header("authorization");
+    // A relay-control principal's own credential is what identified it: forward it unchanged.
+    if (c.get("viaControl") && auth) return auth;
     if (c.req.header("x-relaygate-token") && auth && !/^Bearer\s+rg_/.test(auth)) return auth;
     return cfg.token ? `Bearer ${cfg.token}` : undefined;
   };
@@ -311,6 +357,77 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     if (gate instanceof Response) return gate;
     return pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/delivery/batches", raw));
   });
+
+  // --- relay-control principals ------------------------------------------------------------------------------
+  if (deps.control) {
+    const control = deps.control;
+    // relay-control mints dashboard read tokens through relaygate (its Sessions read URL points here). The call is
+    // forwarded unchanged; on success relaygate records the token's hash and the identity the mint named, which is
+    // how it later knows who holds the token. Never through a public Sessions host.
+    const mint = (path: string, record: boolean) =>
+      app.post(`/sessions${path}`, async (c) => {
+        if (c.req.header(HOST_MOUNTED)) return deny(c, 404, "relaygate_route_not_proxied");
+        const auth = c.req.header("authorization") ?? "";
+        if (cfg.internalSecret && auth !== `Bearer ${cfg.internalSecret}`) return deny(c, 401, "relaygate_unauthenticated");
+        let res: Response;
+        try {
+          res = await doFetch(new URL(path.replace(/^\//, ""), slash(cfg.readUrl)), {
+            method: "POST",
+            headers: { authorization: auth, "content-type": c.req.header("content-type") ?? "application/json" },
+            body: await c.req.text(),
+          });
+        } catch {
+          return deny(c, 502, "relaygate_upstream_unavailable");
+        }
+        const text = await res.text();
+        if (record && res.ok) {
+          try {
+            control.recordMint(JSON.parse(text));
+          } catch {
+            /* not JSON: nothing to record */
+          }
+        }
+        return new Response(text, { status: res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } });
+      });
+    mint("/internal/v1/session-read/sessions", true);
+    mint("/internal/v1/session-read/sessions/refresh", true);
+    mint("/internal/v1/session-read/service-tokens", true);
+    mint("/internal/v1/session-read/revoke", false);
+  }
+
+  // CORS preflights for browsers reading Sessions directly: no credential to check, nothing but headers back.
+  app.options("/sessions/*", async (c) => {
+    const headers: Record<string, string> = {};
+    for (const h of ["origin", "access-control-request-method", "access-control-request-headers"]) {
+      const v = c.req.header(h);
+      if (v) headers[h] = v;
+    }
+    try {
+      const res = await doFetch(new URL(upstreamPath(c).replace(/^\//, ""), slash(cfg.readUrl)), { method: "OPTIONS", headers });
+      const out = new Headers();
+      for (const h of PASS_RESPONSE) {
+        const v = res.headers.get(h);
+        if (v) out.set(h, v);
+      }
+      return new Response(null, { status: res.status, headers: out });
+    } catch {
+      return new Response(null, { status: 502 });
+    }
+  });
+
+  // Aggregates over every session (per-person usage, activity, output, digests): only for the groups the policy
+  // names in sessionAggregates, because they can't be filtered per session.
+  const aggregate = (path: string) =>
+    app.get(`/sessions${path}`, async (c) => {
+      const principal = c.get("principal");
+      const policy = deps.policy();
+      // An aggregate spans every session, so a principal under any ceiling never gets one (it may not see all groups).
+      const ceilinged = policy.ceilings.some((cl) => cl.gid === principal.gid || principal.groups.includes(cl.gid));
+      const allowed = !ceilinged && policy.sessionAggregates.gids.some((g) => principal.gid === g || principal.groups.includes(g));
+      audit(c, "session.aggregate", "r", path, allowed ? "allow" : "deny", "mode", allowed ? "sessionAggregates" : "not_in_sessionAggregates");
+      return allowed ? pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c))) : deny(c, 403, "relaygate_denied", { op: "r", resource: `sessions${path}` });
+    });
+  for (const path of ["/v1/sessions/users", "/v1/sessions/activity", "/v1/sessions/summaries/activity", "/v1/sessions/output", "/v1/sessions/titles", "/v1/digest/daily"]) aggregate(path);
 
   // Upload-side housekeeping that carries no session content.
   app.get("/sessions/v1/delivery/limits", async (c) => pass(await upstream(c, cfg.uploadUrl, "GET", "/v1/delivery/limits")));

@@ -461,6 +461,61 @@ run headless on Linux servers, so their sessions come from a headless uploader
 on that server, authenticated with the agent's `rg_` token, not from the
 desktop app.
 
+## Control principals
+
+Some callers hold only relay-control credentials: the desktop app uploads
+sessions with its device token (`sh_at_…`), and the dashboard reads them with
+Control-issued read tokens (`rth_at_read_…`, service tokens `rth_st_read_…`).
+On Sessions routes, a request with one of those in `Authorization` and no
+`X-Relaygate-Token` is a **Control principal**:
+
+- **Device tokens** are introspected with relay-control
+  (`POST /internal/v1/auth/introspect`, `RELAYCONTROL_INTROSPECT_SECRET`, `aud` =
+  `SESSION_INGEST_AUDIENCE`), which answers with the user, org, workspace, live
+  org role and scopes. Positive answers are reused for up to 15 s.
+- **Read tokens** can't be introspected: only the read API's own table knows
+  them. relay-control mints them by calling the read API's internal
+  `/internal/v1/session-read/sessions` (and `/refresh`, `/service-tokens`); with
+  relay-control's read API URL pointed at relaygate, relaygate forwards those
+  calls unchanged and records the hash of each minted token with the identity
+  the mint named (and its role, when the mint carries one). The mint routes are
+  never served on a public Sessions host, and are checked against
+  `SESSIONS_INTERNAL_SECRET` when it is set.
+
+The policy maps them to groups; the first rule whose every given field matches
+wins, and a user no rule matches is refused:
+
+```
+"controlPrincipals": [
+  {"match": {"orgIds": ["<org>"], "roles": ["owner", "admin"]}, "gid": 33},
+  {"match": {"orgIds": ["<org>"], "emails": ["<someone>@<domain>"]}, "gid": 22},
+  {"match": {"orgIds": ["<org>"]}, "gid": 11}
+],
+"sessionAggregates": {"gids": [33]}
+```
+
+`match` takes `kinds` (`device`, `read`), `orgIds`, `workspaceIds`, `roles`,
+`userIds` and `emails`. A read token minted without a role never matches a rule
+that needs one; without an email it uses the email relay-control last reported
+for that user (from a device-token introspection), and otherwise doesn't match
+an email rule.
+
+Uploads need a device token with `rth:sync`; a read token, or a device token
+without it, only reads, and reads need `rth:read`. The name prefix `ctl:` is
+reserved: no enrollment key registers it, and a registered agent never stands
+for a Control user. Each Control user becomes the relaygate principal
+`ctl:<userId>`, which owns the sessions it uploads and appears in the audit
+log; its credential is forwarded to Sessions unchanged, so Sessions still
+records the real person.
+
+Aggregate reads that span every session (`/v1/sessions/users`, `/activity`,
+`/summaries/activity`, `/output`, `/titles`, `/v1/digest/daily`) are served
+only to the groups in `sessionAggregates`, and never to a principal under any
+ceiling (an aggregate may include groups it must not see). CORS preflights are passed to the
+read API unauthenticated, and the read API's CORS and workspace headers come
+back unchanged; relaygate's own refusals carry CORS headers for the origins in
+`SESSIONS_CORS_ORIGINS`, so a browser sees the real status.
+
 ## The classifier
 
 The mode check runs first. The classifier only sees requests the mode bits

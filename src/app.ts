@@ -4,7 +4,8 @@ import { ClassifierUnavailable, type Classifier } from "./classifier.js";
 import { allGroups, check, inGroup, type AclEntry, type Guarded, type Op, type Principal } from "./mode.js";
 import { deny as proxyDeny, mountRelaycast, type RelaycastUpstream } from "./relaycast.js";
 import { mountNodeToken } from "./realtime.js";
-import { mountSessions, type SessionsConfig } from "./sessions.js";
+import { mountSessions, sessionsCors, type SessionsConfig } from "./sessions.js";
+import { ControlUnavailable, controlPrincipal, controlTokenKind, matchControlRule, type ControlAuth } from "./control.js";
 import { explain, runCases, CaseSchema, QuerySchema } from "./explain.js";
 import { keyUsable, parsePolicy, policyVersion, type EnrollmentKey, type Policy } from "./policy.js";
 import { sameHash, sha256, type Agent, type Store } from "./store.js";
@@ -22,16 +23,22 @@ export interface Deps {
   relaycast?: RelaycastUpstream;
   /** The Sessions upstream; unset disables the Sessions proxy. */
   sessions?: SessionsConfig;
+  /** relay-control, for principals that hold only Control credentials; unset means only rg_ principals. */
+  control?: ControlAuth;
   /** Called after tokens are revoked, so open sockets close at once rather than at the next revalidation. */
   onTokensRevoked?: () => void;
 }
 
-export type Env = { Variables: { agent: Agent; principal: Principal; tokenHash: string } };
+export type Env = { Variables: { agent: Agent; principal: Principal; tokenHash: string; viaControl: boolean } };
 
 const NAME = /^[A-Za-z0-9._:-]{1,128}$/;
 const STREAM_ID = /^[\x21-\x7e]{1,512}$/;
 
-const RegisterBody = z.object({ name: z.string().regex(NAME), recovery: z.string().min(16).max(512).optional() });
+const RegisterBody = z.object({
+  // `ctl:` names belong to relay-control users (docs/contract.md, "Control principals"); no enrollment key gets them.
+  name: z.string().regex(NAME).refine((n) => !n.toLowerCase().startsWith("ctl:"), "names starting ctl: are reserved"),
+  recovery: z.string().min(16).max(512).optional(),
+});
 const StreamBody = z.object({
   gid: z.number().int().nonnegative().optional(),
   mode: z.string().regex(/^[0246]{3}$/),
@@ -336,10 +343,68 @@ export function createApp(deps: Deps) {
   });
 
   // Everything below needs an rg_ token.
+  /** A caller holding only a relay-control credential (Sessions routes only): identified, then mapped by policy. */
+  const authenticateControl = async (c: Context<Env>, token: string): Promise<Response | undefined> => {
+    const control = deps.control!;
+    let identity;
+    try {
+      identity = await control.identify(token);
+    } catch (error) {
+      if (error instanceof ControlUnavailable) {
+        console.error(JSON.stringify({ msg: "control introspection unavailable", error: error.message }));
+        return deny(c, 503, "relaygate_unavailable");
+      }
+      throw error;
+    }
+    if (!identity) {
+      store.audit({ agentId: null, action: "auth", op: null, resourceKind: null, resourceId: null, decision: "deny", stage: "auth", reason: `control_${controlTokenKind(token)}_invalid` });
+      return deny(c, 401, "relaygate_unauthenticated");
+    }
+    const policy = deps.policy();
+    const rule = matchControlRule(identity, policy);
+    if (!rule) {
+      store.audit({ agentId: null, action: "auth", op: null, resourceKind: "agent", resourceId: `ctl:${identity.userId}`, decision: "deny", stage: "auth", reason: "no_control_rule" });
+      return deny(c, 403, "relaygate_denied", { detail: "no controlPrincipals rule matches this user" });
+    }
+    // Uploads need a device token that may sync; a read token (or a device token without rth:sync) only reads.
+    const writes = c.req.method !== "GET" && c.req.method !== "HEAD";
+    if (writes && (identity.kind !== "device" || !identity.scopes.includes("rth:sync"))) {
+      store.audit({ agentId: null, action: "auth", op: "w", resourceKind: "agent", resourceId: `ctl:${identity.userId}`, decision: "deny", stage: "auth", reason: `control_${identity.kind}_cannot_write` });
+      return deny(c, 403, "relaygate_denied", { detail: "uploads need a device token with rth:sync" });
+    }
+    if (!writes && !identity.scopes.includes("rth:read")) {
+      return deny(c, 403, "relaygate_denied", { detail: "this credential has no rth:read" });
+    }
+    let resolved;
+    try {
+      resolved = controlPrincipal(store, identity, rule);
+    } catch (error) {
+      console.error(JSON.stringify({ msg: "control identity refused", error: (error as Error).message }));
+      return deny(c, 403, "relaygate_denied", { detail: "this identity collides with a registered agent" });
+    }
+    const { agent, principal } = resolved;
+    c.set("agent", agent);
+    c.set("principal", principal);
+    c.set("tokenHash", sha256(token));
+    c.set("viaControl", true);
+    return undefined;
+  };
+
   const authenticate = async (c: Context<Env>, next: () => Promise<void>) => {
+    const onSessions = c.req.path.startsWith("/sessions/");
+    // CORS preflights carry no credential, and relay-control's internal mint calls carry the read API's own secret:
+    // both are handled by the Sessions proxy itself.
+    if (onSessions && (c.req.method === "OPTIONS" || c.req.path.startsWith("/sessions/internal/"))) return next();
+    const relaygateToken = onSessions ? c.req.header("x-relaygate-token")?.trim() : undefined;
+    const presented = bearer(c);
+    if (onSessions && !relaygateToken && deps.control && presented && controlTokenKind(presented)) {
+      const refused = await authenticateControl(c, presented);
+      if (refused) return refused;
+      return next();
+    }
     // On Sessions routes the caller's Authorization carries its own Sessions credential and the rg_ token comes in
     // X-Relaygate-Token (docs/contract.md, "Session uploads").
-    const token = (c.req.path.startsWith("/sessions/") ? c.req.header("x-relaygate-token")?.trim() : undefined) ?? bearer(c);
+    const token = relaygateToken ?? presented;
     const agent = token?.startsWith("rg_") ? store.agentForToken(token) : undefined;
     if (!agent) return deny(c, 401, "relaygate_unauthenticated");
     const policy = deps.policy();
@@ -359,9 +424,12 @@ export function createApp(deps: Deps) {
     c.set("agent", agent);
     c.set("principal", principalFor(agent, policy));
     c.set("tokenHash", sha256(token!));
+    c.set("viaControl", false);
     await next();
   };
   app.use("/v1/*", authenticate);
+  // Registered before auth, so relaygate's own refusals reach the dashboard with CORS headers too.
+  if (deps.sessions?.corsOrigins?.length) app.use("/sessions/*", sessionsCors(deps.sessions));
   app.use("/sessions/*", authenticate);
 
   app.get("/v1/whoami", (c) => {
