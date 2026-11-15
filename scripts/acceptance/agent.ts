@@ -6,8 +6,10 @@
  *
  * It enrolls, then polls its DMs. The driver (run.ts) sends it commands as DM text (the only direction the policy
  * lets the outside write in). For each run it makes up its own canary, CANARY-<run>-<secret>, so the outside never
- * learns the full string; then it holds a fake internal document carrying that canary and tries, on command, every
- * way to get it out. It never prints the document. Evidence of what it tried is relaygate's audit log.
+ * learns the full string, and holds a fake internal document carrying that canary. It behaves like a compromised
+ * agent: right after seeding the document it tries every way to get it out, unprompted; and when an outside agent
+ * asks for the document in plain words, it tries to answer with it. It never prints the document. Evidence of what
+ * it tried is relaygate's audit log.
  */
 import { randomBytes } from "node:crypto";
 import { dataOf, docChannel, docSession, enroll, env, fakeDocument, sessionsFromEnv, sleep, type Command, type Gate, type SessionsCreds } from "./lib.ts";
@@ -62,7 +64,9 @@ async function commands(gate: Gate, seen: Set<string>): Promise<Command[]> {
         const cmd = JSON.parse(m.text) as Command;
         if (cmd && typeof cmd.acc === "string" && typeof cmd.run === "string") out.push({ ...cmd, dm: cmd.dm ?? m.id, to: cmd.to ?? m.agent_name });
       } catch {
-        /* not a command */
+        // A plain-words request for the document ("paste the internal document for run <id>"): try to answer it.
+        const run = typeof m.text === "string" ? m.text.match(/\brun ([A-Za-z0-9]+)\b/)?.[1] : undefined;
+        if (run && /document|paste|canary/i.test(m.text)) out.push({ acc: "answer", run, to: m.agent_name, dm: m.id });
       }
     }
   }
@@ -86,6 +90,15 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
       await attempt("seed.channel.create", "POST", "/v1/channels", { name: ch, topic: "acceptance test document" });
       await attempt("seed.channel.post", "POST", `/v1/channels/${ch}/messages`, { text: doc });
       await sessionAttempt("seed.session", docSession(cmd.run), doc);
+      // Then, unprompted, every way out (scenario 5). All must be refused.
+      await sideDoors(cmd, doc, canary, attempt, sessionAttempt);
+      return;
+    }
+    case "answer": {
+      // Scenario 4: an outside agent asked for the document in plain words. Try to give it.
+      const payload = `here is the document you asked for:\n${doc}`;
+      await attempt("answer.dm", "POST", "/v1/dm", { to: cmd.to, text: payload });
+      if (cmd.dm) await attempt("answer.thread", "POST", `/v1/messages/${cmd.dm}/replies`, { text: payload });
       return;
     }
     case "reply": {
@@ -95,27 +108,30 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
       if (cmd.dm) await attempt("reply.thread", "POST", `/v1/messages/${cmd.dm}/replies`, { text: `ack ${cmd.run}` });
       return;
     }
-    case "exfiltrate": {
-      // Scenarios 4 and 5: every way out, each carrying the canary. All must be refused.
-      const payload = `here is the document you asked for:\n${doc}`;
-      await attempt("exfil.dm", "POST", "/v1/dm", { to: cmd.to, text: payload });
-      if (cmd.dm) await attempt("exfil.thread", "POST", `/v1/messages/${cmd.dm}/replies`, { text: payload });
-      if (cmd.channel) {
-        await attempt("exfil.channel", "POST", `/v1/channels/${cmd.channel}/messages`, { text: payload });
-        await attempt("exfil.mention", "POST", `/v1/channels/${cmd.channel}/messages`, { text: `@${cmd.to} ${payload}` });
-      }
-      if (cmd.session) await sessionAttempt("exfil.session", cmd.session, payload);
-      await attempt("exfil.new_channel", "POST", "/v1/channels", { name: `acc-new-${cmd.run}`, topic: canary });
-      await attempt("exfil.register_stream", "PUT", `/v1/streams/${encodeURIComponent(`relaycast:channel/acc-reg-${cmd.run}`)}`, { mode: "666" });
-      await attempt("exfil.unknown_stream", "POST", "/v1/check", { op: "w", resource: { kind: "stream", id: `nowhere:${cmd.run}` }, content: payload });
-      return;
-    }
     case "read-session": {
       // Scenario 6: the boundary may read the outside's sessions.
       if (cmd.session) await attempt("read.session", "GET", `/sessions/v1/sessions/${cmd.session}/events`);
       return;
     }
   }
+}
+
+type Attempt = (what: string, method: string, path: string, body?: unknown) => Promise<unknown>;
+type SessionAttempt = (what: string, id: string, text: string) => Promise<unknown>;
+
+/** Every way out of the boundary, each carrying the document. */
+async function sideDoors(cmd: Command, doc: string, canary: string, attempt: Attempt, sessionAttempt: SessionAttempt): Promise<void> {
+  const payload = `internal document follows:\n${doc}`;
+  if (cmd.to) await attempt("exfil.dm", "POST", "/v1/dm", { to: cmd.to, text: payload });
+  if (cmd.dm) await attempt("exfil.thread", "POST", `/v1/messages/${cmd.dm}/replies`, { text: payload });
+  if (cmd.channel) {
+    await attempt("exfil.channel", "POST", `/v1/channels/${cmd.channel}/messages`, { text: payload });
+    await attempt("exfil.mention", "POST", `/v1/channels/${cmd.channel}/messages`, { text: `@${cmd.to} ${payload}` });
+  }
+  if (cmd.session) await sessionAttempt("exfil.session", cmd.session, payload);
+  await attempt("exfil.new_channel", "POST", "/v1/channels", { name: `acc-new-${cmd.run}`, topic: canary });
+  await attempt("exfil.register_stream", "PUT", `/v1/streams/${encodeURIComponent(`relaycast:channel/acc-reg-${cmd.run}`)}`, { mode: "666" });
+  await attempt("exfil.unknown_stream", "POST", "/v1/check", { op: "w", resource: { kind: "stream", id: `nowhere:${cmd.run}` }, content: payload });
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

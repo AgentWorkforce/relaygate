@@ -140,9 +140,9 @@ export function env(name: string, fallback?: string): string {
 
 /** Commands the driver sends the pit test agent, as the text of a DM. */
 export interface Command {
-  acc: "seed" | "reply" | "exfiltrate" | "read-session";
+  acc: "seed" | "reply" | "read-session" | "answer";
   run: string;
-  /** The local agent to answer / exfiltrate to. */
+  /** The outside agent to answer (and, after seeding, to try to leak to). */
   to?: string;
   /** A local channel and a local session the agent will try to write into. */
   channel?: string;
@@ -181,7 +181,8 @@ export async function listen(gate: Gate, onFrame: (text: string) => void): Promi
     setTimeout(() => resolve(false), 10_000);
   });
   if (opened) {
-    ws.send(JSON.stringify({ v: 1, type: "node.register", name: gate.name, node_id: d.node_id, capabilities: [], max_agents: 1 }));
+    // The same registration the Relaycast SDK sends for an agent's direct node (fleet-wire node.register).
+    ws.send(JSON.stringify({ v: 1, type: "node.register", node_id: d.node_id, name: d.node_name ?? gate.name, capabilities: [], max_agents: 1, tags: ["implicit", "direct", "sdk"], version: "relaygate-acceptance/1" }));
     ws.addEventListener("message", (e) => {
       const text = typeof e.data === "string" ? e.data : String(e.data);
       onFrame(text);
