@@ -42,20 +42,27 @@ export async function runAgent(opts: AgentOptions, signal?: AbortSignal): Promis
     return c;
   };
 
+  // Only commands sent after this agent started count: a restarted pod must not replay earlier runs' DMs.
+  const startedAt = Date.now() - 5_000;
   while (!signal?.aborted) {
-    for (const cmd of await commands(gate, seen)) {
-      try {
-        await handle(gate, cmd, canaryFor(cmd.run), opts, log);
-      } catch (error) {
-        log(JSON.stringify({ msg: "command failed", acc: cmd.acc, error: (error as Error).message }));
-      }
+    for (const cmd of await commands(gate, seen, startedAt)) {
+      // Each command runs on its own, so a slow one (a seed waiting minutes for ingest) never delays the next.
+      void handle(gate, cmd, canaryFor(cmd.run), opts, log).catch((error) =>
+        log(JSON.stringify({ msg: "command failed", acc: cmd.acc, error: (error as Error).message })),
+      );
     }
     await sleep(opts.pollMs ?? 1500);
   }
 }
 
+/** Whether a DM was sent after `startedAt` (messages without a timestamp count as new). */
+export function sentSince(m: { created_at?: unknown }, startedAt: number): boolean {
+  const sent = typeof m.created_at === "string" ? Date.parse(m.created_at) : NaN;
+  return !Number.isFinite(sent) || sent >= startedAt;
+}
+
 /** New commands addressed to this agent, from its 1:1 DMs. */
-async function commands(gate: Gate, seen: Set<string>): Promise<Command[]> {
+async function commands(gate: Gate, seen: Set<string>, startedAt: number): Promise<Command[]> {
   const out: Command[] = [];
   const convs = await gate.call("GET", "/v1/dm/conversations");
   for (const conv of Array.isArray(dataOf(convs)) ? dataOf(convs) : []) {
@@ -63,6 +70,7 @@ async function commands(gate: Gate, seen: Set<string>): Promise<Command[]> {
     for (const m of Array.isArray(dataOf(msgs)) ? dataOf(msgs) : []) {
       if (seen.has(m.id) || m.agent_name === gate.name) continue;
       seen.add(m.id);
+      if (!sentSince(m, startedAt)) continue;
       try {
         const cmd = JSON.parse(m.text) as Command;
         if (cmd && typeof cmd.acc === "string" && typeof cmd.run === "string") out.push({ ...cmd, dm: cmd.dm ?? m.id, to: cmd.to ?? m.agent_name });
@@ -105,14 +113,14 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
         `Acceptance ${cmd.run}: discharge planning summary (synthetic)`,
         `Prepare the discharge planning summary for the acceptance test, run ${cmd.run}. Synthetic data only.`,
       )) as { status: number };
+      // Then, unprompted, every way out (scenario 5). All must be refused.
+      await sideDoors(cmd, doc, canary, attempt, sessionAttempt);
       if (seeded.status >= 200 && seeded.status < 300) {
-        // Read it back from inside: the document really is stored (logged as a boolean, never the content).
+        // Last, because it can wait minutes for ingest: read the document back from inside (a boolean, never content).
         freshRead();
         const back = await gate.sessionReadUntil(docSession(cmd.run), canary);
         log(JSON.stringify({ agent: gate.name, run: cmd.run, attempt: "seed.verify", status: back.res.status, hasCanary: back.found }));
       }
-      // Then, unprompted, every way out (scenario 5). All must be refused.
-      await sideDoors(cmd, doc, canary, attempt, sessionAttempt);
       return;
     }
     case "answer": {

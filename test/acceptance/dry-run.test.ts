@@ -81,3 +81,14 @@ describe("acceptance driver dry run", { timeout: 300_000 }, () => {
     expect(out.code).toBe(1);
   });
 });
+
+describe("inside test agent", () => {
+  it("ignores DMs sent before it started, so a restarted pod never replays earlier runs", async () => {
+    const { sentSince } = await import("../../scripts/acceptance/agent.ts");
+    const start = Date.parse("2026-11-15T12:00:00Z");
+    expect(sentSince({ created_at: "2026-11-15T11:00:00Z" }, start)).toBe(false);
+    expect(sentSince({ created_at: "2026-11-15T12:00:01Z" }, start)).toBe(true);
+    expect(sentSince({}, start)).toBe(true);
+  });
+});
+

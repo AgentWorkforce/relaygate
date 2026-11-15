@@ -8,6 +8,7 @@ interface Msg {
   agent_name: string;
   text: string;
   metadata: unknown;
+  created_at?: string;
 }
 
 /** A small in-memory Relaycast with the shapes relaygate relies on (from packages/engine). */
@@ -99,7 +100,7 @@ export function fakeRelaycast() {
     const body = await c.req.json();
     const from = who(c.req.header("authorization")!)!;
     if (!agents.has(body.to)) return c.json({ ok: false, error: { code: "agent_not_found", message: `Agent "${body.to}" not found` } }, 404);
-    const m = { id: `m${++seq}`, channel_id: `dmch_${pairOf(from, body.to)}`, agent_name: from, text: body.text, metadata: body.data };
+    const m = { id: `m${++seq}`, channel_id: `dmch_${pairOf(from, body.to)}`, agent_name: from, text: body.text, metadata: body.data, created_at: new Date().toISOString() };
     messages.push(m);
     return c.json({ ok: true, data: { conversation_id: `dm_${pairOf(from, body.to)}`, message: m } }, 201);
   });

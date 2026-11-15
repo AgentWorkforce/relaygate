@@ -217,8 +217,14 @@ async function main() {
       const peer = peerRead.res;
       const h = await auditHead();
       await command(localA, pitA, { acc: "read-session", run: RUN, session: localSession, marker });
-      const rows = await waitFor(pitA, h, ["session.read"]);
-      const insideRead = rows.find((r) => r.action === "session.read" && r.resource_id === localSession);
+      // Wait for the inside agent's read of THIS session (it may read others, e.g. its own document, meanwhile).
+      let rows: any[] = [];
+      let insideRead: any;
+      for (const start = Date.now(); !insideRead && Date.now() - start < 120_000; ) {
+        rows = await audit(h, pitA);
+        insideRead = rows.find((r) => r.action === "session.read" && r.resource_id === localSession);
+        if (!insideRead) await sleep(2000);
+      }
       // The gate's allow is logged before forwarding; the inside agent's own status line shows the read landed.
       let actual: any;
       for (let i = 0; i < Math.ceil(ingestWaitMs() / 1500) + 20 && !(actual = insideLines().find((l) => l.agent === pitA && l.attempt === "read.session")); i++) await sleep(1500);
@@ -233,7 +239,7 @@ async function main() {
           canSee ? `inside read: gate ${insideRead?.decision ?? "not seen"}, upstream ${actual?.status ?? "not seen"}, marker present: ${actual?.hasMarker ?? false}` : "inside read unverified: set INSIDE_LOGS_CMD",
           "MANUAL: confirm the admin sees it in the dashboard (scenario 13).",
         ],
-        rows.filter((r) => r.action === "session.read").map(fmt),
+        rows.filter((r) => r.action === "session.read" && r.resource_id === localSession).map(fmt),
       );
     }
   }
@@ -384,7 +390,19 @@ async function main() {
     const inList = !listOk || JSON.stringify(listed.body).includes(docSession(RUN));
     // The refusals only mean something if the document really was stored: the inside agent's own upload status and
     // its read-back (canary present, as a boolean).
-    const lines = insideLines().filter((l) => l.agent === pitA);
+    // The seed's read-back runs concurrently and may still be waiting on ingest: give it the ingest window.
+    let lines = insideLines().filter((l) => l.agent === pitA);
+    const canSeeLogs = inline || !!process.env.INSIDE_LOGS_CMD;
+    // Nothing to wait for if Sessions is off here, or the seed upload already failed (no read-back will come).
+    const seedFailed = () => lines.some((l) => l.attempt === "seed.session" && !ok(l.status));
+    for (
+      const start = Date.now();
+      canSeeLogs && up.status !== 404 && !seedFailed() && !lines.some((l) => l.attempt === "seed.verify") && Date.now() - start < ingestWaitMs() + 60_000;
+
+    ) {
+      await sleep(3000);
+      lines = insideLines().filter((l) => l.agent === pitA);
+    }
     const seedUp = lines.find((l) => l.attempt === "seed.session");
     const verify = lines.find((l) => l.attempt === "seed.verify");
     const stored = seedUp && ok(seedUp.status) && verify?.hasCanary === true;
