@@ -217,8 +217,14 @@ async function main() {
       const peer = peerRead.res;
       const h = await auditHead();
       await command(localA, pitA, { acc: "read-session", run: RUN, session: localSession, marker });
-      const rows = await waitFor(pitA, h, ["session.read"]);
-      const insideRead = rows.find((r) => r.action === "session.read" && r.resource_id === localSession);
+      // Wait for the inside agent's read of THIS session (it may read others, e.g. its own document, meanwhile).
+      let rows: any[] = [];
+      let insideRead: any;
+      for (const start = Date.now(); !insideRead && Date.now() - start < 120_000; ) {
+        rows = await audit(h, pitA);
+        insideRead = rows.find((r) => r.action === "session.read" && r.resource_id === localSession);
+        if (!insideRead) await sleep(2000);
+      }
       // The gate's allow is logged before forwarding; the inside agent's own status line shows the read landed.
       let actual: any;
       for (let i = 0; i < Math.ceil(ingestWaitMs() / 1500) + 20 && !(actual = insideLines().find((l) => l.agent === pitA && l.attempt === "read.session")); i++) await sleep(1500);
@@ -233,7 +239,7 @@ async function main() {
           canSee ? `inside read: gate ${insideRead?.decision ?? "not seen"}, upstream ${actual?.status ?? "not seen"}, marker present: ${actual?.hasMarker ?? false}` : "inside read unverified: set INSIDE_LOGS_CMD",
           "MANUAL: confirm the admin sees it in the dashboard (scenario 13).",
         ],
-        rows.filter((r) => r.action === "session.read").map(fmt),
+        rows.filter((r) => r.action === "session.read" && r.resource_id === localSession).map(fmt),
       );
     }
   }
