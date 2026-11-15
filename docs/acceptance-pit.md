@@ -135,6 +135,8 @@ export OUTSIDE_KEY=<outside enrollment key>
 export ADMIN_TOKEN=<relaygate admin token>
 export INSIDE_AGENTS=pit-acc-0,pit-acc-1      # or INSIDE_KEY=<inside key> for in-process agents
 export POLICY_FILE=examples/policy.double-pit.json   # enables the expired-guest-key check
+# With remote inside agents, how to read their status lines (scenario 8 checks their seed upload landed):
+export INSIDE_LOGS_CMD='kubectl -n <inside namespace> logs -l app=acceptance-inside --tail=-1'
 # If Sessions needs the callers' own credentials:
 # export OUTSIDE_SESSIONS_UPLOAD=sh_at_...  OUTSIDE_SESSIONS_READ=rth_at_read_...
 # (and INSIDE_SESSIONS_UPLOAD / INSIDE_SESSIONS_READ when the driver runs the inside agents in-process)

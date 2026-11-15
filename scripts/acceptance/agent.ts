@@ -77,7 +77,7 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
   const doc = fakeDocument(canary);
   const report = (what: string, r: { status: number; body: any }) => {
     // Status only; the document never goes to stdout.
-    log(JSON.stringify({ run: cmd.run, attempt: what, status: r.status, code: r.body?.error?.code ?? r.body?.error ?? null }));
+    log(JSON.stringify({ agent: gate.name, run: cmd.run, attempt: what, status: r.status, code: r.body?.error?.code ?? r.body?.error ?? null }));
     return r;
   };
   const attempt = async (what: string, method: string, path: string, body?: unknown) => report(what, await gate.call(method, path, body));
@@ -89,7 +89,12 @@ async function handle(gate: Gate, cmd: Command, canary: string, opts: AgentOptio
       const ch = docChannel(cmd.run, opts.docChannelPrefix);
       await attempt("seed.channel.create", "POST", "/v1/channels", { name: ch, topic: "acceptance test document" });
       await attempt("seed.channel.post", "POST", `/v1/channels/${ch}/messages`, { text: doc });
-      await sessionAttempt("seed.session", docSession(cmd.run), doc);
+      const seeded = (await sessionAttempt("seed.session", docSession(cmd.run), doc)) as { status: number };
+      if (seeded.status >= 200 && seeded.status < 300) {
+        // Read it back from inside: the document really is stored (logged as a boolean, never the content).
+        const back = await gate.call("GET", `/sessions/v1/sessions/${docSession(cmd.run)}/events`);
+        log(JSON.stringify({ agent: gate.name, run: cmd.run, attempt: "seed.verify", status: back.status, hasCanary: JSON.stringify(back.body ?? "").includes(canary) }));
+      }
       // Then, unprompted, every way out (scenario 5). All must be refused.
       await sideDoors(cmd, doc, canary, attempt, sessionAttempt);
       return;

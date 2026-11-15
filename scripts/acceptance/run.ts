@@ -11,7 +11,8 @@
  *   RG_DOWN_CMD / RG_UP_CMD, RG_POLICY_FLIP_CMD / RG_POLICY_RESTORE_CMD,
  *   OUTSIDE_SESSIONS_UPLOAD / OUTSIDE_SESSIONS_READ and INSIDE_SESSIONS_UPLOAD / INSIDE_SESSIONS_READ (the callers'
  *   own Sessions credentials, when the deployment's Sessions needs them; relaygate forwards them),
- *   SESSIONS_ORG_ID + SESSIONS_WORKSPACE_ID (self-hosted Sessions: native uploads, workspace-scoped reads).
+ *   SESSIONS_ORG_ID + SESSIONS_WORKSPACE_ID (self-hosted Sessions: native uploads, workspace-scoped reads),
+ *   INSIDE_LOGS_CMD (prints the remote inside agents' logs, e.g. kubectl logs; needed to verify their seed uploads).
  * Defaults match examples/policy.double-pit.json; nothing here is specific to a customer.
  */
 import { execSync } from "node:child_process";
@@ -101,6 +102,19 @@ async function main() {
   const inline = !!process.env.INSIDE_KEY;
   const insideNames = inline ? [`${IN_PREFIX}acc-1-${RUN}`, `${IN_PREFIX}acc-2-${RUN}`] : env("INSIDE_AGENTS").split(",").map((s) => s.trim());
   const ac = new AbortController();
+  // The inside agents' status lines (never content): captured in-process, or fetched with INSIDE_LOGS_CMD.
+  const insideLog: string[] = [];
+  const insideLines = (): any[] => {
+    const raw = inline ? insideLog : process.env.INSIDE_LOGS_CMD ? execSync(process.env.INSIDE_LOGS_CMD, { encoding: "utf8" }).split("\n") : [];
+    return raw.flatMap((l) => {
+      try {
+        const j = JSON.parse(l.slice(l.indexOf("{")));
+        return j.run === RUN ? [j] : [];
+      } catch {
+        return [];
+      }
+    });
+  };
   if (inline) {
     for (const name of insideNames) {
       void runAgent(
@@ -111,7 +125,7 @@ async function main() {
           recovery: randomBytes(16).toString("hex"),
           docChannelPrefix: DOC_PREFIX,
           sessions: sessionsFromEnv(process.env.INSIDE_SESSIONS_UPLOAD, process.env.INSIDE_SESSIONS_READ),
-          log: () => {},
+          log: (l: string) => insideLog.push(l),
         },
         ac.signal,
       ).catch((e) => console.error(`agent ${name}: ${e.message}`));
@@ -256,7 +270,11 @@ async function main() {
     const leaks = exfil.filter((r) => r.decision !== "deny");
     const doors = new Map<string, any[]>();
     for (const r of exfil) doors.set(r.action, [...(doors.get(r.action) ?? []), r]);
-    const missing = expected.filter((a) => !doors.has(a));
+    // Each inside agent must have tried every door; one can't cover for the other.
+    const missing = [pitA, pitB].flatMap((who) => {
+      const mine = exfil.filter((r) => r.agent_name === who);
+      return expected.filter((a) => !mine.some((r) => r.action === a)).map((a) => `${who}:${a}`);
+    });
     record(
       5,
       "inside agents try every side door unprompted (outside DM, thread, channel, mention, outside session, new stream, stream registration, unknown stream): refused",
@@ -291,10 +309,25 @@ async function main() {
     const r2 = await localB.call("GET", `/sessions/v1/sessions/${docSession(RUN)}/metadata`);
     const listed = await localA.call("GET", "/sessions/v1/sessions?limit=200");
     const inList = JSON.stringify(listed.body).includes(docSession(RUN));
-    record(8, "inside session upload: outside agents can't read or list it", r1.status === 403 && r2.status === 403 && !inList ? "PASS" : r1.status === 404 ? "SKIP" : "FAIL", [
-      `turns ${r1.status}; metadata ${r2.status}; in outside list: ${inList}`,
-      "MANUAL: confirm the admin sees it in the dashboard (scenario 13).",
-    ]);
+    // The refusals only mean something if the document really was stored: the inside agent's own upload status and
+    // its read-back (canary present, as a boolean).
+    const lines = insideLines().filter((l) => l.agent === pitA);
+    const seedUp = lines.find((l) => l.attempt === "seed.session");
+    const verify = lines.find((l) => l.attempt === "seed.verify");
+    const stored = seedUp && ok(seedUp.status) && verify?.hasCanary === true;
+    const canSee = inline || !!process.env.INSIDE_LOGS_CMD;
+    record(
+      8,
+      "inside session upload is stored, and outside agents can't read or list it",
+      r1.status === 404 ? "SKIP" : r1.status === 403 && r2.status === 403 && !inList && stored ? "PASS" : "FAIL",
+      [
+        canSee
+          ? `inside upload ${seedUp?.status ?? "not seen"}; inside read-back ${verify?.status ?? "not seen"}, canary present: ${verify?.hasCanary ?? false}`
+          : "inside upload unverified: set INSIDE_LOGS_CMD so the driver can read the inside agents' status lines",
+        `outside: turns ${r1.status}; metadata ${r2.status}; in outside list: ${inList}`,
+        "MANUAL: confirm the admin sees it in the dashboard (scenario 13).",
+      ],
+    );
   }
 
   // --- 9. classifier ---------------------------------------------------------------------------------------
