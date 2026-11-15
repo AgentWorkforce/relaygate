@@ -454,7 +454,9 @@ strong as the network rule that Sessions accepts traffic from relaygate alone
 |---|---|
 | `POST /sessions/v1/sessions/:id/turns` | `w` on the session; `sessionOwner` on the body and every turn is set to the agent |
 | `POST /sessions/v1/delivery/batches` | the native delivery protocol (JSON, optionally `gzip` or `zstd`): `w` on every `records[].session_id`, all or nothing; a record without a session is refused; the original bytes and `Content-Encoding` are forwarded |
-| `GET /sessions/v1/delivery/limits`, `POST .../auth/token/refresh`, `POST .../onboarding/heartbeat` | passed through (no session content) |
+| `GET /sessions/v1/delivery/limits`, `GET .../delivery/admission`, `POST .../auth/token/refresh`, `POST .../onboarding/heartbeat`, `POST .../upload-consent` | passed through (no session content) |
+| `POST /sessions/v1/delivery/sessions/selection` | `w` on every session it names (choosing what syncs) |
+| `POST /sessions/v1/auth/token/revoke`, `GET /sessions/healthz` | no principal needed (revoking is always safe) |
 | `POST /sessions/v1/ingest` | `w` on every session the batch names; all or nothing. Each record gets a `relaygate:agent:<name>` tag (client `relaygate:` tags are dropped) and, where it names one, `sessionOwner` set to the agent |
 | `GET /sessions/v1/sessions` | filtered to sessions the caller may read; the cursor passes through |
 | `GET /sessions/v1/sessions/:id/{events,turns,metadata,thread,catalog,timing,analysis,brief}` | `r` on the session |
@@ -523,12 +525,36 @@ log; its credential is forwarded to Sessions unchanged, so Sessions still
 records the real person.
 
 Aggregate reads that span every session (`/v1/sessions/users`, `/activity`,
-`/summaries/activity`, `/output`, `/titles`, `/v1/digest/daily`) are served
+`/summaries/activity`, `/output`, `/titles`, `/v1/delivery/records`,
+`/v1/digest/*`) are served
 only to the groups in `sessionAggregates`, and never to a principal under any
 ceiling (an aggregate may include groups it must not see). CORS preflights are passed to the
 read API unauthenticated, and the read API's CORS and workspace headers come
 back unchanged; relaygate's own refusals carry CORS headers for the origins in
 `SESSIONS_CORS_ORIGINS`, so a browser sees the real status.
+
+## Adopting existing sessions
+
+Sessions uploaded before relaygate was in front of Sessions have no relaygate
+owner, so they are invisible through it. An operator adopts them once, at the
+switch:
+
+```
+POST /admin/v1/sessions/adopt?dryRun=1
+Authorization: Bearer <admin token>
+{"readToken": "rth_st_read_...", "orgId": "<org>", "workspaceId": "<ws>"}
+```
+
+relaygate pages the read API's session list with that read service token,
+takes each unowned session's uploader (its first `userIds` entry), maps that
+user through `controlPrincipals` (by org, user id, and email if relaygate has
+seen it; role isn't known here), and claims the session as `ctl:<userId>` in
+that rule's group. The report lists what it adopted, what was already owned,
+sessions with no uploader, and uploaders no rule matches (those stay unowned).
+`dryRun` only reports; without it the adoption is applied and audited
+(`session.adopt`). Rerunning it is safe. A run lists at most `maxPages` pages
+(default 500); if it stops there, the report has `truncated: true` and a
+`nextCursor` to pass back as `cursor`.
 
 ## The classifier
 

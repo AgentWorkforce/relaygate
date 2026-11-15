@@ -172,7 +172,7 @@ describe("Sessions proxy: reads", () => {
 
   it("refuses unknown routes and unauthenticated calls", async () => {
     const w = await world();
-    expect((await w.call("POST", "/sessions/v1/delivery/sessions/selection", w.local, {})).body.error.code).toBe("relaygate_route_not_proxied");
+    expect((await w.call("POST", "/sessions/v1/turns/batches", w.local, {})).body.error.code).toBe("relaygate_route_not_proxied");
     expect((await w.call("GET", "/sessions/v1/sessions", "rg_nope")).status).toBe(401);
   });
 });
