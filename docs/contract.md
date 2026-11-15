@@ -420,16 +420,32 @@ shares one session with a guest:
 ```
 
 The Sessions proxy is mounted at `/sessions`: a client's Sessions base URL
-becomes `https://<relaygate>/sessions` and the paths stay the same. relaygate
-calls Sessions with one service token (`rth_st_`, `rth:sync` and `rth:read`).
+becomes `https://<relaygate>/sessions` and the paths stay the same. For hosts
+listed in `SESSIONS_HOSTS` (a deployment's history origin pointed at relaygate),
+the same routes are served at the root, so clients keep their configured origin.
+Uploads go to `SESSIONS_UPLOAD_URL` and reads to `SESSIONS_READ_URL` (both
+default to `SESSIONS_URL`).
+
+relaygate holds no Sessions credential of its own. A caller sends its rg_ token
+in `X-Relaygate-Token` and its own Sessions credential (a device token for
+uploads, a read token for reads) in `Authorization`; relaygate checks the rg_
+principal and forwards that credential unchanged, so Sessions still records the
+real uploader. `SESSIONS_TOKEN` is an optional service credential used only
+for callers that send their rg_ token in `Authorization` and no Sessions
+credential. Because callers hold real Sessions credentials, the gate is only as
+strong as the network rule that Sessions accepts traffic from relaygate alone
+(see "Tokens and the upstream credentials").
 
 | Route | Check |
 |---|---|
 | `POST /sessions/v1/sessions/:id/turns` | `w` on the session; `sessionOwner` on the body and every turn is set to the agent |
+| `POST /sessions/v1/delivery/batches` | the native delivery protocol (JSON, optionally `gzip` or `zstd`): `w` on every `records[].session_id`, all or nothing; a record without a session is refused; the original bytes and `Content-Encoding` are forwarded |
+| `GET /sessions/v1/delivery/limits`, `POST .../auth/token/refresh`, `POST .../onboarding/heartbeat` | passed through (no session content) |
 | `POST /sessions/v1/ingest` | `w` on every session the batch names; all or nothing. Each record gets a `relaygate:agent:<name>` tag (client `relaygate:` tags are dropped) and, where it names one, `sessionOwner` set to the agent |
 | `GET /sessions/v1/sessions` | filtered to sessions the caller may read; the cursor passes through |
 | `GET /sessions/v1/sessions/:id/{events,turns,metadata,thread,catalog,timing,analysis,brief}` | `r` on the session |
-| `GET /sessions/v1/events?session=<id>` | exactly one `session`, `r` on it |
+| `GET /sessions/v1/events?session=<id>` | one `session`, `r` on it |
+| `GET /sessions/v1/events?q=<text>` | transcript search, filtered to events of sessions the caller may read |
 
 A write is decided before anything is recorded; the classifier sees every
 forwarded field, not only `content`. New sessions are claimed in one
@@ -438,8 +454,9 @@ makes its sender an owner. A claim is never released, even if Sessions rejects
 the upload: the uploader chose the session id and is the one who retries, and
 releasing could hand a session another upload filled to a different group. A session override changes mode and ACL only, never the
 owning group, which is what ceilings are checked against. Sessions that never came through relaygate have no owner and
-are invisible through it. Other Sessions routes (including the desktop
-uploader's `/v1/delivery/*`) answer `404 relaygate_route_not_proxied`. Pit agents
+are invisible through it. Other Sessions routes, including aggregate
+reads across sessions (`/v1/sessions/users`, `/activity`, `/v1/digest/*`),
+answer `404 relaygate_route_not_proxied`. Pit agents
 run headless on Linux servers, so their sessions come from a headless uploader
 on that server, authenticated with the agent's `rg_` token, not from the
 desktop app.

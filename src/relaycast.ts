@@ -24,7 +24,7 @@ const MESSAGES: Record<string, string> = {
 };
 
 /** Errors on proxied routes use Relaycast's shape, so SDK clients surface relaygate's code and message. */
-export function deny(c: Context, status: 400 | 401 | 403 | 404 | 409 | 502 | 503, code: string, extra: Record<string, unknown> = {}) {
+export function deny(c: Context, status: 400 | 401 | 403 | 404 | 409 | 413 | 415 | 502 | 503, code: string, extra: Record<string, unknown> = {}) {
   const detail = typeof extra.detail === "string" ? `: ${extra.detail}` : "";
   return c.json({ ok: false, error: { code, message: `${MESSAGES[code] ?? code}${detail}` }, ...extra }, status);
 }
