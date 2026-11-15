@@ -496,16 +496,25 @@ wins, and a user no rule matches is refused:
 
 `match` takes `kinds` (`device`, `read`), `orgIds`, `workspaceIds`, `roles`,
 `userIds` and `emails`. A read token minted without a role never matches a rule
-that needs one. Each Control user becomes the relaygate principal
+that needs one; without an email it uses the email relay-control last reported
+for that user (from a device-token introspection), and otherwise doesn't match
+an email rule.
+
+Uploads need a device token with `rth:sync`; a read token, or a device token
+without it, only reads, and reads need `rth:read`. The name prefix `ctl:` is
+reserved: no enrollment key registers it, and a registered agent never stands
+for a Control user. Each Control user becomes the relaygate principal
 `ctl:<userId>`, which owns the sessions it uploads and appears in the audit
 log; its credential is forwarded to Sessions unchanged, so Sessions still
 records the real person.
 
 Aggregate reads that span every session (`/v1/sessions/users`, `/activity`,
 `/summaries/activity`, `/output`, `/titles`, `/v1/digest/daily`) are served
-only to the groups in `sessionAggregates`. CORS preflights are passed to the
+only to the groups in `sessionAggregates`, and never to a principal under any
+ceiling (an aggregate may include groups it must not see). CORS preflights are passed to the
 read API unauthenticated, and the read API's CORS and workspace headers come
-back unchanged.
+back unchanged; relaygate's own refusals carry CORS headers for the origins in
+`SESSIONS_CORS_ORIGINS`, so a browser sees the real status.
 
 ## The classifier
 

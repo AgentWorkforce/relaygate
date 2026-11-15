@@ -131,7 +131,13 @@ export class Store {
         org_id TEXT NOT NULL,
         workspace_id TEXT,
         role TEXT,
+        email TEXT,
         expires_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS control_users (
+        user_id TEXT PRIMARY KEY,
+        email TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS audit (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,6 +156,7 @@ export class Store {
     this.addColumn("agents", "guest", "INTEGER NOT NULL DEFAULT 0");
     this.addColumn("streams", "acl", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumn("audit", "policy_version", "TEXT");
+    this.addColumn("control_read_tokens", "email", "TEXT");
   }
 
   private addColumn(table: string, column: string, decl: string): void {
@@ -265,6 +272,8 @@ export class Store {
     const name = `ctl:${userId}`;
     const existing = this.agentByName(name);
     if (existing) {
+      // Only an agent relaygate itself created for this Control user stands for it; a registered agent never does.
+      if (existing.keyId !== "control") throw new Error(`agent ${name} exists and is not a Control identity`);
       if (existing.gid !== gid) {
         this.db.prepare("UPDATE agents SET gid = ? WHERE id = ?").run(gid, existing.id);
         existing.gid = gid;
@@ -274,19 +283,38 @@ export class Store {
     return this.createAgent(name, gid, "control", undefined);
   }
 
-  putControlReadToken(row: { hash: string; userId: string; orgId: string; workspaceId: string | null; role: string | null; expiresAt: number }): void {
+  putControlReadToken(row: { hash: string; userId: string; orgId: string; workspaceId: string | null; role: string | null; email: string | null; expiresAt: number }): void {
     this.db
       .prepare(
-        `INSERT INTO control_read_tokens (hash, user_id, org_id, workspace_id, role, expires_at) VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(hash) DO UPDATE SET user_id = excluded.user_id, org_id = excluded.org_id, workspace_id = excluded.workspace_id, role = excluded.role, expires_at = excluded.expires_at`,
+        `INSERT INTO control_read_tokens (hash, user_id, org_id, workspace_id, role, email, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(hash) DO UPDATE SET user_id = excluded.user_id, org_id = excluded.org_id, workspace_id = excluded.workspace_id, role = excluded.role, email = excluded.email, expires_at = excluded.expires_at`,
       )
-      .run(row.hash, row.userId, row.orgId, row.workspaceId, row.role, row.expiresAt);
+      .run(row.hash, row.userId, row.orgId, row.workspaceId, row.role, row.email, row.expiresAt);
   }
 
-  controlReadToken(hash: string, now: number): { userId: string; orgId: string; workspaceId: string | null; role: "owner" | "admin" | "member" | null; expiresAt: number } | undefined {
-    const row = this.db.prepare("SELECT user_id, org_id, workspace_id, role, expires_at FROM control_read_tokens WHERE hash = ? AND expires_at > ?").get(hash, now);
+  /** A Control user's email, as relay-control last reported it (introspection, or a mint that carried it). */
+  rememberControlEmail(userId: string, email: string): void {
+    this.db
+      .prepare("INSERT INTO control_users (user_id, email, updated_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET email = excluded.email, updated_at = excluded.updated_at")
+      .run(userId, email, now());
+  }
+
+  controlEmail(userId: string): string | undefined {
+    const row = this.db.prepare("SELECT email FROM control_users WHERE user_id = ?").get(userId);
+    return row ? String(row.email) : undefined;
+  }
+
+  controlReadToken(hash: string, now: number): { userId: string; orgId: string; workspaceId: string | null; role: "owner" | "admin" | "member" | null; email: string | null; expiresAt: number } | undefined {
+    const row = this.db.prepare("SELECT user_id, org_id, workspace_id, role, email, expires_at FROM control_read_tokens WHERE hash = ? AND expires_at > ?").get(hash, now);
     return row
-      ? { userId: String(row.user_id), orgId: String(row.org_id), workspaceId: row.workspace_id === null ? null : String(row.workspace_id), role: row.role === null ? null : (String(row.role) as "owner"), expiresAt: Number(row.expires_at) }
+      ? {
+          userId: String(row.user_id),
+          orgId: String(row.org_id),
+          workspaceId: row.workspace_id === null ? null : String(row.workspace_id),
+          role: row.role === null ? null : (String(row.role) as "owner"),
+          email: row.email === null ? null : String(row.email),
+          expiresAt: Number(row.expires_at),
+        }
       : undefined;
   }
 

@@ -29,6 +29,11 @@ export interface SessionsConfig {
   readUrl: string;
   /** Optional service credential, used only for callers that send no Sessions credential of their own. */
   token?: string;
+  /**
+   * Browser origins allowed to read Sessions directly (the read API's own CORS list). relaygate adds the CORS headers
+   * to responses it produces itself (refusals, errors), so the dashboard sees the real status instead of a CORS error.
+   */
+  corsOrigins?: string[];
   /** Hosts whose requests are Sessions requests at the root path (no /sessions prefix). */
   hosts?: string[];
   /**
@@ -61,6 +66,21 @@ const PASS_RESPONSE = [
 const HOST_MOUNTED = "x-relaygate-host-mounted";
 /** The largest upload body relaygate inspects (wire and decoded); Sessions' own cap is 2 MiB. */
 const MAX_UPLOAD = 4 * 1024 * 1024;
+
+/**
+ * Adds CORS headers to Sessions responses relaygate produces itself (refusals, auth errors) for allowed browser
+ * origins. Responses from the read API keep its own CORS headers.
+ */
+export function sessionsCors(cfg: SessionsConfig) {
+  const allowed = new Set((cfg.corsOrigins ?? []).map((o) => o.replace(/\/$/, "")));
+  return async (c: Context, next: () => Promise<void>) => {
+    await next();
+    const origin = c.req.header("origin");
+    if (!origin || !allowed.has(origin) || c.res.headers.has("access-control-allow-origin")) return;
+    c.res.headers.set("access-control-allow-origin", origin);
+    c.res.headers.append("vary", "Origin");
+  };
+}
 
 /** Serves Sessions paths at the root for the configured hosts, by mapping them under /sessions. */
 export function routeSessionsHosts(fetchFn: (req: Request) => Response | Promise<Response>, hosts: string[] = []) {
@@ -400,7 +420,10 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   const aggregate = (path: string) =>
     app.get(`/sessions${path}`, async (c) => {
       const principal = c.get("principal");
-      const allowed = deps.policy().sessionAggregates.gids.some((g) => principal.gid === g || principal.groups.includes(g));
+      const policy = deps.policy();
+      // An aggregate spans every session, so a principal under any ceiling never gets one (it may not see all groups).
+      const ceilinged = policy.ceilings.some((cl) => cl.gid === principal.gid || principal.groups.includes(cl.gid));
+      const allowed = !ceilinged && policy.sessionAggregates.gids.some((g) => principal.gid === g || principal.groups.includes(g));
       audit(c, "session.aggregate", "r", path, allowed ? "allow" : "deny", "mode", allowed ? "sessionAggregates" : "not_in_sessionAggregates");
       return allowed ? pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c))) : deny(c, 403, "relaygate_denied", { op: "r", resource: `sessions${path}` });
     });

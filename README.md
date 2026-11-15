@@ -44,6 +44,7 @@ Relaycast client's base URL at relaygate and use the `rg_` token (see
 | `RELAYCONTROL_INTROSPECT_URL` | none | Turns on Control principals (desktop device tokens, dashboard read tokens) on Sessions routes. |
 | `RELAYCONTROL_INTROSPECT_SECRET` | none | relay-control's introspection secret. Required with the URL. |
 | `SESSION_INGEST_AUDIENCE` | none | The audience device tokens are introspected for (the Sessions ingest origin relay-control accepts). Required with the URL. |
+| `SESSIONS_CORS_ORIGINS` | none | Comma-separated browser origins allowed to read Sessions directly (match the read API's list); relaygate's own refusals carry CORS headers for them. |
 | `SESSIONS_INTERNAL_SECRET` | none | The read API's internal secret; when set, relaygate checks relay-control's mint calls against it. |
 | `ANTHROPIC_API_KEY` | none | Needed only when `classifier.model.enabled` is true. |
 

@@ -71,7 +71,7 @@ if (uploadUrl || readUrl) {
     process.exit(1);
   }
   const hosts = (process.env.SESSIONS_HOSTS ?? "").split(",").map((h) => h.trim()).filter(Boolean);
-  sessions = { uploadUrl, readUrl, token: process.env.SESSIONS_TOKEN || undefined, hosts, internalSecret: process.env.SESSIONS_INTERNAL_SECRET || undefined };
+  sessions = { uploadUrl, readUrl, token: process.env.SESSIONS_TOKEN || undefined, hosts, internalSecret: process.env.SESSIONS_INTERNAL_SECRET || undefined, corsOrigins: (process.env.SESSIONS_CORS_ORIGINS ?? "").split(",").map((o) => o.trim()).filter(Boolean) };
 }
 // relay-control principals (desktop device tokens, dashboard read tokens) are on when the introspection URL is set.
 let control: ControlAuth | undefined;

@@ -4,7 +4,7 @@ import { ClassifierUnavailable, type Classifier } from "./classifier.js";
 import { allGroups, check, inGroup, type AclEntry, type Guarded, type Op, type Principal } from "./mode.js";
 import { deny as proxyDeny, mountRelaycast, type RelaycastUpstream } from "./relaycast.js";
 import { mountNodeToken } from "./realtime.js";
-import { mountSessions, type SessionsConfig } from "./sessions.js";
+import { mountSessions, sessionsCors, type SessionsConfig } from "./sessions.js";
 import { ControlUnavailable, controlPrincipal, controlTokenKind, matchControlRule, type ControlAuth } from "./control.js";
 import { explain, runCases, CaseSchema, QuerySchema } from "./explain.js";
 import { keyUsable, parsePolicy, policyVersion, type EnrollmentKey, type Policy } from "./policy.js";
@@ -34,7 +34,11 @@ export type Env = { Variables: { agent: Agent; principal: Principal; tokenHash: 
 const NAME = /^[A-Za-z0-9._:-]{1,128}$/;
 const STREAM_ID = /^[\x21-\x7e]{1,512}$/;
 
-const RegisterBody = z.object({ name: z.string().regex(NAME), recovery: z.string().min(16).max(512).optional() });
+const RegisterBody = z.object({
+  // `ctl:` names belong to relay-control users (docs/contract.md, "Control principals"); no enrollment key gets them.
+  name: z.string().regex(NAME).refine((n) => !n.toLowerCase().startsWith("ctl:"), "names starting ctl: are reserved"),
+  recovery: z.string().min(16).max(512).optional(),
+});
 const StreamBody = z.object({
   gid: z.number().int().nonnegative().optional(),
   mode: z.string().regex(/^[0246]{3}$/),
@@ -362,7 +366,23 @@ export function createApp(deps: Deps) {
       store.audit({ agentId: null, action: "auth", op: null, resourceKind: "agent", resourceId: `ctl:${identity.userId}`, decision: "deny", stage: "auth", reason: "no_control_rule" });
       return deny(c, 403, "relaygate_denied", { detail: "no controlPrincipals rule matches this user" });
     }
-    const { agent, principal } = controlPrincipal(store, identity, rule);
+    // Uploads need a device token that may sync; a read token (or a device token without rth:sync) only reads.
+    const writes = c.req.method !== "GET" && c.req.method !== "HEAD";
+    if (writes && (identity.kind !== "device" || !identity.scopes.includes("rth:sync"))) {
+      store.audit({ agentId: null, action: "auth", op: "w", resourceKind: "agent", resourceId: `ctl:${identity.userId}`, decision: "deny", stage: "auth", reason: `control_${identity.kind}_cannot_write` });
+      return deny(c, 403, "relaygate_denied", { detail: "uploads need a device token with rth:sync" });
+    }
+    if (!writes && !identity.scopes.includes("rth:read")) {
+      return deny(c, 403, "relaygate_denied", { detail: "this credential has no rth:read" });
+    }
+    let resolved;
+    try {
+      resolved = controlPrincipal(store, identity, rule);
+    } catch (error) {
+      console.error(JSON.stringify({ msg: "control identity refused", error: (error as Error).message }));
+      return deny(c, 403, "relaygate_denied", { detail: "this identity collides with a registered agent" });
+    }
+    const { agent, principal } = resolved;
     c.set("agent", agent);
     c.set("principal", principal);
     c.set("tokenHash", sha256(token));
@@ -408,6 +428,8 @@ export function createApp(deps: Deps) {
     await next();
   };
   app.use("/v1/*", authenticate);
+  // Registered before auth, so relaygate's own refusals reach the dashboard with CORS headers too.
+  if (deps.sessions?.corsOrigins?.length) app.use("/sessions/*", sessionsCors(deps.sessions));
   app.use("/sessions/*", authenticate);
 
   app.get("/v1/whoami", (c) => {

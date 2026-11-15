@@ -43,6 +43,8 @@ export interface ControlIdentity {
 export class ControlUnavailable extends Error {}
 
 const ROLES = new Set(["owner", "admin", "member"]);
+/** Device-token identities kept in memory at most. */
+const CACHE_MAX = 10_000;
 /** Longest relaygate remembers a minted read token (service tokens can live 90 days). */
 const MAX_READ_TOKEN_MS = 90 * 24 * 3600 * 1000;
 
@@ -75,7 +77,10 @@ export class ControlAuth {
 
   private readToken(token: string): ControlIdentity | undefined {
     const row = this.store.controlReadToken(sha256(token), this.now());
-    return row ? { kind: "read", userId: row.userId, orgId: row.orgId, workspaceId: row.workspaceId ?? undefined, role: row.role ?? undefined, scopes: ["rth:read"], expiresAt: row.expiresAt ?? undefined } : undefined;
+    if (!row) return undefined;
+    // The mint rarely carries an email; fall back to the one relay-control last reported for this user.
+    const email = row.email ?? this.store.controlEmail(row.userId);
+    return { kind: "read", userId: row.userId, email, orgId: row.orgId, workspaceId: row.workspaceId ?? undefined, role: row.role ?? undefined, scopes: ["rth:read"], expiresAt: row.expiresAt ?? undefined };
   }
 
   private async introspect(token: string): Promise<ControlIdentity | undefined> {
@@ -95,7 +100,13 @@ export class ControlAuth {
     }
     // Control answers 200 for every well-formed, authenticated request; anything else means it couldn't decide.
     if (res.status !== 200) throw new ControlUnavailable(`introspection answered ${res.status}`);
-    const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    let body: Record<string, unknown> | null;
+    try {
+      body = (await res.json()) as Record<string, unknown> | null;
+    } catch {
+      // A 200 that can't be read is Control failing, not the token being bad.
+      throw new ControlUnavailable("introspection answer could not be read");
+    }
     if (!body || body.active !== true) return undefined;
     if (body.principal_type !== "desktop-user" || typeof body.sub !== "string" || typeof body.org !== "string") return undefined;
     const identity: ControlIdentity = {
@@ -108,9 +119,20 @@ export class ControlAuth {
       scopes: Array.isArray(body.scopes) ? body.scopes.filter((s): s is string => typeof s === "string") : [],
       expiresAt: typeof body.exp === "number" ? body.exp * 1000 : undefined,
     };
+    if (identity.email) this.store.rememberControlEmail(identity.userId, identity.email);
     const until = Math.min(this.now() + (this.cfg.cacheMs ?? 15_000), identity.expiresAt ?? Infinity);
-    this.cache.set(key, { identity, until });
+    this.remember(key, { identity, until });
     return identity;
+  }
+
+  /** Bounded: expired entries go first, then the oldest, so rotated tokens never pile up. */
+  private remember(key: string, entry: { identity: ControlIdentity; until: number }): void {
+    const now = this.now();
+    if (this.cache.size >= CACHE_MAX) {
+      for (const [k, v] of this.cache) if (v.until <= now) this.cache.delete(k);
+      while (this.cache.size >= CACHE_MAX) this.cache.delete(this.cache.keys().next().value!);
+    }
+    this.cache.set(key, entry);
   }
 
   /** Records a read token relay-control just minted through relaygate (its hash, never the token). */
@@ -129,6 +151,7 @@ export class ControlAuth {
       orgId: b.orgId,
       workspaceId: typeof b.workspaceId === "string" ? b.workspaceId : null,
       role: role as ControlRole | null,
+      email: typeof b.email === "string" ? b.email : null,
       expiresAt: exp,
     });
     this.store.pruneControlReadTokens(now);
