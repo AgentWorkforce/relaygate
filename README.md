@@ -22,7 +22,9 @@ The contract is in [docs/contract.md](docs/contract.md).
 
 Build 1 implements registration, `rg_` tokens, the mode check, stream
 registration, `POST /v1/check`, the classifier (rules, then optionally Claude)
-and the audit log. The Relaycast and Sessions proxies come next.
+and the audit log. It also implements access lists (`acl`), guest enrollment
+keys (`guest`, `expiresAt`; revoking or expiring one ends its tokens), group
+ceilings and guest provenance. The Relaycast and Sessions proxies come next.
 
 | Setting | Default | Meaning |
 |---|---|---|

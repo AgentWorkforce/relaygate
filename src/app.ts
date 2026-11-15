@@ -1,8 +1,8 @@
 import { Hono, type Context } from "hono";
 import { z } from "zod";
 import { ClassifierUnavailable, type Classifier } from "./classifier.js";
-import { inGroup, modeAllows, type Guarded, type Op, type Principal } from "./mode.js";
-import type { Policy } from "./policy.js";
+import { allGroups, check, inGroup, type AclEntry, type Guarded, type Op, type Principal } from "./mode.js";
+import { keyUsable, type EnrollmentKey, type Policy } from "./policy.js";
 import { sameHash, sha256, type Agent, type Store } from "./store.js";
 
 export interface Deps {
@@ -10,6 +10,8 @@ export interface Deps {
   /** Returns the current operator policy (reloaded by the caller when it changes). */
   policy: () => Policy;
   classifier: () => Classifier;
+  /** Clock for key expiry; defaults to Date.now. */
+  now?: () => number;
 }
 
 type Env = { Variables: { agent: Agent; principal: Principal } };
@@ -22,6 +24,7 @@ const StreamBody = z.object({
   gid: z.number().int().nonnegative().optional(),
   mode: z.string().regex(/^[0246]{3}$/),
   classify: z.boolean().default(false),
+  acl: z.array(z.object({ gid: z.number().int().nonnegative(), perm: z.enum(["r", "w", "rw"]) })).max(64).default([]),
 });
 const Resource = z.object({ kind: z.literal("stream"), id: z.string().regex(STREAM_ID) });
 const CheckBody = z.object({ op: z.enum(["r", "w"]), resource: Resource, content: z.string().max(200_000).optional() });
@@ -40,30 +43,70 @@ export function principalFor(agent: Agent, policy: Policy): Principal {
   return { agentId: agent.id, gid: agent.gid, groups: key?.groups ?? [] };
 }
 
+/** A guest agent, by the key it enrolled with now or the flag recorded when it registered. */
+export function isGuest(agent: Agent, policy: Policy): boolean {
+  return agent.guest || policy.enrollmentKeys.some((k) => k.id === agent.keyId && k.guest);
+}
+
+/**
+ * Why a guest agent's tokens have ended, or undefined while they still work. A guest key that is revoked,
+ * expired or gone from the policy ends every token issued from it (docs/contract.md, "Guests").
+ */
+export function guestEnded(agent: Agent, policy: Policy, now: number): string | undefined {
+  if (!isGuest(agent, policy)) return undefined;
+  const key = policy.enrollmentKeys.find((k) => k.id === agent.keyId);
+  if (!key) return "guest_key_removed";
+  if (key.revoked) return "guest_key_revoked";
+  if (!keyUsable(key, now)) return "guest_key_expired";
+  return undefined;
+}
+
+/**
+ * Records every agent of a guest key as a guest, then revokes every token issued from guest keys that are revoked,
+ * expired or gone from the policy. Returns the revoked hashes.
+ */
+export function sweepGuestKeys(store: Store, policy: Policy, now: number): string[] {
+  for (const k of policy.enrollmentKeys) if (k.guest) store.markKeyGuest(k.id);
+  return store.guestKeyIds().flatMap((id) => {
+    const key = policy.enrollmentKeys.find((k) => k.id === id);
+    return key && keyUsable(key, now) ? [] : store.revokeGuestKeyTokens(id);
+  });
+}
+
+/** The sender card stamped on everything relaygate forwards and returned by /v1/whoami. */
+export function provenance(agent: Agent, principal: Principal, policy: Policy) {
+  return {
+    agent: agent.name,
+    groups: allGroups(principal).map((g) => groupName(policy, g)),
+    ...(isGuest(agent, policy) ? { guest: true as const } : {}),
+  };
+}
+
 export interface ResolvedStream extends Guarded {
   id: string;
   classify: boolean;
+  acl: AclEntry[];
   source: "override" | "registered" | "prefix";
 }
 
 /** Operator override, then the registered stream, then the longest matching prefix default. */
 export function resolveStream(id: string, store: Store, policy: Policy): ResolvedStream | undefined {
   const override = policy.streamOverrides.find((o) => o.id === id);
-  if (override) return { id, owner: null, gid: override.gid, mode: override.mode, classify: override.classify, source: "override" };
+  if (override) return { id, owner: null, gid: override.gid, mode: override.mode, classify: override.classify, acl: override.acl, source: "override" };
   const row = store.stream(id);
-  if (row) return { id, owner: row.owner, gid: row.gid, mode: row.mode, classify: row.classify, source: "registered" };
+  if (row) return { id, owner: row.owner, gid: row.gid, mode: row.mode, classify: row.classify, acl: row.acl, source: "registered" };
   const prefix = longestPrefix(id, policy);
-  if (prefix) return { id, owner: null, gid: prefix.gid, mode: prefix.mode, classify: prefix.classify, source: "prefix" };
+  if (prefix) return { id, owner: null, gid: prefix.gid, mode: prefix.mode, classify: prefix.classify, acl: prefix.acl, source: "prefix" };
   return undefined;
 }
 
-function longestPrefix(id: string, policy: Policy) {
+export function longestPrefix(id: string, policy: Policy) {
   return policy.streamDefaults
     .filter((d) => id.startsWith(d.prefix))
     .sort((a, b) => b.prefix.length - a.prefix.length)[0];
 }
 
-const groupName = (policy: Policy, gid: number) => policy.groups.find((g) => g.gid === gid)?.name ?? String(gid);
+export const groupName = (policy: Policy, gid: number) => policy.groups.find((g) => g.gid === gid)?.name ?? String(gid);
 
 export type Decision =
   | { status: "allow"; stage: "mode" | "classifier"; reason: string }
@@ -83,9 +126,9 @@ export async function decide(
   const policy = deps.policy();
   const stream = resolveStream(streamId, deps.store, policy);
   if (!stream) return { status: "deny", stage: "mode", error: "relaygate_denied", reason: "unknown_stream" };
-  if (!modeAllows(principal, stream, op)) {
-    return { status: "deny", stage: "mode", error: "relaygate_denied", reason: `mode:${stream.mode}:${stream.source}` };
-  }
+  const result = check(principal, stream, op, policy.ceilings);
+  const modeReason = `${result.reason}:${stream.source}`;
+  if (!result.allowed) return { status: "deny", stage: "mode", error: "relaygate_denied", reason: modeReason };
   const crossesGroup = !inGroup(principal, stream.gid);
   if (op === "w" && (crossesGroup || stream.classify)) {
     if (content === undefined) return { status: "invalid", reason: "content is required for this write" };
@@ -94,7 +137,8 @@ export async function decide(
         from: {
           agentId: agent.id,
           name: agent.name,
-          groups: [principal.gid, ...principal.groups].map((g) => groupName(policy, g)),
+          groups: allGroups(principal).map((g) => groupName(policy, g)),
+          guest: isGuest(agent, policy),
         },
         op: "w",
         resource: { kind: "stream", id: stream.id, group: groupName(policy, stream.gid) },
@@ -109,12 +153,13 @@ export async function decide(
       throw error;
     }
   }
-  return { status: "allow", stage: "mode", reason: `mode:${stream.mode}:${stream.source}` };
+  return { status: "allow", stage: "mode", reason: modeReason };
 }
 
 export function createApp(deps: Deps) {
   const app = new Hono<Env>();
   const { store } = deps;
+  const now = deps.now ?? Date.now;
 
   app.get("/healthz", (c) => c.json({ ok: true }));
   app.get("/readyz", (c) => {
@@ -129,9 +174,12 @@ export function createApp(deps: Deps) {
   app.post("/v1/register", async (c) => {
     const key = bearer(c);
     const policy = deps.policy();
-    const enrollment = key ? policy.enrollmentKeys.find((k) => !k.revoked && sameHash(k.sha256, sha256(key))) : undefined;
+    const matches: EnrollmentKey[] = key ? policy.enrollmentKeys.filter((k) => sameHash(k.sha256, sha256(key))) : [];
+    const enrollment = matches.find((k) => keyUsable(k, now()));
+    const found = matches[0];
     if (!enrollment) {
-      store.audit({ agentId: null, action: "register", op: null, resourceKind: null, resourceId: null, decision: "deny", stage: "auth", reason: "bad_enrollment_key" });
+      const reason = !found ? "bad_enrollment_key" : found.revoked ? `key_revoked:${found.id}` : `key_expired:${found.id}`;
+      store.audit({ agentId: null, action: "register", op: null, resourceKind: null, resourceId: null, decision: "deny", stage: "auth", reason });
       return deny(c, 401, "relaygate_unauthenticated");
     }
     const parsed = RegisterBody.safeParse(await c.req.json().catch(() => null));
@@ -144,8 +192,14 @@ export function createApp(deps: Deps) {
 
     const existing = store.agentByName(name);
     if (existing) {
+      // Effective guest status, persisted first, so a key that just turned guest can't be escaped by rebinding.
+      if (!existing.guest && isGuest(existing, policy)) {
+        store.markKeyGuest(existing.keyId);
+        existing.guest = true;
+      }
       const recovered =
         existing.gid === enrollment.gid &&
+        existing.guest === enrollment.guest &&
         recovery !== undefined &&
         existing.recoveryHash !== null &&
         sameHash(existing.recoveryHash, sha256(recovery));
@@ -154,12 +208,14 @@ export function createApp(deps: Deps) {
         return deny(c, 409, "relaygate_name_taken");
       }
       store.revokeTokens(existing.id);
+      // The key that recovered the agent now governs it (key rotation: the old key may have expired).
+      if (existing.keyId !== enrollment.id) store.setAgentKey(existing.id, enrollment.id, enrollment.guest);
       const token = store.issueToken(existing.id);
       store.audit({ agentId: existing.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: "recovered" });
       return c.json({ agent_id: existing.id, gid: existing.gid, token });
     }
 
-    const agent = store.createAgent(name, enrollment.gid, enrollment.id, recovery);
+    const agent = store.createAgent(name, enrollment.gid, enrollment.id, recovery, enrollment.guest);
     const token = store.issueToken(agent.id);
     store.audit({ agentId: agent.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: `key:${enrollment.id}` });
     return c.json({ agent_id: agent.id, gid: agent.gid, token });
@@ -170,20 +226,36 @@ export function createApp(deps: Deps) {
     const token = bearer(c);
     const agent = token?.startsWith("rg_") ? store.agentForToken(token) : undefined;
     if (!agent) return deny(c, 401, "relaygate_unauthenticated");
+    const policy = deps.policy();
+    // A key that became a guest key makes its agents guests for good.
+    if (!agent.guest && isGuest(agent, policy)) {
+      store.markKeyGuest(agent.keyId);
+      agent.guest = true;
+    }
+    const ended = guestEnded(agent, policy, now());
+    if (ended) {
+      // Permanent: un-revoking or extending the key later doesn't bring these tokens back.
+      store.revokeTokens(agent.id);
+      store.audit({ agentId: agent.id, action: "auth", op: null, resourceKind: null, resourceId: null, decision: "deny", stage: "auth", reason: ended });
+      return deny(c, 401, "relaygate_unauthenticated");
+    }
     c.set("agent", agent);
-    c.set("principal", principalFor(agent, deps.policy()));
+    c.set("principal", principalFor(agent, policy));
     await next();
   });
 
   app.get("/v1/whoami", (c) => {
     const policy = deps.policy();
     const p = c.get("principal");
+    const agent = c.get("agent");
     return c.json({
       agent_id: p.agentId,
-      name: c.get("agent").name,
+      name: agent.name,
       gid: p.gid,
       groups: p.groups,
-      group_names: [p.gid, ...p.groups].map((g) => groupName(policy, g)),
+      group_names: allGroups(p).map((g) => groupName(policy, g)),
+      guest: isGuest(agent, policy),
+      relaygate: provenance(agent, p, policy),
     });
   });
 
@@ -196,6 +268,9 @@ export function createApp(deps: Deps) {
     const parsed = StreamBody.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return deny(c, 400, "relaygate_bad_request", { detail: parsed.error.issues[0]?.message });
     const gid = parsed.data.gid ?? principal.gid;
+    const { mode, classify, acl } = parsed.data;
+    const unknownGid = acl.find((e) => !policy.groups.some((g) => g.gid === e.gid));
+    if (unknownGid) return deny(c, 400, "relaygate_bad_request", { detail: `acl names unknown gid ${unknownGid.gid}` });
 
     const refuse = (reason: string) => {
       store.audit({ agentId: agent.id, action: "stream.register", op: "w", resourceKind: "stream", resourceId: id, decision: "deny", stage: "registration", reason });
@@ -208,9 +283,10 @@ export function createApp(deps: Deps) {
     const existing = store.stream(id);
     if (existing && existing.owner !== agent.id) return refuse("not_owner");
 
-    store.putStream({ id, owner: agent.id, gid, mode: parsed.data.mode, classify: parsed.data.classify });
-    store.audit({ agentId: agent.id, action: "stream.register", op: "w", resourceKind: "stream", resourceId: id, decision: "allow", stage: "registration", reason: `mode:${parsed.data.mode}` });
-    return c.json({ id, owner: agent.id, gid, mode: parsed.data.mode, classify: parsed.data.classify });
+    store.putStream({ id, owner: agent.id, gid, mode, classify, acl });
+    const aclText = acl.map((e) => `+acl:${e.gid}:${e.perm}`).join("");
+    store.audit({ agentId: agent.id, action: "stream.register", op: "w", resourceKind: "stream", resourceId: id, decision: "allow", stage: "registration", reason: `mode:${mode}${aclText}` });
+    return c.json({ id, owner: agent.id, gid, mode, classify, acl });
   });
 
   app.post("/v1/check", async (c) => {

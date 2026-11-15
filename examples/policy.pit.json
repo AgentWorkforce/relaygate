@@ -1,23 +1,34 @@
 {
   "groups": [
-    { "gid": 11, "name": "local" },
-    { "gid": 22, "name": "pit" }
+    {"gid": 11, "name": "local"},
+    {"gid": 22, "name": "pit"},
+    {"gid": 44, "name": "guest"}
   ],
   "enrollmentKeys": [
-    { "id": "local", "gid": 11, "sha256": "<sha256 of the local enrollment key>" },
-    { "id": "pit", "gid": 22, "sha256": "<sha256 of the pit enrollment key>" },
-    { "id": "slack-bridge", "gid": 22, "sha256": "<sha256 of the bridge key>", "namePrefix": "slack-" }
+    {"id": "local", "gid": 11, "sha256": "<sha256 of the local enrollment key>", "namePrefix": "local-"},
+    {"id": "pit", "gid": 22, "sha256": "<sha256 of the pit enrollment key>", "namePrefix": "pit-"},
+    {"id": "slack-bridge", "gid": 22, "sha256": "<sha256 of the bridge key>", "namePrefix": "slack-"},
+    {"id": "vendor-guest", "gid": 44, "sha256": "<sha256 of the guest enrollment key>", "namePrefix": "guest-", "guest": true, "expiresAt": "2027-03-31T00:00:00Z"}
   ],
   "streamDefaults": [
-    { "prefix": "relaycast:inbox/", "gid": 11, "mode": "664" },
-    { "prefix": "slack:", "gid": 22, "mode": "660", "classify": true },
-    { "prefix": "kb:", "gid": 22, "mode": "660", "classify": true }
+    {"prefix": "relaycast:channel/", "gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}]},
+    {"prefix": "relaycast:inbox/local-", "gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}]},
+    {"prefix": "relaycast:channel/pit-", "gid": 22, "mode": "660", "acl": [{"gid": 11, "perm": "w"}]},
+    {"prefix": "relaycast:inbox/pit-", "gid": 22, "mode": "660", "acl": [{"gid": 11, "perm": "w"}]},
+    {"prefix": "relaycast:inbox/slack-", "gid": 22, "mode": "660", "acl": [{"gid": 11, "perm": "w"}]},
+    {"prefix": "relaycast:channel/collab-", "gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}, {"gid": 44, "perm": "rw"}]},
+    {"prefix": "relaycast:inbox/guest-", "gid": 44, "mode": "660", "acl": [{"gid": 11, "perm": "w"}]},
+    {"prefix": "slack:", "gid": 22, "mode": "660", "classify": true},
+    {"prefix": "kb:", "gid": 22, "mode": "660", "classify": true}
   ],
   "streamOverrides": [],
+  "ceilings": [
+    {"gid": 44, "never": [22]}
+  ],
   "classifier": {
     "rules": [
-      { "id": "us-ssn", "pattern": "\\b\\d{3}-\\d{2}-\\d{4}\\b" },
-      { "id": "prompt-injection", "pattern": "ignore (all )?(previous|prior) instructions" }
+      {"id": "us-ssn", "pattern": "\\b\\d{3}-\\d{2}-\\d{4}\\b"},
+      {"id": "prompt-injection", "pattern": "ignore (all )?(previous|prior) instructions"}
     ],
     "model": {
       "enabled": true,

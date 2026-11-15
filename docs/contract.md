@@ -27,9 +27,13 @@ The operator, in relay-control, owns:
 
 - the **groups**: each `gid` and its name;
 - the **enrollment keys**: which group each key enrolls into, its optional name
-  prefix, creating and revoking keys;
-- the **prefix defaults** for streams (`gid`, `mode`, `classify` per prefix);
-- **overrides** for a specific stream or session (`gid`, `mode`, `classify`);
+  prefix, whether it is a guest key and when it expires, creating and revoking
+  keys;
+- the **prefix defaults** for streams (`gid`, `mode`, `acl`, `classify` per
+  prefix);
+- **overrides** for a specific stream or session (`gid`, `mode`, `acl`,
+  `classify`);
+- the **ceilings**: per group, the groups it may never touch;
 - the **classifier settings**.
 
 relaygate pulls this policy from relay-control and keeps it cached, so a
@@ -107,7 +111,7 @@ and an operator override in relay-control wins over what the component set:
 ```
 PUT /v1/streams/{id}
 Authorization: Bearer rg_...
-{"gid": 22, "mode": "660", "classify": true}
+{"gid": 22, "mode": "660", "acl": [{"gid": 11, "perm": "w"}], "classify": true}
 ```
 
 A stream id that isn't registered takes the deployment's default for the
@@ -185,6 +189,12 @@ writes to outside chat tools":
 Every default leaves "other" at `0`, so a group the operator adds later (a
 guest, say) starts with no access to anything and is granted only what an ACL
 names.
+
+Stream ids for inboxes carry the agent's name, so the prefix defaults only
+place an inbox in the right group if names do. In this deployment each
+enrollment key has its own name prefix (`local-`, `pit-`, `slack-`, `guest-`)
+and inbox defaults are per prefix, with no catch-all: an inbox that matches no
+prefix is refused rather than defaulting into the wrong group.
 
 The `slack:` and `kb:` rows are prefix defaults this deployment configures.
 relaygate itself has no notion of Slack or knowledge bases.

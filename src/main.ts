@@ -1,6 +1,6 @@
 import { statSync } from "node:fs";
 import { serve } from "@hono/node-server";
-import { createApp } from "./app.js";
+import { createApp, sweepGuestKeys } from "./app.js";
 import { classifierFromPolicy, type Classifier } from "./classifier.js";
 import { loadPolicyFile, type Policy } from "./policy.js";
 import { Store } from "./store.js";
@@ -14,12 +14,16 @@ const dbPath = process.env.RELAYGATE_DB ?? "/data/relaygate.db";
 const port = Number(process.env.PORT ?? 8080);
 const reloadMs = Number(process.env.RELAYGATE_POLICY_RELOAD_MS ?? 5000);
 
+const store = new Store(dbPath);
 let policy: Policy = loadPolicyFile(policyPath);
 let classifier: Classifier = classifierFromPolicy(policy);
 let mtime = statSync(policyPath).mtimeMs;
 
 // Keep the last good policy if a new one doesn't parse, so a bad edit never opens the gate.
 setInterval(() => {
+  // Guest keys that were revoked or have expired end their tokens even if no one calls with them.
+  const ended = sweepGuestKeys(store, policy, Date.now());
+  if (ended.length > 0) console.log(JSON.stringify({ msg: "guest tokens ended", count: ended.length }));
   try {
     const m = statSync(policyPath).mtimeMs;
     if (m === mtime) return;
@@ -33,7 +37,6 @@ setInterval(() => {
   }
 }, reloadMs).unref();
 
-const store = new Store(dbPath);
 const app = createApp({ store, policy: () => policy, classifier: () => classifier });
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
