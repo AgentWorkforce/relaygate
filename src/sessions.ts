@@ -120,10 +120,29 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     return gateWrites(c, writes, attempt + 1);
   };
 
-  /** Forwards an upload; if upstream didn't accept it, the sessions this request claimed are released. */
-  const upload = async (c: Ctx, claimed: string[], path: string, body: unknown) => {
-    const res = await upstream(c, "POST", path, body);
-    if (res.status < 200 || res.status >= 300) store.releaseSessions(claimed, c.get("agent").id);
+  /** Uploads in flight per session, so a failed upload never releases a claim a concurrent one relies on. */
+  const inflight = new Map<string, number>();
+
+  /**
+   * Forwards an upload. An accepted upload confirms every session it wrote (its claim is then permanent). A failed
+   * one releases the sessions it claimed, unless they are confirmed or another upload to them is still in flight
+   * (that one confirms or releases when it finishes).
+   */
+  const upload = async (c: Ctx, written: string[], claimed: string[], path: string, body: unknown) => {
+    for (const id of written) inflight.set(id, (inflight.get(id) ?? 0) + 1);
+    let res: Awaited<ReturnType<typeof upstream>> | undefined;
+    try {
+      res = await upstream(c, "POST", path, body);
+    } finally {
+      for (const id of written) {
+        const n = (inflight.get(id) ?? 1) - 1;
+        if (n === 0) inflight.delete(id);
+        else inflight.set(id, n);
+      }
+      const ok = res !== undefined && res.status >= 200 && res.status < 300;
+      if (ok) store.confirmSessions(written);
+      else store.releaseSessions(claimed.filter((id) => !inflight.has(id)), c.get("agent").id);
+    }
     return pass(c, res);
   };
 
@@ -141,11 +160,11 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     if (!body || !Array.isArray(body.turns)) return deny(c, 400, "relaygate_bad_request", { detail: "turns[] required" });
     const name = c.get("agent").name;
     const turns: Array<Record<string, unknown>> = (body.turns as Array<Record<string, unknown>>).map((t) => ({ ...t, sessionOwner: name }));
-    // The classifier sees every field that is forwarded, not only `content`.
-    const content = turns.map((t) => JSON.stringify(t)).join("\n");
-    const gate = await gateWrites(c, new Map([[id, content]]));
+    const forwarded = { ...body, sessionOwner: name, turns };
+    // The classifier sees everything that is forwarded, not only `content`.
+    const gate = await gateWrites(c, new Map([[id, JSON.stringify(forwarded)]]));
     if (gate instanceof Response) return gate;
-    return upload(c, gate, `/v1/sessions/${encodeURIComponent(id)}/turns`, { ...body, sessionOwner: name, turns });
+    return upload(c, [id], gate, `/v1/sessions/${encodeURIComponent(id)}/turns`, forwarded);
   });
 
   // Batch upload. Every session a batch touches must be writable, or nothing is forwarded.
@@ -159,17 +178,17 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
       const tags = Array.isArray(r.tags) ? r.tags.filter((t) => typeof t === "string" && !t.startsWith("relaygate:")) : [];
       return { ...r, tags: [...tags, `relaygate:agent:${name}`], ...("sessionOwner" in r ? { sessionOwner: name } : {}) };
     });
-    const bySession = new Map<string, string[]>();
+    const bySession = new Map<string, Array<Record<string, unknown>>>();
     for (const r of records) {
       const id = r.sessionId;
       if (typeof id !== "string" || !SESSION_ID.test(id)) return deny(c, 400, "relaygate_bad_request", { detail: "every record needs a valid sessionId" });
-      const parts = bySession.get(id) ?? [];
-      parts.push(JSON.stringify(r));
-      bySession.set(id, parts);
+      bySession.set(id, [...(bySession.get(id) ?? []), r]);
     }
-    const gate = await gateWrites(c, new Map([...bySession].map(([id, parts]) => [id, parts.join("\n")])));
+    // Each session's classification covers its records and every top-level field the batch forwards.
+    const { records: _records, ...envelope } = body as Record<string, unknown>;
+    const gate = await gateWrites(c, new Map([...bySession].map(([id, rs]) => [id, JSON.stringify({ ...envelope, records: rs })])));
     if (gate instanceof Response) return gate;
-    return upload(c, gate, "/v1/ingest", { ...body, records });
+    return upload(c, [...bySession.keys()], gate, "/v1/ingest", { ...envelope, records });
   });
 
   // List and search: only sessions the caller may read. Filtering after the fact means a page can come back short.

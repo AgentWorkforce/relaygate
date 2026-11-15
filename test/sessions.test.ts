@@ -165,6 +165,27 @@ describe("Sessions proxy: review regressions", () => {
     expect(w.store.session("s-fail")).toBeUndefined();
   });
 
+  it("a failed upload never releases a session another upload filled", async () => {
+    const store = new Store(":memory:");
+    const a = store.createAgent("local-a", 11, "local", undefined);
+    store.claimSessions(["s1"], a.id, 11);
+    store.confirmSessions(["s1"]);
+    store.releaseSessions(["s1"], a.id);
+    expect(store.session("s1")?.owner).toBe(a.id);
+  });
+
+  it("the classifier sees top-level fields too", async () => {
+    const w = await world(policy([], [], ["s-local"]));
+    const turns = await w.call("POST", "/sessions/v1/sessions/s-local/turns", w.guest, { note: "ssn 123-45-6789", turns: [{ turnIndex: 1, role: "assistant", content: "ok" }] });
+    expect(turns.body.error.code).toBe("relaygate_classified");
+    const ingest = await w.call("POST", "/sessions/v1/ingest", w.guest, {
+      machine: { hostname: "ssn 123-45-6789" },
+      batchId: "b",
+      records: [{ v: 1, kind: "turn", source: "cli", sessionId: "s-local", content: "ok" }],
+    });
+    expect(ingest.body.error.code).toBe("relaygate_classified");
+  });
+
   it("claims are all or nothing", () => {
     const store = new Store(":memory:");
     const a = store.createAgent("local-a", 11, "local", undefined);
