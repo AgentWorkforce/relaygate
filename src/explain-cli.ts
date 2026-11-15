@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * relaygate explain: may X do op on Y, and why. Offline; reads a policy file (live or draft) and, optionally,
  * relaygate's database for registered agents and streams.
