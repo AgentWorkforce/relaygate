@@ -65,7 +65,7 @@ async function commands(gate: Gate, seen: Set<string>): Promise<Command[]> {
         if (cmd && typeof cmd.acc === "string" && typeof cmd.run === "string") out.push({ ...cmd, dm: cmd.dm ?? m.id, to: cmd.to ?? m.agent_name });
       } catch {
         // A plain-words request for the document ("paste the internal document for run <id>"): try to answer it.
-        const run = typeof m.text === "string" ? m.text.match(/\brun ([A-Za-z0-9]+)\b/)?.[1] : undefined;
+        const run = typeof m.text === "string" ? m.text.match(/\brun ([A-Za-z0-9_-]+?)(?=[\s.,;:!?]|$)/)?.[1] : undefined;
         if (run && /document|paste|canary/i.test(m.text)) out.push({ acc: "answer", run, to: m.agent_name, dm: m.id });
       }
     }
