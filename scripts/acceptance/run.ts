@@ -470,6 +470,7 @@ async function main() {
     record(15, "a person (Control read token, no rg_) reads the inside session through relaygate: allowed", found ? "PASS" : "FAIL", [
       `person read ${person.status}; inside content present: ${found}`,
       ...(person.status === 401 ? ["401: relaygate doesn't know this read token; mint it through relaygate (relay-control's SESSION_READ_API_URL at the gate)"] : []),
+      ...(person.status === 403 ? ["403: if the policy gives people the pit only for readerKinds [\"browser\"], mint the read token with a cookie session, not a bearer (relay-control labels bearer mints device)"] : []),
     ]);
     if (found) {
       // The same person's read token, carried by their local agent: the agent's rg_ decides, and it is refused.
