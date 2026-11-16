@@ -134,6 +134,11 @@ describe("policy", () => {
     expect(policy.ceilings).toEqual([{ gid: 44, never: [22] }]);
   });
 
+  it("reserves enrollment key ids used for relay-control identities", () => {
+    expect(() => pitPolicy((r) => ((r.enrollmentKeys[0] as Record<string, unknown>).id = "device:desktop"))).toThrow(/reserved/);
+    expect(() => pitPolicy((r) => ((r.enrollmentKeys[0] as Record<string, unknown>).id = "control"))).toThrow(/reserved/);
+  });
+
   it("rejects ACLs and ceilings naming unknown groups", () => {
     expect(() => pitPolicy((r) => (r.streamDefaults[0]!.acl = [{ gid: 99, perm: "r" }]))).toThrow(/gid 99/);
     expect(() => pitPolicy((r) => (r.ceilings = [{ gid: 44, never: [98] }]))).toThrow(/gid 98/);
@@ -450,6 +455,21 @@ describe("stream registration with ACLs", () => {
 });
 
 describe("database from build 1", () => {
+  it("reads agents from an unmigrated database opened read-only (explain CLI)", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const { mkdtempSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const path = join(mkdtempSync(join(tmpdir(), "rg-")), "old.db");
+    const old = new DatabaseSync(path);
+    old.exec(`CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, key_id TEXT NOT NULL, recovery_hash TEXT, created_at TEXT NOT NULL);
+      INSERT INTO agents VALUES ('ag_1', 'local-1', 11, 'local', NULL, 'x');`);
+    old.close();
+    const store = new Store(path, { readOnly: true });
+    expect(store.agentByName("local-1")).toMatchObject({ gid: 11, guest: false, groups: null });
+    store.close();
+  });
+
   it("adds the new columns to an existing database", async () => {
     const { DatabaseSync } = await import("node:sqlite");
     const { mkdtempSync } = await import("node:fs");

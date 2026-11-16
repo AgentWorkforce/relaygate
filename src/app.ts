@@ -59,7 +59,7 @@ export function deny(c: Context, status: 400 | 401 | 403 | 404 | 409 | 503, erro
 
 export function principalFor(agent: Agent, policy: Policy): Principal {
   const key = policy.enrollmentKeys.find((k) => k.id === agent.keyId);
-  return { agentId: agent.id, gid: agent.gid, groups: key?.groups ?? [] };
+  return { agentId: agent.id, gid: agent.gid, groups: key?.groups ?? agent.groups ?? [] };
 }
 
 /** A guest agent, by the key it enrolled with now or the flag recorded when it registered. */
@@ -245,8 +245,62 @@ export function createApp(deps: Deps) {
     }
   };
 
+  /** Longest a device-enrolled agent's token lives before the desktop must register again (docs/contract.md). */
+  const DEVICE_TOKEN_MAX_MS = 24 * 3600 * 1000;
+
+  /** POST /v1/register with a person's device token: identified by relay-control, grouped by controlPrincipals. */
+  const registerWithDevice = async (c: Context<Env>, deviceToken: string) => {
+    const control = deps.control!;
+    const policy = deps.policy();
+    let identity;
+    try {
+      identity = await control.identify(deviceToken);
+    } catch (error) {
+      if (error instanceof ControlUnavailable) return deny(c, 503, "relaygate_unavailable");
+      throw error;
+    }
+    const refuse = (status: 401 | 403 | 409, error: string, reason: string, extra: Record<string, unknown> = {}) => {
+      store.audit({ agentId: null, action: "register", op: null, resourceKind: "agent", resourceId: identity ? `ctl:${identity.userId}` : null, decision: "deny", stage: "registration", reason });
+      return deny(c, status, error, extra);
+    };
+    if (!identity) return refuse(401, "relaygate_unauthenticated", "device_token_invalid");
+    if (!identity.scopes.includes("cli:auth")) return refuse(403, "relaygate_denied", "device_token_no_cli_auth", { detail: "the device token needs cli:auth" });
+    const rule = matchControlRule(identity, policy);
+    if (!rule) return refuse(403, "relaygate_denied", "no_control_rule", { detail: "no controlPrincipals rule matches this person" });
+    const parsed = RegisterBody.safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return deny(c, 400, "relaygate_bad_request", { detail: parsed.error.issues[0]?.message });
+    const { name, recovery } = parsed.data;
+    if (rule.namePrefix && !name.startsWith(rule.namePrefix)) return refuse(403, "relaygate_name_scope", "name_scope");
+    const keyId = `device:${identity.userId}`;
+    const expiresAt = Math.min(now() + DEVICE_TOKEN_MAX_MS, identity.expiresAt ?? Infinity);
+    const answer = (agentId: string, gid: number, token: string) =>
+      c.json({ agent_id: agentId, gid, token, expires_at: new Date(expiresAt).toISOString(), user_id: identity!.userId });
+
+    const existing = store.agentByName(name);
+    if (existing) {
+      // Only the same person, with the recovery proof, gets an existing name back.
+      const recovered =
+        existing.keyId === keyId && recovery !== undefined && existing.recoveryHash !== null && sameHash(existing.recoveryHash, sha256(recovery));
+      if (!recovered) return refuse(409, "relaygate_name_taken", "name_taken");
+      store.revokeTokens(existing.id);
+      deps.onTokensRevoked?.();
+      // The person's current rule decides the group (their role or the policy may have changed).
+      store.setAgentGroups(existing.id, rule.gid, rule.groups);
+      const token = store.issueToken(existing.id, expiresAt);
+      store.audit({ agentId: existing.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: `device_recovered:${identity.userId}` });
+      await enrollUpstream({ ...existing, gid: rule.gid, groups: rule.groups });
+      return answer(existing.id, rule.gid, token);
+    }
+    const agent = store.createAgent(name, rule.gid, keyId, recovery, false, rule.groups);
+    const token = store.issueToken(agent.id, expiresAt);
+    store.audit({ agentId: agent.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: `device:${identity.userId}` });
+    await enrollUpstream(agent);
+    return answer(agent.id, rule.gid, token);
+  };
+
   app.post("/v1/register", async (c) => {
     const key = bearer(c);
+    if (key && deps.control && controlTokenKind(key) === "device") return registerWithDevice(c, key);
     const policy = deps.policy();
     const matches: EnrollmentKey[] = key ? policy.enrollmentKeys.filter((k) => sameHash(k.sha256, sha256(key))) : [];
     const enrollment = matches.find((k) => keyUsable(k, now()));
@@ -272,6 +326,8 @@ export function createApp(deps: Deps) {
         existing.guest = true;
       }
       const recovered =
+        // A desktop-enrolled agent belongs to its person: only their device token recovers it.
+        !existing.keyId.startsWith("device:") &&
         existing.gid === enrollment.gid &&
         existing.guest === enrollment.guest &&
         recovery !== undefined &&

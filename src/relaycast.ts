@@ -26,7 +26,9 @@ const MESSAGES: Record<string, string> = {
 /** Errors on proxied routes use Relaycast's shape, so SDK clients surface relaygate's code and message. */
 export function deny(c: Context, status: 400 | 401 | 403 | 404 | 409 | 413 | 415 | 502 | 503, code: string, extra: Record<string, unknown> = {}) {
   const detail = typeof extra.detail === "string" ? `: ${extra.detail}` : "";
-  return c.json({ ok: false, error: { code, message: `${MESSAGES[code] ?? code}${detail}` }, ...extra }, status);
+  // relaygate couldn't decide (classifier, relay-control, an upstream): worth retrying shortly.
+  const headers = status === 503 || status === 502 ? { "retry-after": "1" } : undefined;
+  return c.json({ ok: false, error: { code, message: `${MESSAGES[code] ?? code}${detail}` }, ...extra }, status, headers);
 }
 
 export interface RelaycastConfig {
@@ -50,6 +52,8 @@ export class UpstreamError extends Error {
 interface UpstreamResponse {
   status: number;
   body: unknown;
+  /** Retry-After from Relaycast (rate limits, overload), passed back to the caller. */
+  retryAfter?: string;
 }
 
 export class RelaycastUpstream {
@@ -80,7 +84,7 @@ export class RelaycastUpstream {
     } catch {
       parsed = { ok: false, error: { code: "upstream_not_json" } };
     }
-    return { status: res.status, body: parsed };
+    return { status: res.status, body: parsed, retryAfter: res.headers.get("retry-after") ?? undefined };
   }
 
   /** The agent's upstream at_live_ token, registering the agent upstream on first use. */
@@ -156,8 +160,8 @@ export class RelaycastUpstream {
   }
 
   /** Calls Relaycast with the workspace key (only for reads relaygate filters itself). */
-  asWorkspace(method: string, path: string): Promise<UpstreamResponse> {
-    return this.raw(method, path, this.cfg.workspaceKey);
+  asWorkspace(method: string, path: string, body?: unknown): Promise<UpstreamResponse> {
+    return this.raw(method, path, this.cfg.workspaceKey, body);
   }
 }
 
@@ -212,7 +216,7 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
 
   const denied = (c: Ctx, op: Op, id: string) => deny(c, 403, "relaygate_denied", { op, resource: id });
 
-  const pass = (c: Ctx, r: UpstreamResponse) => c.json(r.body as object, r.status as 200);
+  const pass = (c: Ctx, r: UpstreamResponse) => c.json(r.body as object, r.status as 200, r.retryAfter ? { "retry-after": r.retryAfter } : undefined);
 
   const forward = async (c: Ctx, method: string, path: string, body?: unknown) => {
     try {
@@ -335,6 +339,92 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
     const res = await upstream.asWorkspace("GET", `/v1/agents/${encodeURIComponent(name)}`).catch(() => ({ status: 502, body: { ok: false, error: { code: "relaygate_upstream_unavailable" } } }));
     return pass(c, res);
   });
+
+  // --- self status and removal (Relaycast does these with the workspace key) ----------------------------
+  app.patch("/v1/agent", async (c) => {
+    const body = await jsonBody(c);
+    if (!body) return deny(c, 400, "relaygate_bad_request", { detail: "JSON body required" });
+    const allowed: Record<string, unknown> = {};
+    for (const k of ["status", "persona", "metadata", "skills"]) if (k in body) allowed[k] = body[k];
+    if (allowed.metadata && typeof allowed.metadata === "object" && !Array.isArray(allowed.metadata)) {
+      const metadata = { ...(allowed.metadata as Record<string, unknown>) };
+      delete metadata.relaygate;
+      allowed.metadata = metadata;
+    }
+    const name = c.get("agent").name;
+    audit(c, "agent.update", "w", `relaycast:agent/${name}`, "allow", null, Object.keys(allowed).join(",") || "nothing");
+    try {
+      await upstream.agentToken(c.get("agent"));
+      return pass(c, await upstream.asWorkspace("PATCH", `/v1/agents/${encodeURIComponent(name)}`, allowed));
+    } catch {
+      return deny(c, 502, "relaygate_upstream_unavailable");
+    }
+  });
+
+  app.delete("/v1/agent", async (c) => {
+    const agent = c.get("agent");
+    let res: UpstreamResponse;
+    try {
+      res = await upstream.asWorkspace("DELETE", `/v1/agents/${encodeURIComponent(agent.name)}`);
+    } catch {
+      return deny(c, 502, "relaygate_upstream_unavailable");
+    }
+    if (res.status >= 200 && res.status < 300) {
+      // Gone upstream: its relaygate tokens and sockets go too. The name stays reserved for its owner.
+      store.deleteUpstreamAgent(agent.id);
+      store.revokeTokens(agent.id);
+      deps.onTokensRevoked?.();
+    }
+    audit(c, "agent.delete", "w", `relaycast:agent/${agent.name}`, res.status < 300 ? "allow" : "deny", null, `upstream:${res.status}`);
+    return pass(c, res);
+  });
+
+  // --- the delivery queue (the desktop broker's intake) ---------------------------------------------------
+  // Each item is placed by its channel: a channel the caller may read, or a 1:1 DM (the caller's own inbox).
+  // Anything else is never returned, and is failed upstream so it isn't redelivered.
+  app.get("/v1/deliveries", async (c) => {
+    const res = await forward(c, "GET", pathWithQuery(c));
+    if (res.status !== 200) return pass(c, res);
+    const items = asArray(dataOf(res.body));
+    const principal = c.get("principal");
+    const me = c.get("agent").name;
+    // Channel names, looked up once and only if an item needs one. A failed lookup aborts the whole answer
+    // (nothing is failed upstream): only a successful lookup can establish that an item is not readable.
+    let names: Map<string, string> | undefined;
+    if (items.some((i) => typeof i.channel_id === "string" && !i.channel_id.startsWith("dmch_"))) {
+      const list = await forward(c, "GET", "/v1/channels");
+      if (list.status !== 200 || !Array.isArray(dataOf(list.body))) return pass(c, list.status === 200 ? { status: 502, body: { ok: false, error: { code: "relaygate_upstream_unavailable" } } } : list);
+      names = new Map(asArray(dataOf(list.body)).flatMap((ch) => (typeof ch.id === "string" && typeof ch.name === "string" ? [[ch.id, ch.name] as [string, string]] : [])));
+    }
+    const channelName = async (id: string) => names?.get(id);
+    const kept: Array<Record<string, unknown>> = [];
+    const refused: string[] = [];
+    for (const item of items) {
+      const channelId = typeof item.channel_id === "string" ? item.channel_id : "";
+      let stream: string | undefined;
+      if (channelId.startsWith("dmch_")) stream = inboxStream(me);
+      else if (channelId) {
+        const name = await channelName(channelId);
+        if (name && !isDmChannelName(name)) stream = channelStream(name);
+      }
+      if (stream && canRead(deps, principal, stream)) kept.push(item);
+      else if (typeof item.id === "string") refused.push(item.id);
+    }
+    for (const id of refused) {
+      await forward(c, "POST", `/v1/deliveries/${encodeURIComponent(id)}/fail`, { error: "relaygate_denied", retryable: false });
+    }
+    audit(c, "deliveries.list", "r", null, "allow", "mode", `kept:${kept.length},refused:${refused.length}`);
+    return c.json({ ...(res.body as object), data: kept }, 200);
+  });
+  for (const verb of ["ack", "fail", "defer"] as const) {
+    app.post(`/v1/deliveries/:id/${verb}`, async (c) => {
+      const id = c.req.param("id");
+      if (!MSG_ID.test(id)) return deny(c, 400, "relaygate_bad_request", { detail: "invalid delivery id" });
+      const body = verb === "ack" ? {} : ((await jsonBody(c)) ?? {});
+      // Relaycast scopes these to the caller's own deliveries (404 for anyone else's).
+      return pass(c, await forward(c, "POST", `/v1/deliveries/${encodeURIComponent(id)}/${verb}`, body));
+    });
+  }
 
   // --- channels --------------------------------------------------------------------------------------------
   app.get("/v1/channels", async (c) => {
