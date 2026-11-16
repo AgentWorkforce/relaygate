@@ -422,6 +422,23 @@ enrollment key never recovers a desktop-enrolled or launched agent.
 at `/v1/register` (`403 relaygate_name_scope`), for names a control plane
 registers server-side (e.g. `["control-"]`). `ctl:` is always reserved.
 
+### Person identities
+
+`"personNames": {"prefix": "person-", "hashLength": 16}` gives each
+relay-control user one person identity, named `<prefix><first hashLength hex
+of sha256(userId)>`:
+
+- Only that user enrols it, with their device token, whatever their rule's
+  `namePrefix` or `reservedNamePrefixes` say. Every other registration of a
+  name with the prefix (another person, a launch credential, an enrollment
+  key) answers `403 relaygate_name_scope`.
+- It is one identity across their computers. Each computer registers with its
+  own recovery proof and gets its own token; registering again from a computer
+  rotates only that computer's token (registering without a proof rotates the
+  tokens issued without one).
+- Other desktop agent names keep the usual rule: one recovery proof, and a
+  second computer gets `409 relaygate_name_taken`.
+
 ### Agent status and removal
 
 ```

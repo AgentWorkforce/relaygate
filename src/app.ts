@@ -7,7 +7,7 @@ import { mountNodeToken } from "./realtime.js";
 import { adoptSessions, mountSessions, sessionsCors, type SessionsConfig } from "./sessions.js";
 import { ControlUnavailable, controlPrincipal, controlTokenKind, matchControlRule, type ControlAuth } from "./control.js";
 import { explain, runCases, CaseSchema, QuerySchema } from "./explain.js";
-import { keyUsable, parsePolicy, policyVersion, type EnrollmentKey, type Policy } from "./policy.js";
+import { keyUsable, parsePolicy, personNameFor, policyVersion, type EnrollmentKey, type Policy } from "./policy.js";
 import { sameHash, sha256, type Agent, type Store } from "./store.js";
 import type { PolicyStatus } from "./policy-source.js";
 
@@ -266,6 +266,8 @@ export function createApp(deps: Deps) {
 
   /** Names the policy reserves for someone else (a control plane's server-side identities). */
   const reservedName = (name: string, policy: Policy) => policy.reservedNamePrefixes.some((p) => name.startsWith(p));
+  /** A person-identity name (policy personNames) belongs to one relay-control user; nobody else enrols one. */
+  const personPrefixed = (name: string, policy: Policy) => !!policy.personNames && name.startsWith(policy.personNames.prefix);
 
   /**
    * POST /v1/register with a relay-control credential, identified by relay-control and grouped by
@@ -295,8 +297,12 @@ export function createApp(deps: Deps) {
     const parsed = RegisterBody.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return deny(c, 400, "relaygate_bad_request", { detail: parsed.error.issues[0]?.message });
     const { name, recovery } = parsed.data;
-    if (rule.namePrefix && !name.startsWith(rule.namePrefix)) return refuse(403, "relaygate_name_scope", "name_scope");
-    if (reservedName(name, policy)) return refuse(403, "relaygate_name_scope", "name_reserved");
+    // The person's own identity: theirs from any computer, whatever their rule's name prefix.
+    const ownPerson = !launch && name === personNameFor(policy, identity.userId);
+    const binding = recovery === undefined ? null : sha256(recovery);
+    if (!ownPerson && personPrefixed(name, policy)) return refuse(403, "relaygate_name_scope", "person_name_not_own", { detail: "this name is another person's identity" });
+    if (!ownPerson && rule.namePrefix && !name.startsWith(rule.namePrefix)) return refuse(403, "relaygate_name_scope", "name_scope");
+    if (!ownPerson && reservedName(name, policy)) return refuse(403, "relaygate_name_scope", "name_reserved");
     // A launch credential enrols exactly the agent it names.
     if (launch && name !== identity.agentName) return refuse(403, "relaygate_name_scope", "launch_name_mismatch", { detail: "name must equal the launch credential's agent_name" });
     const keyId = `${launch ? "launch" : "device"}:${identity.userId}`;
@@ -310,21 +316,23 @@ export function createApp(deps: Deps) {
     if (existing) {
       // Only the same person gets an existing name back: with the recovery proof, or (a relaunch) with a fresh
       // single-use launch credential naming that very agent.
+      // A person identity is one name across their computers: each computer's recovery proof rotates only its own token.
       const recovered =
         existing.keyId === keyId &&
-        (launch || (recovery !== undefined && existing.recoveryHash !== null && sameHash(existing.recoveryHash, sha256(recovery))));
+        (launch || ownPerson || (recovery !== undefined && existing.recoveryHash !== null && sameHash(existing.recoveryHash, sha256(recovery))));
       if (!recovered) return refuse(409, "relaygate_name_taken", "name_taken");
-      store.revokeTokens(existing.id);
+      if (ownPerson) store.revokeBoundTokens(existing.id, binding);
+      else store.revokeTokens(existing.id);
       deps.onTokensRevoked?.();
       // The person's current rule decides the group (their role or the policy may have changed).
       store.setAgentGroups(existing.id, rule.gid, rule.groups);
-      const token = store.issueToken(existing.id, expiresAt);
+      const token = store.issueToken(existing.id, expiresAt, ownPerson ? (binding ?? undefined) : undefined);
       store.audit({ agentId: existing.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: `device_recovered:${identity.userId}` });
       await enrollUpstream({ ...existing, gid: rule.gid, groups: rule.groups });
       return answer(existing.id, rule.gid, token);
     }
     const agent = store.createAgent(name, rule.gid, keyId, recovery, false, rule.groups);
-    const token = store.issueToken(agent.id, expiresAt);
+    const token = store.issueToken(agent.id, expiresAt, ownPerson ? (binding ?? undefined) : undefined);
     store.audit({ agentId: agent.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: `device:${identity.userId}` });
     await enrollUpstream(agent);
     return answer(agent.id, rule.gid, token);
@@ -346,7 +354,7 @@ export function createApp(deps: Deps) {
     const parsed = RegisterBody.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return deny(c, 400, "relaygate_bad_request", { detail: parsed.error.issues[0]?.message });
     const { name, recovery } = parsed.data;
-    if ((enrollment.namePrefix && !name.startsWith(enrollment.namePrefix)) || reservedName(name, policy)) {
+    if ((enrollment.namePrefix && !name.startsWith(enrollment.namePrefix)) || reservedName(name, policy) || personPrefixed(name, policy)) {
       store.audit({ agentId: null, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "deny", stage: "registration", reason: "name_scope" });
       return deny(c, 403, "relaygate_name_scope");
     }
