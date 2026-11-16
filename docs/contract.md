@@ -636,8 +636,8 @@ strong as the network rule that Sessions accepts traffic from relaygate alone
 | `POST /sessions/v1/delivery/sessions/selection` | `w` on every session it names (choosing what syncs) |
 | `POST /sessions/v1/auth/token/revoke`, `GET /sessions/healthz` | no principal needed (revoking is always safe) |
 | `POST /sessions/v1/ingest` | `w` on every session the batch names; all or nothing. Each record gets a `relaygate:agent:<name>` tag (client `relaygate:` tags are dropped) and, where it names one, `sessionOwner` set to the agent |
-| `GET /sessions/v1/sessions` | filtered to sessions the caller may read; the cursor passes through |
-| `GET /sessions/v1/sessions/:id/{events,turns,metadata,thread,catalog,timing,analysis,brief}` | `r` on the session |
+| `GET /sessions/v1/sessions` | filtered to sessions the caller may read; the cursor passes through; labeled sessions carry `relaygate` (see "Group labels") |
+| `GET /sessions/v1/sessions/:id/{events,turns,metadata,thread,catalog,timing,analysis,brief}` | `r` on the session; `metadata` and `catalog` of a labeled session carry `relaygate` |
 | `GET /sessions/v1/events?session=<id>` | one `session`, `r` on it |
 | `GET /sessions/v1/events?q=<text>` | transcript search, filtered to events of sessions the caller may read |
 
@@ -654,6 +654,40 @@ answer `404 relaygate_route_not_proxied`. Pit agents
 run headless on Linux servers, so their sessions come from a headless uploader
 on that server, authenticated with the agent's `rg_` token, not from the
 desktop app.
+
+### Group labels
+
+A deployment can name its groups for people reading sessions, so a dashboard
+can badge, say, every session the pit group owns. Labels are display only:
+they grant nothing and change no decision. No group has a label unless the
+policy gives it one.
+
+```
+"groupLabels": {"22": {"label": "pit", "description": "Agents inside the boundary"}}
+```
+
+Keys are gids in decimal, each one a group the policy defines. `label` is 1 to
+24 characters (letters, digits, space, `.`, `_`, `-`; it starts with a letter
+or digit and doesn't end in a space); `description` is optional, at most 200
+characters, and is not sent to readers. Both the loader and
+`POST /admin/v1/policy/validate` refuse anything else.
+
+On reads that pass the check, relaygate adds the owning group and its label to
+each session a labeled group owns:
+
+- every session in `GET /sessions/v1/sessions`;
+- the top-level object of `GET /sessions/v1/sessions/:id/metadata` and `.../catalog`.
+
+```
+{"sessionId": "...", ..., "relaygate": {"gid": 22, "label": "pit"}}
+```
+
+Nothing else changes: a session whose group has no label gets no `relaygate`
+key, other views are untouched, and a single-session view without a label
+passes byte for byte. The owner is never named. A `relaygate` key that comes
+from Sessions itself is dropped, so a reader can trust that only relaygate
+wrote it. A caller only ever sees the label of a session it may read, and a
+session that never came through relaygate has no owning group, so no label.
 
 ## Control principals
 

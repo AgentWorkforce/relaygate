@@ -10,8 +10,9 @@ import { sha256, Store } from "../src/store.js";
 const KEYS = { local: "enroll-local-0000000000000000", pit: "enroll-pit-00000000000000000000", guest: "enroll-guest-0000000000000000000" };
 const SERVICE = "rth_st_service";
 
-function policy(shared: string[] = [], mistaken: string[] = [], writable: string[] = []) {
+function policy(shared: string[] = [], mistaken: string[] = [], writable: string[] = [], extra: Record<string, unknown> = {}) {
   return parsePolicy({
+    ...extra,
     groups: [
       { gid: 11, name: "local" },
       { gid: 22, name: "pit" },
@@ -56,6 +57,8 @@ function harness(pol = policy(), opts: { token?: string } = { token: SERVICE }) 
   upstream.post("/v1/ingest", (c) => c.json({ received: 1 }));
   upstream.get("/v1/sessions", (c) => c.json({ sessions: [{ sessionId: "s-local" }, { sessionId: "s-pit" }, { sessionId: "s-elsewhere" }], nextCursor: "c2" }));
   upstream.get("/v1/sessions/:id/events", (c) => c.json({ events: [{ sessionId: c.req.param("id") }] }));
+  upstream.get("/v1/sessions/:id/metadata", (c) => c.text(`{"sessionId":"${c.req.param("id")}",  "title":"t"}`, 200, { "content-type": "application/json" }));
+  upstream.get("/v1/sessions/:id/catalog", (c) => c.json({ catalog: { title: "t" }, parents: [], children: [], relaygate: { gid: 33, label: "forged" } }));
   upstream.get("/v1/events", (c) =>
     c.json({ events: c.req.query("q") ? [{ sessionId: "s-local", text: "a" }, { sessionId: "s-pit", text: "b" }, { text: "no session" }] : [] }),
   );
@@ -174,6 +177,49 @@ describe("Sessions proxy: reads", () => {
     const w = await world();
     expect((await w.call("POST", "/sessions/v1/turns/batches", w.local, {})).body.error.code).toBe("relaygate_route_not_proxied");
     expect((await w.call("GET", "/sessions/v1/sessions", "rg_nope")).status).toBe(401);
+  });
+});
+
+describe("Sessions proxy: group labels", () => {
+  const labeled = () => policy([], [], [], { groupLabels: { "22": { label: "pit", description: "Pit crew" } } });
+
+  it("labels each readable session its labeled group owns, and only those", async () => {
+    const w = await world(labeled());
+    const pit = (await w.call("GET", "/sessions/v1/sessions?limit=10", w.pit)).body;
+    expect(pit.sessions).toEqual([{ sessionId: "s-local" }, { sessionId: "s-pit", relaygate: { gid: 22, label: "pit" } }]);
+    expect(pit.nextCursor).toBe("c2");
+    // A local agent never sees the pit session, so it never sees the label either.
+    expect((await w.call("GET", "/sessions/v1/sessions", w.local)).body.sessions).toEqual([{ sessionId: "s-local" }]);
+  });
+
+  it("labels one session's metadata and catalog; other views and unlabeled sessions pass byte for byte", async () => {
+    const w = await world(labeled());
+    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/metadata", w.pit)).body).toEqual({ sessionId: "s-pit", title: "t", relaygate: { gid: 22, label: "pit" } });
+    const raw = await w.app.request("/sessions/v1/sessions/s-local/metadata", { headers: { authorization: `Bearer ${w.pit}` } });
+    expect(await raw.text()).toBe('{"sessionId":"s-local",  "title":"t"}');
+    // A relaygate key from upstream is never passed on as if relaygate said it.
+    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/catalog", w.pit)).body.relaygate).toEqual({ gid: 22, label: "pit" });
+    expect((await w.call("GET", "/sessions/v1/sessions/s-local/catalog", w.pit)).body).not.toHaveProperty("relaygate");
+    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/events", w.pit)).body).toEqual({ events: [{ sessionId: "s-pit" }] });
+    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/metadata", w.local)).status).toBe(403);
+  });
+
+  it("without groupLabels nothing is labeled", async () => {
+    const w = await world();
+    expect((await w.call("GET", "/sessions/v1/sessions", w.pit)).body.sessions).toEqual([{ sessionId: "s-local" }, { sessionId: "s-pit" }]);
+    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/metadata", w.pit)).body).not.toHaveProperty("relaygate");
+  });
+
+  it("validates labels: known groups, short plain text", () => {
+    const base = { groups: [{ gid: 22, name: "pit" }], enrollmentKeys: [] };
+    expect(parsePolicy({ ...base, groupLabels: { "22": { label: "pit" } } }).groupLabels).toEqual({ "22": { label: "pit" } });
+    expect(parsePolicy(base).groupLabels).toBeUndefined();
+    expect(() => parsePolicy({ ...base, groupLabels: { "33": { label: "admins" } } })).toThrow(/groupLabels \(gid 33\)/);
+    for (const label of ["", " pit", "pit ", "x".repeat(25), "<b>pit</b>", "pit\n"]) {
+      expect(() => parsePolicy({ ...base, groupLabels: { "22": { label } } })).toThrow();
+    }
+    expect(() => parsePolicy({ ...base, groupLabels: { "022": { label: "pit" } } })).toThrow();
+    expect(() => parsePolicy({ ...base, groupLabels: { "22": { label: "pit", color: "red" } } })).toThrow();
   });
 });
 

@@ -4,7 +4,7 @@ import { bodyLimit } from "hono/body-limit";
 import { decideResource, type Deps, type Env, type ResolvedResource } from "./app.js";
 import { matchControlRule, takeReaderKind } from "./control.js";
 import { check, type AclEntry, type Op } from "./mode.js";
-import type { Policy } from "./policy.js";
+import { groupLabel, type Policy } from "./policy.js";
 import { deny } from "./relaycast.js";
 import type { Agent } from "./store.js";
 
@@ -115,6 +115,8 @@ export function sessionsAtRoot(fetchFn: (req: Request) => Response | Promise<Res
 
 const SESSION_ID = /^[A-Za-z0-9._:@-]{1,256}$/;
 const READ_VIEWS = ["events", "turns", "metadata", "thread", "catalog", "timing", "analysis", "brief", "summary"] as const;
+/** Single-session views that describe the session itself, so they carry its group label (docs/contract.md, "Group labels"). */
+const LABELED_VIEWS = new Set<string>(["metadata", "catalog"]);
 
 /** A session's effective owner, group, mode and ACL. */
 export function resolveSession(id: string, row: { owner: string; gid: number }, policy: Policy): ResolvedResource {
@@ -199,6 +201,22 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   const upstreamPath = (c: Ctx) => {
     const u = new URL(c.req.url);
     return `${u.pathname.replace(/^\/sessions/, "")}${u.search}`;
+  };
+
+  /**
+   * The owning group's display label for a session, as `relaygate: {gid, label}` (docs/contract.md, "Group labels").
+   * Only for sessions relaygate owns whose group the policy labels; never names the owner.
+   */
+  const annotation = (id: string, policy: Policy): { gid: number; label: string } | undefined => {
+    const row = store.session(id);
+    const label = row && groupLabel(policy, row.gid);
+    return row && label ? { gid: row.gid, label } : undefined;
+  };
+  /** A session object with relaygate's annotation set, and any upstream `relaygate` key dropped (only relaygate says it). */
+  const annotate = (s: Record<string, unknown>, id: string, policy: Policy): Record<string, unknown> => {
+    const { relaygate: _forged, ...rest } = s;
+    const a = annotation(id, policy);
+    return a ? { ...rest, relaygate: a } : rest;
   };
 
   const canRead = (c: Ctx, id: string): boolean => {
@@ -316,13 +334,28 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     const res = await upstream(c, cfg.readUrl, "GET", upstreamPath(c));
     if (res instanceof Response || res.status !== 200) return pass(res);
     const page = json(res) ?? {};
-    const sessions = (Array.isArray(page.sessions) ? page.sessions : []).filter((s: any) => typeof s?.sessionId === "string" && canRead(c, s.sessionId));
+    const policy = deps.policy();
+    const sessions = (Array.isArray(page.sessions) ? page.sessions : [])
+      .filter((s: any) => typeof s?.sessionId === "string" && canRead(c, s.sessionId))
+      .map((s: Record<string, unknown>) => annotate(s, s.sessionId as string, policy));
     audit(c, "session.list", "r", null, "allow", "mode", `filtered:${sessions.length}`);
     return pass(res, { ...page, sessions });
   });
 
   for (const view of READ_VIEWS) {
-    app.get(`/sessions/v1/sessions/:id/${view}`, async (c) => gateRead(c, c.req.param("id")) ?? pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c))));
+    app.get(`/sessions/v1/sessions/:id/${view}`, async (c) => {
+      const id = c.req.param("id");
+      const refused = gateRead(c, id);
+      if (refused) return refused;
+      const res = await upstream(c, cfg.readUrl, "GET", upstreamPath(c));
+      if (!LABELED_VIEWS.has(view) || res instanceof Response || res.status !== 200) return pass(res);
+      // One session's metadata and catalog carry its group label; otherwise the body passes byte for byte.
+      const body = json(res);
+      if (!body || typeof body !== "object" || Array.isArray(body)) return pass(res);
+      const policy = deps.policy();
+      if (!("relaygate" in body) && !annotation(id, policy)) return pass(res);
+      return pass(res, annotate(body, id, policy));
+    });
   }
 
   // Events inside one session (gated), or a workspace transcript search (`q`), filtered to readable sessions.
