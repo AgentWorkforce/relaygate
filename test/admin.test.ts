@@ -61,3 +61,77 @@ describe("GET /admin/v1/audit", () => {
     expect(row.policy_version).toBe(before);
   });
 });
+
+describe("admin API for relay-control (R2)", () => {
+  const GUEST = "enroll-guest-00000000000000000000";
+  const pol = () =>
+    parsePolicy({
+      groups: [{ gid: 1, name: "a" }, { gid: 2, name: "b" }, { gid: 4, name: "people" }],
+      enrollmentKeys: [
+        { id: "a", gid: 1, sha256: sha256(KEY) },
+        { id: "guest-1", gid: 2, guest: true, namePrefix: "g-", expiresAt: "2099-01-01T00:00:00Z", sha256: sha256(GUEST) },
+        { id: "unused", gid: 1, revoked: true, sha256: sha256("enroll-unused-000000000000000000") },
+      ],
+      streamDefaults: [{ prefix: "x:", gid: 2, mode: "660", acl: [{ gid: 4, perm: "r" }] }],
+      controlPrincipals: [
+        { match: { as: ["agent"] }, gid: 1 },
+        { match: { kinds: ["read"], readerKinds: ["browser"] }, gid: 4 },
+        { match: {}, gid: 1 },
+      ],
+    });
+  const harness = () => {
+    let t = Date.parse("2026-11-16T00:00:00Z");
+    const p = pol();
+    const app = createApp({ store: new Store(":memory:"), policy: () => p, classifier: () => new RuleClassifier([]), adminToken: ADMIN, now: () => t });
+    const call = async (method: string, path: string, token: string, body?: unknown) => {
+      const res = await app.request(path, { method, headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: body && JSON.stringify(body) });
+      return { status: res.status, body: (await res.json()) as any };
+    };
+    return { call, p, advance: (ms: number) => (t += ms) };
+  };
+
+  it("validates a draft with the same rules relaygate loads with, saying where it is wrong", async () => {
+    const h = harness();
+    const good = await h.call("POST", "/admin/v1/policy/validate", ADMIN, { policy: h.p });
+    expect(good.body).toMatchObject({ ok: true });
+    expect(good.body.hash).toMatch(/^[0-9a-f]{12}$/);
+    const bad = await h.call("POST", "/admin/v1/policy/validate", ADMIN, { policy: { groups: [{ gid: 1, name: "a" }], enrollmentKeys: [{ id: "k", gid: 1, sha256: "nope" }] } });
+    expect(bad.body.ok).toBe(false);
+    expect(bad.body.errors[0]).toMatchObject({ path: "enrollmentKeys.0.sha256" });
+    const unknownGid = await h.call("POST", "/admin/v1/policy/validate", ADMIN, { policy: { groups: [{ gid: 1, name: "a" }], enrollmentKeys: [{ id: "k", gid: 9, sha256: sha256("x") }] } });
+    expect(unknownGid.body).toMatchObject({ ok: false, errors: [{ message: expect.stringContaining("gid 9") }] });
+    const reserved = await h.call("POST", "/admin/v1/policy/validate", ADMIN, { policy: { groups: [{ gid: 1, name: "a" }], enrollmentKeys: [{ id: "device:u1", gid: 1, sha256: sha256("x") }] } });
+    expect(reserved.body.ok).toBe(false);
+    expect((await h.call("POST", "/admin/v1/policy/validate", ADMIN, {})).status).toBe(400);
+    expect((await h.call("POST", "/admin/v1/policy/validate", "rg_nope", { policy: h.p })).status).toBe(401);
+  });
+
+  it("lists each key with its agents, active tokens and last use, never its hash", async () => {
+    const h = harness();
+    const g = await h.call("POST", "/v1/register", GUEST, { name: "g-1" });
+    await h.call("POST", "/v1/register", GUEST, { name: "g-2" });
+    h.advance(120_000);
+    await h.call("GET", "/v1/whoami", g.body.token);
+    const keys = (await h.call("GET", "/admin/v1/keys", ADMIN)).body.keys;
+    expect(JSON.stringify(keys)).not.toContain(sha256(GUEST));
+    const guest = keys.find((k: any) => k.id === "guest-1");
+    expect(guest).toMatchObject({ gid: 2, guest: true, namePrefix: "g-", usable: true, agents: 2, activeTokens: 2, expiresAt: "2099-01-01T00:00:00Z" });
+    expect(guest.lastUsedAt).toBe("2026-11-16T00:02:00.000Z");
+    expect(keys.find((k: any) => k.id === "unused")).toMatchObject({ revoked: true, usable: false, agents: 0, activeTokens: 0, lastUsedAt: null });
+  });
+
+  it("explains a relay-control user as a dashboard person and as the agents they enrol", async () => {
+    const h = harness();
+    const ask = (control: Record<string, unknown>) => h.call("POST", "/admin/v1/explain", ADMIN, { as: { control: { userId: "u1", orgId: "o1", ...control } }, op: "r", resource: { kind: "stream", id: "x:doc" } });
+    const person = (await ask({})).body;
+    expect(person).toMatchObject({ decision: "allow", subject: { name: "ctl:u1", gid: 4 } });
+    expect(person.steps[0].detail).toContain("controlPrincipals rule 1");
+    expect((await ask({ readerKind: "mcp" })).body).toMatchObject({ decision: "deny", subject: { gid: 1 } });
+    const agent = (await ask({ kind: "device", as: "agent" })).body;
+    expect(agent).toMatchObject({ decision: "deny", subject: { name: "<agent of u1>", gid: 1 } });
+    expect(agent.steps[0].detail).toContain("controlPrincipals rule 0");
+    // Against a draft with no rule for them.
+    const none = await h.call("POST", "/admin/v1/explain", ADMIN, { policy: { ...h.p, controlPrincipals: [] }, as: { control: { userId: "u1", orgId: "o1" } }, op: "r", resource: { kind: "stream", id: "x:doc" } });
+    expect(none.body).toMatchObject({ draft: true, decision: "deny", reason: "no_control_rule" });
+  });
+});
