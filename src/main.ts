@@ -5,7 +5,7 @@ import { classifierFromPolicy, type Classifier } from "./classifier.js";
 import { loadPolicyFile, type Policy } from "./policy.js";
 import { NodeSockets } from "./realtime.js";
 import { RelaycastUpstream } from "./relaycast.js";
-import { routeSessionsHosts } from "./sessions.js";
+import { routeSessionsHosts, sessionsAtRoot } from "./sessions.js";
 import { ControlAuth } from "./control.js";
 import { SecretBox, Store } from "./store.js";
 
@@ -92,6 +92,15 @@ const fetchFn = sessions?.hosts?.length ? routeSessionsHosts(app.fetch, sessions
 const server = serve({ fetch: fetchFn, port }, (info) => {
   console.log(JSON.stringify({ msg: "relaygate listening", port: info.port, model_classifier: policy.classifier.model.enabled, relaycast: !!relaycast, sessions: !!sessions, sessions_hosts: sessions?.hosts ?? [], control_principals: !!control }));
 });
+// An internal listener serving Sessions at its root, so a control plane that requires a bare-origin Sessions URL can
+// point at relaygate (and mint read tokens through it). Keep it off any public route.
+const sessionsPort = process.env.SESSIONS_PORT ? Number(process.env.SESSIONS_PORT) : undefined;
+let sessionsServer: ReturnType<typeof serve> | undefined;
+if (sessions && sessionsPort) {
+  sessionsServer = serve({ fetch: sessionsAtRoot(app.fetch), port: sessionsPort }, (info) => {
+    console.log(JSON.stringify({ msg: "relaygate sessions listener", port: info.port }));
+  });
+}
 if (relaycast) {
   sockets = new NodeSockets(deps, relaycast);
   sockets.attach(server as unknown as import("node:http").Server);
@@ -100,6 +109,7 @@ if (relaycast) {
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     sockets?.close();
+    sessionsServer?.close();
     server.close();
     store.close();
     process.exit(0);

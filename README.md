@@ -40,6 +40,7 @@ Relaycast client's base URL at relaygate and use the `rg_` token (see
 | `RELAYGATE_SECRET` | none | At least 32 characters; seals the upstream agent and node tokens at rest. Required with `RELAYCAST_URL`. |
 | `SESSIONS_URL` | none | Turns on the Sessions proxy at `/sessions` (uploads and reads to one origin). |
 | `SESSIONS_UPLOAD_URL`, `SESSIONS_READ_URL` | `SESSIONS_URL` | Separate upload and read origins. |
+| `SESSIONS_PORT` | none | An internal listener serving Sessions at its root, for relay-control's bare-origin `SESSION_READ_API_URL` (its mint calls are allowed there). ClusterIP only, never public. |
 | `SESSIONS_HOSTS` | none | Comma-separated hosts whose requests are Sessions requests at the root path (a history origin pointed at relaygate). |
 | `SESSIONS_TOKEN` | none | Optional fallback Sessions credential for callers that send none; callers normally forward their own in `Authorization`, with their rg_ token in `X-Relaygate-Token`. |
 | `RELAYCONTROL_INTROSPECT_URL` | none | Turns on Control principals (desktop device tokens, dashboard read tokens) on Sessions routes. |
