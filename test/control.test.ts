@@ -326,16 +326,20 @@ describe("person vs agent: match.as", () => {
       ],
       controlPrincipals: [
         { match: { orgIds: ["org-1"], userIds: ["u-inside"] }, gid: 22 },
+        { match: { orgIds: ["org-1"], roles: ["owner", "admin"], as: ["person"] }, gid: 33 },
         { match: { orgIds: ["org-1"], as: ["agent"] }, gid: 11 },
-        { match: { orgIds: ["org-1"], as: ["person"] }, gid: 11, groups: [44] },
+        { match: { orgIds: ["org-1"], kinds: ["read"] }, gid: 44 },
+        { match: { orgIds: ["org-1"] }, gid: 11 },
       ],
     });
 
-  it("the same user reads the pit as a person, and the agent their desktop enrols can't", async () => {
+  it("the same user reads the pit from the dashboard, and the agent their desktop enrols can't", async () => {
     const h = harness({ policy: peoplePolicy() });
     expect((await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_inside", h.batch("pit-1"))).status).toBe(200);
     const read = (await h.mint("u-member")).body.accessToken;
     expect((await h.call("GET", "/sessions/v1/sessions/pit-1/events", read)).status).toBe(200);
+    // The device token sits where the person's agents can reach it: it gets no more than an agent.
+    expect((await h.call("GET", "/sessions/v1/sessions/pit-1/events", "sh_at_member")).status).toBe(403);
     // The person's own uploads still land in the local group.
     expect((await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", h.batch("mine-1"))).status).toBe(200);
     expect(h.store.session("mine-1")).toMatchObject({ gid: 11 });

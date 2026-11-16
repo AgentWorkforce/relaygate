@@ -656,22 +656,31 @@ wins, and a user no rule matches is refused:
 `workspaceIds`, `roles`, `userIds` and `emails`. `as` says what the credential
 stands for: `agent` when it enrols an agent at `POST /v1/register` (a device or
 launch credential), `person` everywhere else (Sessions uploads and reads,
-`/v1/check`, adoption). It lets the same user read more as a person than the
-agents they enrol, e.g. every person reads the pit while their agents stay
-local:
+`/v1/check`, adoption). Rules without `as` match both. Put `as: ["person"]` on
+rules that grant more than an agent should have (admins), so the agents those
+people enrol land in an agent rule instead.
+
+`as` separates what a credential enrols, not who presents it: relaygate can't
+tell whether a person or an agent sends a bearer token. An agent that can reach
+its person's device token (it sits on the same laptop) can drop
+`X-Relaygate-Token` and be served as that person. So grant person-only reads
+to dashboard read tokens (`kinds: ["read"]`, minted by relay-control and held
+by the browser), never to device tokens. For example, every person reads the
+pit from the dashboard while their agents stay local:
 
 ```
 "groups": [..., {"gid": 44, "name": "people"}],
 "sessionDefaults": [{"gid": 22, "mode": "660", "acl": [{"gid": 33, "perm": "r"}, {"gid": 44, "perm": "r"}]}, ...],
 "controlPrincipals": [
+  {"match": {"orgIds": ["<org>"], "emails": ["<admin>@<domain>"], "as": ["person"]}, "gid": 33},
   {"match": {"orgIds": ["<org>"], "as": ["agent"]}, "gid": 11},
-  {"match": {"orgIds": ["<org>"], "as": ["person"]}, "gid": 11, "groups": [44]}
+  {"match": {"orgIds": ["<org>"], "kinds": ["read"]}, "gid": 44},
+  {"match": {"orgIds": ["<org>"]}, "gid": 11}
 ]
 ```
 
-Rules without `as` match both, so put agent-only rules (and `as: ["person"]`
-on admin rules, if admins' agents shouldn't read everything) before the
-catch-all. A rule may also set `namePrefix`, which limits the
+The admin's own device token still reads as 33 on Sessions, for whatever can
+reach it. A rule may also set `namePrefix`, which limits the
 agent names that person's desktop may enrol (see "Enrolling with a device
 token"). A read token minted without a role never matches a rule
 that needs one; without an email it uses the email relay-control last reported
