@@ -143,7 +143,9 @@ pit sees every agent on the relay while local agents' view is unchanged:
 "streamDefaults": [{"prefix": "relaycast:agent/", "gid": 22, "mode": "040"}, ...]
 ```
 
-Entries are operator policy only (prefix defaults and overrides): `PUT
+Entries are operator policy only: an override for the exact id, or a prefix
+default that itself starts with `relaycast:agent/`. A broader default (such as
+`relaycast:`) and registered stream rows never count, and `PUT
 /v1/streams/{id}` refuses every `relaycast:agent/` id, so an agent can't show
 itself, or anyone else, to another group. Ceilings apply as usual.
 

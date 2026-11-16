@@ -1,6 +1,7 @@
 import type { Context, Hono } from "hono";
-import { decide, provenance, resolveStream, type Deps, type Env } from "./app.js";
+import { decide, longestPrefix, provenance, resolveStream, type Deps, type Env, type ResolvedStream } from "./app.js";
 import { check, type Op, type Principal } from "./mode.js";
+import type { Policy } from "./policy.js";
 import type { Agent, SecretBox, Store } from "./store.js";
 
 /**
@@ -180,6 +181,21 @@ export const inboxStream = (agentName: string) => `relaycast:inbox/${agentName}`
 export const AGENT_ENTRY_PREFIX = "relaycast:agent/";
 export const agentEntry = (agentName: string) => `${AGENT_ENTRY_PREFIX}${agentName}`;
 
+/**
+ * An agent's directory entry, from operator policy only: an override for the exact id, else the longest prefix
+ * default under `relaycast:agent/`. Registered stream rows never count (an agent could have registered one before
+ * PUT /v1/streams refused these ids), and neither does a broader default such as `relaycast:`, so visibility only
+ * widens when the operator writes a directory rule.
+ */
+export function directoryEntry(agentName: string, policy: Policy): ResolvedStream | undefined {
+  const id = agentEntry(agentName);
+  const override = policy.streamOverrides.find((o) => o.id === id);
+  if (override) return { id, owner: null, gid: override.gid, mode: override.mode, classify: override.classify, acl: override.acl, source: "override" };
+  const prefix = longestPrefix(id, policy);
+  if (!prefix || !prefix.prefix.startsWith(AGENT_ENTRY_PREFIX)) return undefined;
+  return { id, owner: null, gid: prefix.gid, mode: prefix.mode, classify: prefix.classify, acl: prefix.acl, source: "prefix" };
+}
+
 /** Relaycast stores DMs as hidden channels named dm-<pair>; they are never addressed as channels through relaygate. */
 export const isDmChannelName = (name: string) => name.startsWith("dm-") || name.startsWith("dmch_");
 
@@ -333,7 +349,7 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
     const principal = c.get("principal");
     const ceilings = deps.policy().ceilings;
     // Visibility only: `r` on the agent's directory entry shows it, and grants nothing else.
-    const entry = resolveStream(agentEntry(name), store, deps.policy());
+    const entry = directoryEntry(name, deps.policy());
     if (entry && check(principal, entry, "r", ceilings).allowed) return true;
     const stream = resolveStream(inboxStream(name), store, deps.policy());
     if (!stream) return false;

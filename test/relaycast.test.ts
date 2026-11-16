@@ -323,6 +323,32 @@ describe("Relaycast proxy: the pit rules", () => {
     expect((await h.call("PUT", `/v1/streams/${encodeURIComponent("relaycast:agent/pit-a")}`, pit, { mode: "666" })).status).toBe(403);
   });
 
+  it("only a directory rule widens visibility: a broader default or a registered row never does", async () => {
+    // A broad relaycast: default that would allow r doesn't count for directory entries (inboxes keep their own rule).
+    const broad = harness(undefined, undefined, [
+      { prefix: "relaycast:", gid: 22, mode: "040" },
+      { prefix: "relaycast:inbox/", gid: 11, mode: "660" },
+    ]);
+    const pit = await broad.token(KEYS.pit, "pit-a");
+    await broad.token(KEYS.editor, "editor-dana");
+    expect((await broad.call("GET", "/v1/agents", pit)).body.data.map((a: any) => a.name)).not.toContain("editor-dana");
+    expect((await broad.call("GET", "/v1/agents/editor-dana", pit)).status).toBe(404);
+
+    // A stream row registered for a directory id (before registration was refused) is ignored.
+    const legacy = harness();
+    const pit2 = await legacy.token(KEYS.pit, "pit-a");
+    await legacy.token(KEYS.editor, "editor-dana");
+    legacy.store.putStream({ id: "relaycast:agent/editor-dana", owner: legacy.store.agentByName("pit-a")!.id, gid: 22, mode: "666", classify: false, acl: [] });
+    expect((await legacy.call("GET", "/v1/agents/editor-dana", pit2)).status).toBe(404);
+
+    // An exact operator override does count.
+    const exact = harness();
+    exact.deps.policy().streamOverrides.push({ id: "relaycast:agent/editor-dana", gid: 22, mode: "040", classify: false, acl: [] } as never);
+    const pit3 = await exact.token(KEYS.pit, "pit-a");
+    await exact.token(KEYS.editor, "editor-dana");
+    expect((await exact.call("GET", "/v1/agents/editor-dana", pit3)).status).toBe(200);
+  });
+
   it("lists only 1:1 DM conversations", async () => {
     const h = harness();
     const local = await h.token(KEYS.local, "local-a");
