@@ -9,6 +9,7 @@ import { ControlUnavailable, controlPrincipal, controlTokenKind, matchControlRul
 import { explain, runCases, CaseSchema, QuerySchema } from "./explain.js";
 import { keyUsable, parsePolicy, policyVersion, type EnrollmentKey, type Policy } from "./policy.js";
 import { sameHash, sha256, type Agent, type Store } from "./store.js";
+import type { PolicyStatus } from "./policy-source.js";
 
 export interface Deps {
   store: Store;
@@ -27,6 +28,8 @@ export interface Deps {
   control?: ControlAuth;
   /** Called after tokens are revoked, so open sockets close at once rather than at the next revalidation. */
   onTokensRevoked?: () => void;
+  /** Where the policy comes from and what's in force, for /admin/v1/policy/status. */
+  policyStatus?: () => PolicyStatus;
 }
 
 export type Env = { Variables: { agent: Agent; principal: Principal; tokenHash: string; viaControl: boolean } };
@@ -234,6 +237,18 @@ export function createApp(deps: Deps) {
     }
   });
 
+  // No policy in force (pulling from relay-control, nothing cached yet): refuse everything, forward nothing.
+  app.use("*", async (c, next) => {
+    // Operators still see why (the status route reports the source's last error).
+    if (c.req.path === "/admin/v1/policy/status") return next();
+    try {
+      deps.policy();
+    } catch {
+      return deny(c, 503, "relaygate_unavailable", { detail: "no policy in force" });
+    }
+    await next();
+  });
+
   // An agent exists in Relaycast from the moment it registers, so others can DM it and see it before it makes a
   // call of its own. Best effort: a failure here is retried lazily on the agent's first proxied request.
   const enrollUpstream = async (agent: Agent) => {
@@ -393,6 +408,12 @@ export function createApp(deps: Deps) {
     if (!Number.isInteger(after) || after < 0 || !Number.isInteger(limit)) return deny(c, 400, "relaygate_bad_request");
     const rows = store.auditSince(after, limit, c.req.query("agent") || undefined);
     return c.json({ policy_version: policyVersion(deps.policy()), rows });
+  });
+
+  app.get("/admin/v1/policy/status", (c) => {
+    const refused = adminRefusal(c);
+    if (refused) return refused;
+    return c.json(deps.policyStatus?.() ?? { source: "file", hash: policyVersion(deps.policy()) });
   });
 
   // Gives sessions uploaded before relaygate an owner, by their uploader (docs/contract.md, "Adopting existing sessions").

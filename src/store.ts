@@ -143,6 +143,13 @@ export class Store {
         email TEXT,
         expires_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS policy_cache (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        version INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        fetched_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS control_users (
         user_id TEXT PRIMARY KEY,
         email TEXT NOT NULL,
@@ -174,6 +181,21 @@ export class Store {
   private addColumn(table: string, column: string, decl: string): void {
     const cols = this.db.prepare(`PRAGMA table_info(${table})`).all().map((c) => String(c.name));
     if (!cols.includes(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  }
+
+  /** The last policy version applied from relay-control, exactly as it was served (re-verified on startup). */
+  cachePolicy(row: { version: number; body: string; signature: string; fetchedAt: string }): void {
+    this.db
+      .prepare(
+        `INSERT INTO policy_cache (id, version, body, signature, fetched_at) VALUES (1, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET version = excluded.version, body = excluded.body, signature = excluded.signature, fetched_at = excluded.fetched_at`,
+      )
+      .run(row.version, row.body, row.signature, row.fetchedAt);
+  }
+
+  cachedPolicy(): { version: number; body: string; signature: string; fetchedAt: string } | undefined {
+    const row = this.db.prepare("SELECT version, body, signature, fetched_at FROM policy_cache WHERE id = 1").get();
+    return row ? { version: Number(row.version), body: String(row.body), signature: String(row.signature), fetchedAt: String(row.fetched_at) } : undefined;
   }
 
   ping(): boolean {

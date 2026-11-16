@@ -21,10 +21,9 @@ end-user auth to the dashboard.
 
 ## Who decides, who enforces
 
-The **operator** defines the policy. The plan is for it to live in
-**relay-control**, the control plane they already use, with relaygate only
-enforcing it. **Today** the policy is a JSON file (`RELAYGATE_POLICY`, on
-Kubernetes a ConfigMap): relaygate checks it for changes every few seconds
+The **operator** defines the policy; relaygate only enforces it. It lives in
+**relay-control**, the control plane they already use (pulled, below), or in a
+JSON file (`RELAYGATE_POLICY`, on Kubernetes a ConfigMap): relaygate checks the file for changes every few seconds
 (`RELAYGATE_POLICY_RELOAD_MS`, default 5000), applies a new version once it
 parses, and keeps the last good policy if an edit doesn't. Each audit row
 records the version in force (see "Audit").
@@ -42,10 +41,32 @@ The operator owns:
 - the **ceilings**: per group, the groups it may never touch;
 - the **classifier settings**.
 
-**Planned:** relaygate pulls this policy from relay-control and keeps it
-cached, so a relay-control outage doesn't stop enforcement, and a change takes
-effect within a bounded delay. **Open:** the relay-control API for this, and the
-delay.
+**From relay-control:** with `RELAYCONTROL_POLICY_URL` set (instead of
+`RELAYGATE_POLICY`), relaygate pulls the policy from relay-control
+(docs/design/control-owned-policy.md):
+
+```
+GET <RELAYCONTROL_POLICY_URL>
+Authorization: Bearer <RELAYCONTROL_POLICY_SECRET>
+If-None-Match: "<version in force>"
+
+200  ETag: "<version>"
+     X-Relaycontrol-Signature: v1=<hex HMAC-SHA256(secret, the exact body bytes)>
+     {"version": <positive integer>, "updatedAt": "...", "policy": {...the file's shape...}}
+304  (no body, no signature): unchanged
+```
+
+relaygate applies an answer only if its signature verifies over the bytes it
+received, the policy parses, and the version is newer than the one in force
+(a rollback is published as a new, higher version). Anything else keeps the
+policy in force and is reported by `GET /admin/v1/policy/status` (`source`,
+`version`, `hash`, `appliedAt`, `lastFetchAt`, `lastError`, `lastRejected`).
+Each applied answer is cached in the database exactly as served and
+re-verified on startup, so a restart while relay-control is down keeps
+enforcing it. With nothing applied or cached, relaygate fails closed: every
+route except `/healthz` and the status route answers `503
+relaygate_unavailable`, `/readyz` stays 503, and nothing is forwarded. Audit
+rows record pulled versions as `c<version>-<hash>`.
 
 Agents and components can only do what the policy already allows: register
 with a key the operator issued, and register a stream inside a prefix their

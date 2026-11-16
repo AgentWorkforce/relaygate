@@ -31,7 +31,9 @@ Relaycast client's base URL at relaygate and use the `rg_` token (see
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `RELAYGATE_POLICY` | required | Path to the operator policy JSON (see `examples/policy.pit.json`). Reloaded when it changes; a bad edit keeps the previous policy. |
+| `RELAYGATE_POLICY` | one of these two | Path to the operator policy JSON (see `examples/policy.pit.json`). Reloaded when it changes; a bad edit keeps the previous policy. |
+| `RELAYCONTROL_POLICY_URL` | one of these two | Pull the policy from relay-control instead (`GET`, signed, versioned; see docs/contract.md, "Who decides, who enforces"). Polled every `RELAYGATE_POLICY_RELOAD_MS`; the last applied version is cached in the database. With no version applied or cached, every route but `/healthz` answers 503. |
+| `RELAYCONTROL_POLICY_SECRET` | with `RELAYCONTROL_POLICY_URL` | Bearer secret for the pull, and the HMAC key of the answer's signature. At least 32 characters; not the introspection secret. |
 | `RELAYGATE_DB` | `/data/relaygate.db` | SQLite file for agents, tokens, streams and the audit log. |
 | `PORT` | `8080` | HTTP port. |
 | `RELAYGATE_ADMIN_TOKEN` | none | Enables the operator endpoints: `POST /admin/v1/explain` ("may X do op on Y, and why") and `GET /admin/v1/audit` (content-free audit rows with the policy version). |
