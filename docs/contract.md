@@ -129,6 +129,26 @@ A DM is a write to the recipient's **inbox**, a stream owned by the recipient.
 Whether A may DM B is therefore decided by B's inbox mode, and whether B may
 answer is decided by A's inbox mode.
 
+### The agent directory
+
+Who appears in `GET /v1/agents` (and `GET /v1/agents/:name`) is, by default,
+the agents a caller could message or whose inbox it may read. To let a group
+see agents beyond that, without any right to message them, the operator grants
+`r` on their directory entries, `relaycast:agent/<name>`. Only `r` is ever
+checked on an entry: it shows the agent's name, status, persona and card, and
+nothing else (DMs still need `w` on `relaycast:inbox/<name>`). For example, the
+pit sees every agent on the relay while local agents' view is unchanged:
+
+```
+"streamDefaults": [{"prefix": "relaycast:agent/", "gid": 22, "mode": "040"}, ...]
+```
+
+Entries are operator policy only: an override for the exact id, or a prefix
+default that itself starts with `relaycast:agent/`. A broader default (such as
+`relaycast:`) and registered stream rows never count, and `PUT
+/v1/streams/{id}` refuses every `relaycast:agent/` id, so an agent can't show
+itself, or anyone else, to another group. Ceilings apply as usual.
+
 ### Registering streams and prefix defaults
 
 The owning component registers a stream with its `gid`, `mode` and `classify`.
@@ -500,7 +520,7 @@ skip membership checks, so relaygate checks each one itself:
 | Route | Check |
 |---|---|
 | `GET /v1/agent`, `POST /v1/agents/heartbeat`, `/disconnect` | self |
-| `GET /v1/agents`, `GET /v1/agents/:name` | answered with the workspace key, filtered to agents whose inbox the caller may write or read |
+| `GET /v1/agents`, `GET /v1/agents/:name` | answered with the workspace key, filtered to agents whose inbox the caller may write or read, or whose directory entry `relaycast:agent/<name>` it may read |
 | `GET /v1/channels` | filtered to channels the caller may read |
 | `POST /v1/channels` | `w` on `relaycast:channel/<name>` |
 | `GET /v1/channels/:name`, `/messages`; `POST .../join` | `r` on the channel |

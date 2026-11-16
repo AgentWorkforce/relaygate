@@ -2,7 +2,7 @@ import { Hono, type Context } from "hono";
 import { z } from "zod";
 import { ClassifierUnavailable, type Classifier } from "./classifier.js";
 import { allGroups, check, inGroup, type AclEntry, type Guarded, type Op, type Principal } from "./mode.js";
-import { deny as proxyDeny, mountRelaycast, type RelaycastUpstream } from "./relaycast.js";
+import { AGENT_ENTRY_PREFIX, deny as proxyDeny, mountRelaycast, type RelaycastUpstream } from "./relaycast.js";
 import { mountNodeToken } from "./realtime.js";
 import { adoptSessions, mountSessions, sessionsCors, type SessionsConfig } from "./sessions.js";
 import { ControlUnavailable, controlPrincipal, controlTokenKind, matchControlRule, type ControlAuth } from "./control.js";
@@ -657,6 +657,8 @@ export function createApp(deps: Deps) {
       return deny(c, 403, "relaygate_denied", { op: "w", resource: id });
     };
     if (policy.streamOverrides.some((o) => o.id === id)) return refuse("operator_override");
+    // Agent directory entries are operator policy: an agent registering one could show any agent to any group.
+    if (id.startsWith(AGENT_ENTRY_PREFIX)) return refuse("agent_directory_operator_only");
     if (!inGroup(principal, gid)) return refuse("gid_not_own_group");
     const prefix = longestPrefix(id, policy);
     if (!prefix || !inGroup(principal, prefix.gid)) return refuse("prefix_not_own_group");

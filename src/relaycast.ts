@@ -1,6 +1,7 @@
 import type { Context, Hono } from "hono";
-import { decide, provenance, resolveStream, type Deps, type Env } from "./app.js";
+import { decide, longestPrefix, provenance, resolveStream, type Deps, type Env, type ResolvedStream } from "./app.js";
 import { check, type Op, type Principal } from "./mode.js";
+import type { Policy } from "./policy.js";
 import type { Agent, SecretBox, Store } from "./store.js";
 
 /**
@@ -172,6 +173,28 @@ const dataOf = (body: unknown): unknown => (body && typeof body === "object" && 
 
 export const channelStream = (name: string) => `relaycast:channel/${name}`;
 export const inboxStream = (agentName: string) => `relaycast:inbox/${agentName}`;
+/**
+ * An agent's entry in the agent directory (GET /v1/agents, /v1/agents/:name). Only `r` is ever checked on it: it
+ * lets a group see the agent (name, status, persona, card) without any right to message it or read its inbox.
+ * Operator policy only: agents can't register these ids (PUT /v1/streams refuses them).
+ */
+export const AGENT_ENTRY_PREFIX = "relaycast:agent/";
+export const agentEntry = (agentName: string) => `${AGENT_ENTRY_PREFIX}${agentName}`;
+
+/**
+ * An agent's directory entry, from operator policy only: an override for the exact id, else the longest prefix
+ * default under `relaycast:agent/`. Registered stream rows never count (an agent could have registered one before
+ * PUT /v1/streams refused these ids), and neither does a broader default such as `relaycast:`, so visibility only
+ * widens when the operator writes a directory rule.
+ */
+export function directoryEntry(agentName: string, policy: Policy): ResolvedStream | undefined {
+  const id = agentEntry(agentName);
+  const override = policy.streamOverrides.find((o) => o.id === id);
+  if (override) return { id, owner: null, gid: override.gid, mode: override.mode, classify: override.classify, acl: override.acl, source: "override" };
+  const prefix = longestPrefix(id, policy);
+  if (!prefix || !prefix.prefix.startsWith(AGENT_ENTRY_PREFIX)) return undefined;
+  return { id, owner: null, gid: prefix.gid, mode: prefix.mode, classify: prefix.classify, acl: prefix.acl, source: "prefix" };
+}
 
 /** Relaycast stores DMs as hidden channels named dm-<pair>; they are never addressed as channels through relaygate. */
 export const isDmChannelName = (name: string) => name.startsWith("dm-") || name.startsWith("dmch_");
@@ -318,14 +341,18 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
   app.post("/v1/agents/disconnect", async (c) => pass(c, await forward(c, "POST", "/v1/agents/disconnect", (await jsonBody(c)) ?? {})));
 
   // --- agents (Relaycast refuses agent tokens here; relaygate answers with the workspace key, filtered) -------
-  // An agent sees the agents it could message or whose inbox it may read, and nothing else.
+  // An agent sees the agents it could message, whose inbox it may read, or whose directory entry
+  // (relaycast:agent/<name>) it may read, and nothing else.
   const visibleAgent = (c: Ctx, name: unknown) => {
     if (typeof name !== "string") return false;
     if (name === c.get("agent").name) return true;
     const principal = c.get("principal");
+    const ceilings = deps.policy().ceilings;
+    // Visibility only: `r` on the agent's directory entry shows it, and grants nothing else.
+    const entry = directoryEntry(name, deps.policy());
+    if (entry && check(principal, entry, "r", ceilings).allowed) return true;
     const stream = resolveStream(inboxStream(name), store, deps.policy());
     if (!stream) return false;
-    const ceilings = deps.policy().ceilings;
     return check(principal, stream, "w", ceilings).allowed || check(principal, stream, "r", ceilings).allowed;
   };
   app.get("/v1/agents", async (c) => {
