@@ -66,9 +66,11 @@ function harness(opts: { controlDown?: boolean; internalSecret?: string; garbled
     await next();
   });
   let minted = 0;
+  const mintBodies: Array<Record<string, unknown>> = [];
   sessions.post("/internal/v1/session-read/sessions", async (c) => {
     if (c.req.header("authorization") !== `Bearer ${INTERNAL}`) return c.json({ error: "unauthorized" }, 401);
     const b = await c.req.json();
+    mintBodies.push(b);
     return c.json({ userId: b.userId, orgId: b.orgId, workspaceId: b.workspaceId, role: b.role, accessToken: `rth_at_read_${b.userId}_${++minted}`, accessTokenExpiresAt: new Date(Date.now() + 300_000).toISOString() });
   });
   sessions.post("/v1/delivery/batches", (c) => c.json({ protocolVersion: 1, receiptId: "rhr_1" }));
@@ -106,9 +108,9 @@ function harness(opts: { controlDown?: boolean; internalSecret?: string; garbled
     protocolVersion: 1,
     batch: { schema_version: 1, origin_id: "o", batch_id: "b", records: [{ schema_version: 1, record_id: "r", kind: "session_event", source: "claude", session_id, operation: "upsert", payload: { text: "work" } }] },
   });
-  const mint = (userId: string, role?: string) =>
-    call("POST", "/sessions/internal/v1/session-read/sessions", INTERNAL, { userId, orgId: "org-1", workspaceId: "ws-1", role, audience: AUD, scopes: ["rth:read"] });
-  return { app, store, call, batch, mint, introspections, calls, controlAuth };
+  const mint = (userId: string, role?: string, extra: Record<string, unknown> = {}) =>
+    call("POST", "/sessions/internal/v1/session-read/sessions", INTERNAL, { userId, orgId: "org-1", workspaceId: "ws-1", role, audience: AUD, scopes: ["rth:read"], ...extra });
+  return { app, store, call, batch, mint, mintBodies, introspections, calls, controlAuth };
 }
 
 describe("relay-control principals: desktop device tokens", () => {
@@ -358,6 +360,44 @@ describe("person vs agent: match.as", () => {
     const people = harness({ policy: only("person") });
     expect((await people.call("POST", "/v1/register", "sh_at_member", { name: "desk-r", recovery: "recovery-proof-0123456789" })).status).toBe(403);
     expect((await people.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", people.batch("x-2"))).status).toBe(200);
+  });
+});
+
+describe("reader_kind: how the reader authenticated to relay-control", () => {
+  const readerPolicy = () =>
+    parsePolicy({
+      ...policy(),
+      groups: [...policy().groups, { gid: 44, name: "people" }],
+      sessionDefaults: [
+        { gid: 11, mode: "660", acl: [{ gid: 22, perm: "r" }, { gid: 33, perm: "r" }] },
+        { gid: 22, mode: "660", acl: [{ gid: 33, perm: "r" }, { gid: 44, perm: "r" }] },
+      ],
+      controlPrincipals: [
+        { match: { orgIds: ["org-1"], userIds: ["u-inside"] }, gid: 22 },
+        { match: { orgIds: ["org-1"], kinds: ["read"], readerKinds: ["browser"] }, gid: 44 },
+        { match: { orgIds: ["org-1"] }, gid: 11 },
+      ],
+    });
+
+  it("only a browser mint reads the pit; mcp, device and unlabelled mints don't, and the read API never sees the field", async () => {
+    const h = harness({ policy: readerPolicy() });
+    expect((await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_inside", h.batch("pit-2"))).status).toBe(200);
+    const read = async (extra: Record<string, unknown>) =>
+      (await h.call("GET", "/sessions/v1/sessions/pit-2/events", (await h.mint("u-member", undefined, extra)).body.accessToken)).status;
+    expect(await read({ reader_kind: "browser" })).toBe(200);
+    expect(await read({ reader_kind: "mcp" })).toBe(403);
+    expect(await read({ reader_kind: "device" })).toBe(403);
+    expect(await read({})).toBe(403);
+    expect(await read({ reader_kind: "Browser" })).toBe(403);
+    expect(h.mintBodies.length).toBe(5);
+    for (const b of h.mintBodies) expect(b).not.toHaveProperty("reader_kind");
+    expect(h.mintBodies[0]).toMatchObject({ userId: "u-member", orgId: "org-1", scopes: ["rth:read"] });
+  });
+
+  it("a device token never matches a readerKinds rule", async () => {
+    const h = harness({ policy: readerPolicy() });
+    expect((await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_inside", h.batch("pit-3"))).status).toBe(200);
+    expect((await h.call("GET", "/sessions/v1/sessions/pit-3/events", "sh_at_member")).status).toBe(403);
   });
 });
 

@@ -2,7 +2,7 @@ import { gunzipSync, zstdDecompressSync } from "node:zlib";
 import type { Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { decideResource, type Deps, type Env, type ResolvedResource } from "./app.js";
-import { matchControlRule } from "./control.js";
+import { matchControlRule, takeReaderKind } from "./control.js";
 import { check, type AclEntry, type Op } from "./mode.js";
 import type { Policy } from "./policy.js";
 import { deny } from "./relaycast.js";
@@ -385,12 +385,14 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
         if (c.req.header(HOST_MOUNTED)) return deny(c, 404, "relaygate_route_not_proxied");
         const auth = c.req.header("authorization") ?? "";
         if (cfg.internalSecret && auth !== `Bearer ${cfg.internalSecret}`) return deny(c, 401, "relaygate_unauthenticated");
+        // relay-control says how the reader authenticated; relaygate keeps it with the token and the read API never sees it.
+        const { readerKind, body } = takeReaderKind(await c.req.text());
         let res: Response;
         try {
           res = await doFetch(new URL(path.replace(/^\//, ""), slash(cfg.readUrl)), {
             method: "POST",
             headers: { authorization: auth, "content-type": c.req.header("content-type") ?? "application/json" },
-            body: await c.req.text(),
+            body,
           });
         } catch {
           return deny(c, 502, "relaygate_upstream_unavailable");
@@ -398,7 +400,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
         const text = await res.text();
         if (record && res.ok) {
           try {
-            control.recordMint(JSON.parse(text));
+            control.recordMint(JSON.parse(text), readerKind);
           } catch {
             /* not JSON: nothing to record */
           }

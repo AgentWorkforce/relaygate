@@ -40,6 +40,29 @@ export interface ControlIdentity {
   scopes: string[];
   /** Expiry, ms since the epoch. */
   expiresAt?: number;
+  /** Read tokens only: how the reader authenticated to relay-control, as relay-control set it on the mint. */
+  readerKind?: ReaderKind;
+}
+
+/** browser: a cookie-authenticated dashboard session; device: a desktop or CLI bearer; mcp: an agent-behalf read. */
+export const READER_KINDS = ["browser", "device", "mcp"] as const;
+export type ReaderKind = (typeof READER_KINDS)[number];
+const isReaderKind = (v: unknown): v is ReaderKind => typeof v === "string" && (READER_KINDS as readonly string[]).includes(v);
+
+/**
+ * The reader_kind relay-control put on a mint request, and the request with it removed (the read API doesn't take it).
+ * Unparseable bodies pass through untouched.
+ */
+export function takeReaderKind(text: string): { readerKind: ReaderKind | undefined; body: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { readerKind: undefined, body: text };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !("reader_kind" in parsed)) return { readerKind: undefined, body: text };
+  const { reader_kind, ...rest } = parsed as Record<string, unknown>;
+  return { readerKind: isReaderKind(reader_kind) ? reader_kind : undefined, body: JSON.stringify(rest) };
 }
 
 export class ControlUnavailable extends Error {}
@@ -83,7 +106,8 @@ export class ControlAuth {
     if (!row) return undefined;
     // The mint rarely carries an email; fall back to the one relay-control last reported for this user.
     const email = row.email ?? this.store.controlEmail(row.userId);
-    return { kind: "read", userId: row.userId, email, orgId: row.orgId, workspaceId: row.workspaceId ?? undefined, role: row.role ?? undefined, scopes: ["rth:read"], expiresAt: row.expiresAt ?? undefined };
+    const readerKind = isReaderKind(row.readerKind) ? row.readerKind : undefined;
+    return { kind: "read", userId: row.userId, email, orgId: row.orgId, workspaceId: row.workspaceId ?? undefined, role: row.role ?? undefined, scopes: ["rth:read"], expiresAt: row.expiresAt ?? undefined, readerKind };
   }
 
   private async introspect(token: string, kind: "device" | "launch"): Promise<ControlIdentity | undefined> {
@@ -146,7 +170,7 @@ export class ControlAuth {
   }
 
   /** Records a read token relay-control just minted through relaygate (its hash, never the token). */
-  recordMint(body: unknown, now = this.now()): boolean {
+  recordMint(body: unknown, readerKind?: ReaderKind, now = this.now()): boolean {
     const b = body as Record<string, unknown> | null;
     const token = typeof b?.accessToken === "string" ? b.accessToken : typeof b?.token === "string" ? b.token : undefined;
     if (!token || controlTokenKind(token) !== "read" || typeof b?.userId !== "string" || typeof b?.orgId !== "string") return false;
@@ -162,6 +186,7 @@ export class ControlAuth {
       workspaceId: typeof b.workspaceId === "string" ? b.workspaceId : null,
       role: role as ControlRole | null,
       email: typeof b.email === "string" ? b.email : null,
+      readerKind: readerKind ?? null,
       expiresAt: exp,
     });
     this.store.pruneControlReadTokens(now);
@@ -177,6 +202,8 @@ export function matchControlRule(identity: ControlIdentity, policy: Policy, as: 
     const m = rule.match;
     if (m.as && !m.as.includes(as)) return false;
     if (m.kinds && !m.kinds.includes(identity.kind)) return false;
+    // Fails closed: a read token minted without a reader_kind (an older relay-control) matches no readerKinds rule.
+    if (m.readerKinds && (!identity.readerKind || !m.readerKinds.includes(identity.readerKind))) return false;
     if (m.orgIds && !m.orgIds.includes(identity.orgId)) return false;
     if (m.workspaceIds && (!identity.workspaceId || !m.workspaceIds.includes(identity.workspaceId))) return false;
     if (m.roles && (!identity.role || !m.roles.includes(identity.role))) return false;

@@ -84,6 +84,12 @@ export const PolicySchema = z.object({
              * than the agents they enrol.
              */
             as: z.array(z.enum(["person", "agent"])).min(1).optional(),
+            /**
+             * Read tokens only: how the reader authenticated to relay-control when it minted the token ("browser" a
+             * dashboard cookie session, "device" a desktop/CLI bearer, "mcp" an agent-behalf read). A token minted
+             * without one, and every device or launch credential, matches no rule that sets this.
+             */
+            readerKinds: z.array(z.enum(["browser", "device", "mcp"])).min(1).optional(),
             orgIds: z.array(z.string().min(1)).min(1).optional(),
             workspaceIds: z.array(z.string().min(1)).min(1).optional(),
             roles: z.array(z.enum(["owner", "admin", "member"])).min(1).optional(),
