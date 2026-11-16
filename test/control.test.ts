@@ -47,7 +47,7 @@ function policy() {
   });
 }
 
-function harness(opts: { controlDown?: boolean; internalSecret?: string; garbled?: boolean; ceilingOnAdmins?: boolean } = {}) {
+function harness(opts: { controlDown?: boolean; internalSecret?: string; garbled?: boolean; ceilingOnAdmins?: boolean; policy?: ReturnType<typeof parsePolicy> } = {}) {
   const introspections: Array<Record<string, unknown>> = [];
   const control = new Hono();
   control.post("/internal/v1/auth/introspect", async (c) => {
@@ -78,7 +78,7 @@ function harness(opts: { controlDown?: boolean; internalSecret?: string; garbled
 
   const toFetch = (app: Hono) => (async (input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init))) as typeof fetch;
   const store = new Store(":memory:");
-  const pol = opts.ceilingOnAdmins ? parsePolicy({ ...policy(), ceilings: [{ gid: 33, never: [22] }] }) : policy();
+  const pol = opts.policy ? opts.policy : opts.ceilingOnAdmins ? parsePolicy({ ...policy(), ceilings: [{ gid: 33, never: [22] }] }) : policy();
   const controlAuth = new ControlAuth({ introspectUrl: "http://control.test/internal/v1/auth/introspect", introspectSecret: SECRET, audience: AUD, fetch: toFetch(control) }, store);
   const app = createApp({
     store,
@@ -311,6 +311,53 @@ describe("desktop enrolment: POST /v1/register with a device token", () => {
     expect((await h.call("POST", "/v1/register", "sh_at_otherorg", { name: "desk-c" })).status).toBe(403);
     expect((await h.call("POST", "/v1/register", "sh_at_revoked", { name: "desk-c" })).status).toBe(401);
     expect((await h.call("POST", "/v1/register", "sh_at_member", { name: "ctl:u-member" })).status).toBe(400);
+  });
+});
+
+describe("person vs agent: match.as", () => {
+  // Every person may read the pit as a person; the agents they enrol stay local.
+  const peoplePolicy = () =>
+    parsePolicy({
+      ...policy(),
+      groups: [...policy().groups, { gid: 44, name: "people" }],
+      sessionDefaults: [
+        { gid: 11, mode: "660", acl: [{ gid: 22, perm: "r" }, { gid: 33, perm: "r" }] },
+        { gid: 22, mode: "660", acl: [{ gid: 33, perm: "r" }, { gid: 44, perm: "r" }] },
+      ],
+      controlPrincipals: [
+        { match: { orgIds: ["org-1"], userIds: ["u-inside"] }, gid: 22 },
+        { match: { orgIds: ["org-1"], roles: ["owner", "admin"], as: ["person"] }, gid: 33 },
+        { match: { orgIds: ["org-1"], as: ["agent"] }, gid: 11 },
+        { match: { orgIds: ["org-1"], kinds: ["read"] }, gid: 44 },
+        { match: { orgIds: ["org-1"] }, gid: 11 },
+      ],
+    });
+
+  it("the same user reads the pit from the dashboard, and the agent their desktop enrols can't", async () => {
+    const h = harness({ policy: peoplePolicy() });
+    expect((await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_inside", h.batch("pit-1"))).status).toBe(200);
+    const read = (await h.mint("u-member")).body.accessToken;
+    expect((await h.call("GET", "/sessions/v1/sessions/pit-1/events", read)).status).toBe(200);
+    // The device token sits where the person's agents can reach it: it gets no more than an agent.
+    expect((await h.call("GET", "/sessions/v1/sessions/pit-1/events", "sh_at_member")).status).toBe(403);
+    // The person's own uploads still land in the local group.
+    expect((await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", h.batch("mine-1"))).status).toBe(200);
+    expect(h.store.session("mine-1")).toMatchObject({ gid: 11 });
+    const agent = await h.call("POST", "/v1/register", "sh_at_member", { name: "desk-p", recovery: "recovery-proof-0123456789" });
+    expect(agent.body).toMatchObject({ gid: 11 });
+    expect((await h.call("GET", "/v1/whoami", agent.body.token)).body.group_names).toEqual(["local"]);
+    const asAgent = await h.call("GET", "/sessions/v1/sessions/pit-1/events", undefined, undefined, { "x-relaygate-token": agent.body.token, authorization: `Bearer ${read}` });
+    expect(asAgent.status).toBe(403);
+  });
+
+  it("a rule limited to agents never maps a person, and the reverse", async () => {
+    const only = (as: "person" | "agent") => parsePolicy({ ...policy(), controlPrincipals: [{ match: { as: [as] }, gid: 11 }] });
+    const agents = harness({ policy: only("agent") });
+    expect((await agents.call("POST", "/v1/register", "sh_at_member", { name: "desk-q", recovery: "recovery-proof-0123456789" })).status).toBe(200);
+    expect((await agents.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", agents.batch("x-1"))).status).toBe(403);
+    const people = harness({ policy: only("person") });
+    expect((await people.call("POST", "/v1/register", "sh_at_member", { name: "desk-r", recovery: "recovery-proof-0123456789" })).status).toBe(403);
+    expect((await people.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", people.batch("x-2"))).status).toBe(200);
   });
 });
 

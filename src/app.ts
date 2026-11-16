@@ -274,7 +274,7 @@ export function createApp(deps: Deps) {
     const launch = identity.kind === "launch";
     const needed = launch ? "relay:agent:enrol" : "cli:auth";
     if (!identity.scopes.includes(needed)) return refuse(403, "relaygate_denied", `control_credential_no_${needed}`, { detail: `the credential needs ${needed}` });
-    const rule = matchControlRule(identity, policy);
+    const rule = matchControlRule(identity, policy, "agent");
     if (!rule) return refuse(403, "relaygate_denied", "no_control_rule", { detail: "no controlPrincipals rule matches this person" });
     const parsed = RegisterBody.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return deny(c, 400, "relaygate_bad_request", { detail: parsed.error.issues[0]?.message });
@@ -454,7 +454,7 @@ export function createApp(deps: Deps) {
       return deny(c, 401, "relaygate_unauthenticated");
     }
     const policy = deps.policy();
-    const rule = matchControlRule(identity, policy);
+    const rule = matchControlRule(identity, policy, "person");
     if (!rule) {
       store.audit({ agentId: null, action: "auth", op: null, resourceKind: "agent", resourceId: `ctl:${identity.userId}`, decision: "deny", stage: "auth", reason: "no_control_rule" });
       return deny(c, 403, "relaygate_denied", { detail: "no controlPrincipals rule matches this user" });

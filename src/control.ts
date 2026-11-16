@@ -172,9 +172,10 @@ export class ControlAuth {
 export type ControlRule = Policy["controlPrincipals"][number];
 
 /** The first policy rule that matches the identity; undefined means the caller is refused. */
-export function matchControlRule(identity: ControlIdentity, policy: Policy): ControlRule | undefined {
+export function matchControlRule(identity: ControlIdentity, policy: Policy, as: "person" | "agent"): ControlRule | undefined {
   return policy.controlPrincipals.find((rule) => {
     const m = rule.match;
+    if (m.as && !m.as.includes(as)) return false;
     if (m.kinds && !m.kinds.includes(identity.kind)) return false;
     if (m.orgIds && !m.orgIds.includes(identity.orgId)) return false;
     if (m.workspaceIds && (!identity.workspaceId || !m.workspaceIds.includes(identity.workspaceId))) return false;

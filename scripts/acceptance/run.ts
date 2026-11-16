@@ -17,7 +17,9 @@
  *   scenario that reads sessions, for deployments whose read tokens are short-lived),
  *   ACCEPTANCE_INGEST_WAIT_MS (how long an upload may take to become readable; 360000 on self-hosted Sessions),
  *   DIRECT_SESSIONS_READ_URL (the Sessions read origin as reachable WITHOUT relaygate, e.g. the public history host:
- *   scenario 14 tries the outside user's own read token there and must be refused).
+ *   scenario 14 tries the outside user's own read token there and must be refused),
+ *   PEOPLE_READ_PIT=1 (the policy lets every person read the pit: scenario 15 expects the outside person's own read
+ *   token, without an rg_, to read the inside session; then scenario 16 expects their local agent, carrying that same token with its rg_, to be refused).
  * Defaults match examples/policy.double-pit.json; nothing here is specific to a customer.
  */
 import { execSync } from "node:child_process";
@@ -419,6 +421,42 @@ async function main() {
         "MANUAL: confirm the admin sees it in the dashboard (scenario 13).",
       ],
     );
+  }
+
+  // --- 15/16. the same user: as a person (Control read token) reads the pit; their local agent (rg_) doesn't ----
+  // For deployments where every person may read the pit (PEOPLE_READ_PIT=1). The person's read token must be one
+  // relay-control minted through relaygate (SESSIONS_READ_REFRESH_CMD), so relaygate knows whose it is. 16 runs only
+  // once 15 proves the person can read, so its refusal is the agent's, not the person's.
+  if (up.status !== 404 && outsideSessions.read && process.env.PEOPLE_READ_PIT === "1") {
+    refreshReads();
+    const ws = outsideSessions.native ? `?workspace=${encodeURIComponent(outsideSessions.native.workspaceId)}` : "";
+    const path = `/sessions/v1/sessions/${docSession(RUN)}/events${ws}`;
+    let person = await request(URL_, "GET", path, outsideSessions.read);
+    // The inside upload may still be ingesting: poll for the canary while the gate allows the read.
+    for (const start = Date.now(); ok(person.status) && !JSON.stringify(person.body ?? "").includes(CANARY_PREFIX) && Date.now() - start < ingestWaitMs(); ) {
+      await sleep(3000);
+      person = await request(URL_, "GET", path, outsideSessions.read);
+    }
+    const found = ok(person.status) && JSON.stringify(person.body ?? "").includes(CANARY_PREFIX);
+    record(15, "a person (Control read token, no rg_) reads the inside session through relaygate: allowed", found ? "PASS" : "FAIL", [
+      `person read ${person.status}; inside content present: ${found}`,
+      ...(person.status === 401 ? ["401: relaygate doesn't know this read token; mint it through relaygate (relay-control's SESSION_READ_API_URL at the gate)"] : []),
+    ]);
+    if (found) {
+      // The same person's read token, carried by their local agent: the agent's rg_ decides, and it is refused.
+      const h = await auditHead();
+      const asAgent = await localA.call("GET", `/sessions/v1/sessions/${docSession(RUN)}/events`);
+      const row = (await audit(h, localA.name)).find((r) => r.action === "session.read" && r.resource_id === docSession(RUN));
+      const refused = asAgent.status === 403 && asAgent.body?.error === "relaygate_denied" && row?.decision === "deny";
+      record(16, "a local agent (rg_, with the same person's read token) reads the inside session: refused", refused ? "PASS" : "FAIL", [
+        `agent read ${asAgent.status} ${asAgent.body?.error ?? ""}; gate ${row?.decision ?? "no audit row"}`,
+        "This proves relaygate's decision for the agent's rg_. An agent that holds a person credential can present it as the person: keep person-only grants on dashboard read tokens.",
+      ], row ? [fmt(row)] : []);
+    } else record(16, "a local agent reads the inside session", "SKIP", ["scenario 15 didn't show the person can read, so a refusal here would prove nothing"]);
+  } else {
+    const why = process.env.PEOPLE_READ_PIT === "1" ? "needs the Sessions proxy and OUTSIDE_SESSIONS_READ" : "set PEOPLE_READ_PIT=1 when the policy lets every person read the pit";
+    record(15, "a person reads the inside session through relaygate", "SKIP", [why]);
+    record(16, "a local agent reads the inside session", "SKIP", [why]);
   }
 
   // --- 9. classifier ---------------------------------------------------------------------------------------

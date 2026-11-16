@@ -49,6 +49,8 @@ run with `node` directly (no build step).
 | 12 | Policy change takes effect | flip one ACL, rerun 2 (now allowed), restore (refused again); audit shows both policy versions | driver (needs hooks) |
 | 13 | Admin view | the org admin sees outside and inside sessions per person | manual |
 | 14 | Bypass: an outside member's own Sessions read token, straight at Sessions (e.g. the public history host), skipping relaygate | refused: no connection, 401/403/404, never the inside session | driver (needs `DIRECT_SESSIONS_READ_URL`) |
+| 15 | A person (an outside member's own Control read token, no `rg_`) reads the inside session through relaygate, where the policy lets every person read the pit | allowed; the inside content comes back | driver (needs `PEOPLE_READ_PIT=1` and a read token minted through relaygate) |
+| 16 | The same person's read token, carried by their local agent (`rg_`) | refused (403 `relaygate_denied`, audit deny): the agent's token decides. Runs only when 15 passes | driver (needs `PEOPLE_READ_PIT=1`) |
 
 **Scenario 9, why there is no inside-to-outside classifier path.** The policy
 gives the inside no write bit on anything the outside can read, so every inside
