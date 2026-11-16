@@ -3,6 +3,7 @@ import { groupName, guestEnded, isGuest, principalFor, resolveStream, type Resol
 import { resolveSession } from "./sessions.js";
 import { allGroups, check, inGroup, type CheckStep, type Op, type Principal } from "./mode.js";
 import { keyUsable, type Policy } from "./policy.js";
+import { matchControlRule } from "./control.js";
 import type { Store } from "./store.js";
 
 /**
@@ -19,6 +20,26 @@ export const SubjectSchema = z.union([
   z.object({ key: z.string().min(1), name: z.string().min(1).optional() }).strict(),
   /** A hypothetical agent with these groups. */
   z.object({ gid: Gid, groups: z.array(Gid).default([]), guest: z.boolean().default(false), name: z.string().min(1).optional() }).strict(),
+  /**
+   * A relay-control user, mapped through controlPrincipals. Defaults to a person on the dashboard (kind read, reader
+   * browser); kind device with as agent explains the agents their desktop enrols.
+   */
+  z
+    .object({
+      control: z
+        .object({
+          userId: z.string().min(1),
+          orgId: z.string().min(1),
+          email: z.string().min(3).optional(),
+          role: z.enum(["owner", "admin", "member"]).optional(),
+          workspaceId: z.string().min(1).optional(),
+          kind: z.enum(["device", "read", "launch"]).default("read"),
+          readerKind: z.enum(["browser", "device", "mcp"]).optional(),
+          as: z.enum(["person", "agent"]).optional(),
+        })
+        .strict(),
+    })
+    .strict(),
 ]);
 export type Subject = z.input<typeof SubjectSchema>;
 
@@ -85,6 +106,21 @@ function resolveSubject(subject: Subject, policy: Policy, store: Pick<Store, "ag
       guest: key.guest,
       notes: [`a new agent enrolled with key ${key.id}`],
     };
+  }
+  if ("control" in s) {
+    const p = s.control;
+    const as = p.as ?? (p.kind === "launch" ? "agent" : "person");
+    const readerKind = p.kind === "read" ? (p.readerKind ?? "browser") : undefined;
+    const identity = { kind: p.kind, userId: p.userId, orgId: p.orgId, email: p.email, role: p.role, workspaceId: p.workspaceId, scopes: [], readerKind };
+    const rule = matchControlRule(identity, policy, as);
+    const who = as === "agent" ? `an agent ${p.userId} enrols (${p.kind} credential)` : `relay-control user ${p.userId} (${p.kind}${readerKind ? `, ${readerKind}` : ""})`;
+    if (!rule) return { ok: false, reason: "no_control_rule", detail: `no controlPrincipals rule matches ${who}` };
+    const index = policy.controlPrincipals.indexOf(rule);
+    const name = as === "agent" ? `<agent of ${p.userId}>` : `ctl:${p.userId}`;
+    // A person who already uploaded owns their sessions as the stored ctl: agent, as a real request would.
+    const stored = as === "person" ? store?.agentByName(name) : undefined;
+    const agentId = stored && stored.keyId === "control" ? stored.id : `explain:${name}`;
+    return { ok: true, principal: { agentId, gid: rule.gid, groups: rule.groups }, name, guest: false, notes: [`${who}, by controlPrincipals rule ${index}`] };
   }
   const unknown = [s.gid, ...s.groups].find((g) => !policy.groups.some((x) => x.gid === g));
   if (unknown !== undefined) return { ok: false, reason: "unknown_gid", detail: `the policy defines no gid ${unknown}` };

@@ -219,6 +219,7 @@ export function createApp(deps: Deps) {
   const app = new Hono<Env>();
   const { store } = deps;
   const now = deps.now ?? Date.now;
+  store.clock = now;
   store.policyVersion = () => {
     try {
       return policyVersion(deps.policy());
@@ -416,6 +417,49 @@ export function createApp(deps: Deps) {
     return c.json(deps.policyStatus?.() ?? { source: "file", hash: policyVersion(deps.policy()) });
   });
 
+  // The validator relaygate applies to every policy it loads, for relay-control to run before publishing a version.
+  app.post("/admin/v1/policy/validate", async (c) => {
+    const refused = adminRefusal(c);
+    if (refused) return refused;
+    const body = (await c.req.json().catch(() => null)) as { policy?: unknown } | null;
+    if (!body || typeof body !== "object" || !("policy" in body)) return deny(c, 400, "relaygate_bad_request", { detail: "body must be {policy}" });
+    try {
+      const policy = parsePolicy(body.policy);
+      return c.json({ ok: true, hash: policyVersion(policy) });
+    } catch (error) {
+      const issues = (error as { issues?: Array<{ path: PropertyKey[]; message: string }> }).issues;
+      const errors = issues
+        ? issues.slice(0, 100).map((i) => ({ path: i.path.map(String).join("."), message: i.message }))
+        : [{ path: "", message: (error as Error).message.slice(0, 2000) }];
+      return c.json({ ok: false, errors });
+    }
+  });
+
+  // Each enrollment key in the policy in force, with how it is used (never the key or its hash).
+  app.get("/admin/v1/keys", (c) => {
+    const refused = adminRefusal(c);
+    if (refused) return refused;
+    const at = now();
+    const usage = store.keyUsage(at);
+    const keys = deps.policy().enrollmentKeys.map((k) => {
+      const u = usage.get(k.id);
+      return {
+        id: k.id,
+        gid: k.gid,
+        groups: k.groups,
+        namePrefix: k.namePrefix ?? null,
+        guest: k.guest,
+        revoked: k.revoked,
+        expiresAt: k.expiresAt ?? null,
+        usable: keyUsable(k, at),
+        agents: u?.agents ?? 0,
+        activeTokens: u?.activeTokens ?? 0,
+        lastUsedAt: u?.lastUsedAt ? new Date(u.lastUsedAt).toISOString() : null,
+      };
+    });
+    return c.json({ keys });
+  });
+
   // Gives sessions uploaded before relaygate an owner, by their uploader (docs/contract.md, "Adopting existing sessions").
   const AdoptBody = z.object({
     readToken: z.string().min(8),
@@ -544,6 +588,7 @@ export function createApp(deps: Deps) {
       store.audit({ agentId: agent.id, action: "auth", op: null, resourceKind: null, resourceId: null, decision: "deny", stage: "auth", reason: ended });
       return deny(c, 401, "relaygate_unauthenticated");
     }
+    store.touchAgent(agent.id, now());
     c.set("agent", agent);
     c.set("principal", principalFor(agent, policy));
     c.set("tokenHash", sha256(token!));

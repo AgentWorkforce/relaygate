@@ -175,6 +175,7 @@ export class Store {
     this.addColumn("control_read_tokens", "email", "TEXT");
     this.addColumn("agents", "groups", "TEXT");
     this.addColumn("tokens", "expires_at", "INTEGER");
+    this.addColumn("agents", "last_seen_at", "INTEGER");
     this.addColumn("control_read_tokens", "reader_kind", "TEXT");
   }
 
@@ -260,7 +261,37 @@ export class Store {
   issueToken(agentId: string, expiresAt?: number): string {
     const token = `rg_${randomBytes(32).toString("base64url")}`;
     this.db.prepare("INSERT INTO tokens (hash, agent_id, created_at, expires_at) VALUES (?, ?, ?, ?)").run(sha256(token), agentId, now(), expiresAt ?? null);
+    this.touchAgent(agentId, this.clock(), true);
     return token;
+  }
+
+  /** Milliseconds since the epoch; the app sets its own clock here. */
+  clock: () => number = Date.now;
+  private seen = new Map<string, number>();
+
+  /** Records that an agent was just active: at most one write a minute per agent unless forced. */
+  touchAgent(agentId: string, at: number, force = false): void {
+    const last = this.seen.get(agentId);
+    if (!force && last !== undefined && at - last < 60_000) return;
+    if (this.seen.size > 50_000) this.seen.clear();
+    this.seen.set(agentId, at);
+    this.db.prepare("UPDATE agents SET last_seen_at = ? WHERE id = ?").run(at, agentId);
+  }
+
+  /** Per enrollment key id: its agents, their unexpired unrevoked tokens, and when one of them was last active. */
+  keyUsage(at: number): Map<string, { agents: number; activeTokens: number; lastUsedAt: number | null }> {
+    const rows = this.db
+      .prepare(
+        `SELECT a.key_id AS key_id, COUNT(DISTINCT a.id) AS agents, MAX(a.last_seen_at) AS last_seen,
+                COUNT(t.hash) AS active
+           FROM agents a
+           LEFT JOIN tokens t ON t.agent_id = a.id AND t.revoked = 0 AND (t.expires_at IS NULL OR t.expires_at > ?)
+          GROUP BY a.key_id`,
+      )
+      .all(at);
+    return new Map(
+      rows.map((r) => [String(r.key_id), { agents: Number(r.agents), activeTokens: Number(r.active), lastUsedAt: r.last_seen === null ? null : Number(r.last_seen) }]),
+    );
   }
 
   /** A desktop-enrolled agent's group follows its person's current controlPrincipals rule (set on each registration). */

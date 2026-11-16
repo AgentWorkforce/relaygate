@@ -839,7 +839,12 @@ Authorization: Bearer <admin token>
 "session", "id", "gid"?}`: a recorded session is looked up; otherwise `gid` is
 the group of its hypothetical first uploader). `as` is a registered agent (`{"agent": "<name>"}`), a new agent enrolled with
 a key (`{"key": "<id>", "name"?}`), or bare groups (`{"gid": 44, "groups":
-[]}`). A body with `cases` instead runs a list of expected decisions
+[]}`), or a relay-control user mapped through `controlPrincipals`
+(`{"control": {"userId", "orgId", "email"?, "role"?, "workspaceId"?, "kind"?,
+"readerKind"?, "as"?}}`; by default a person on the dashboard, `kind: "read"`
+with `readerKind: "browser"`; `kind: "device", as: "agent"` explains the
+agents their desktop enrols; the first step names the matching rule by index).
+A body with `cases` instead runs a list of expected decisions
 (`"expect": "allow" | "deny"`, optionally `"classified"`) and reports which
 fail, so a drafted policy can carry its own tests. An invalid draft answers
 `400 relaygate_bad_policy` with the reason. Nothing is applied and nothing is
@@ -849,8 +854,23 @@ The same check runs offline: `relaygate-explain --policy <file> --as
 key:vendor-guest --op w --stream <id>`, or `--cases <file>`, which exits `1`
 when any case fails (see `examples/cases.pit.json`).
 
-**Open:** in production the admin endpoint belongs behind relay-control, which
-holds the policy; today it is enabled by `RELAYGATE_ADMIN_TOKEN`.
+## Admin API for relay-control
+
+relay-control (or an operator) calls these with `RELAYGATE_ADMIN_TOKEN`;
+without it they answer 404.
+
+- `POST /admin/v1/policy/validate` `{"policy": {...}}`: `{"ok": true, "hash"}`
+  or `{"ok": false, "errors": [{"path", "message"}]}`, by the same validator
+  relaygate loads every policy with. relay-control runs it before publishing a
+  version.
+- `GET /admin/v1/policy/status`: where the policy comes from and what is in
+  force (see "Who decides, who enforces").
+- `GET /admin/v1/keys`: each enrollment key in the policy in force, `{id, gid,
+  groups, namePrefix, guest, revoked, expiresAt, usable, agents,
+  activeTokens, lastUsedAt}`, never the key or its hash. `lastUsedAt` is the
+  latest registration with the key or request by one of its agents (recorded
+  at most once a minute per agent).
+- `POST /admin/v1/explain` (above) and `GET /admin/v1/audit` (below).
 
 ## Audit
 

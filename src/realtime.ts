@@ -88,7 +88,9 @@ export class NodeSockets {
     if (!row) return undefined;
     const agent = this.deps.store.agentForTokenHash(row.agentTokenHash);
     if (!agent || agent.id !== row.agentId) return undefined;
-    if (guestEnded(agent, this.deps.policy(), (this.deps.now ?? Date.now)())) return undefined;
+    const at = (this.deps.now ?? Date.now)();
+    if (guestEnded(agent, this.deps.policy(), at)) return undefined;
+    this.deps.store.touchAgent(agent.id, at);
     return { agent, row };
   }
 
