@@ -426,6 +426,17 @@ describe("Relaycast proxy: realtime", { timeout: 30_000 }, () => {
     expect(got.filter((f) => f.type === "deliver").map((f) => f.seq)).toEqual([2, 3]);
     expect(got.some((f) => f.type === "action.invoke")).toBe(false);
 
+    // The agent's groups change while the socket is open: deliveries follow the stored agent at once, both ways.
+    const me = rt.h.deps.store.agentByName("local-a")!;
+    rt.h.deps.store.setAgentGroups(me.id, 22, []);
+    deliver(6, "message.created", { channel_name: "pit-ops", text: "now readable" });
+    await waitFor(() => got.some((f) => f.seq === 6));
+    rt.h.deps.store.setAgentGroups(me.id, 11, []);
+    deliver(7, "message.created", { channel_name: "pit-ops", text: "not any more" });
+    rt.upstream().send(JSON.stringify({ v: 1, type: "ping", n: 2 }));
+    await waitFor(() => got.some((f) => f.type === "ping" && f.n === 2));
+    expect(got.filter((f) => f.type === "deliver").map((f) => f.seq)).toEqual([2, 3, 6]);
+
     // Re-registering with the recovery proof revokes the old rg_ token, which closes the socket at once.
     await rt.h.register(KEYS.local, "local-a", proof);
     expect(await closed).toBe(4401);

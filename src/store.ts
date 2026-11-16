@@ -176,6 +176,7 @@ export class Store {
     this.addColumn("agents", "groups", "TEXT");
     this.addColumn("tokens", "expires_at", "INTEGER");
     this.addColumn("agents", "last_seen_at", "INTEGER");
+    this.addColumn("tokens", "binding", "TEXT");
     this.addColumn("control_read_tokens", "reader_kind", "TEXT");
   }
 
@@ -225,6 +226,15 @@ export class Store {
   }
 
   /** Revokes every token the agent holds and returns the hashes that were revoked. */
+  /** Revokes an agent's tokens issued under one binding (one computer), leaving its other computers' tokens. */
+  revokeBoundTokens(agentId: string, binding: string | null): string[] {
+    const where = binding === null ? "binding IS NULL" : "binding = ?";
+    const args = binding === null ? [agentId] : [agentId, binding];
+    const rows = this.db.prepare(`SELECT hash FROM tokens WHERE agent_id = ? AND revoked = 0 AND ${where}`).all(...args);
+    this.db.prepare(`UPDATE tokens SET revoked = 1 WHERE agent_id = ? AND ${where}`).run(...args);
+    return rows.map((r) => String(r.hash));
+  }
+
   revokeTokens(agentId: string): string[] {
     const rows = this.db.prepare("SELECT hash FROM tokens WHERE agent_id = ? AND revoked = 0").all(agentId);
     this.db.prepare("UPDATE tokens SET revoked = 1 WHERE agent_id = ?").run(agentId);
@@ -258,9 +268,10 @@ export class Store {
     this.db.prepare("UPDATE agents SET key_id = ?, guest = MAX(guest, ?) WHERE id = ?").run(keyId, guest ? 1 : 0, agentId);
   }
 
-  issueToken(agentId: string, expiresAt?: number): string {
+  /** `binding` ties the token to one computer's recovery proof, so re-registering there rotates only its own token. */
+  issueToken(agentId: string, expiresAt?: number, binding?: string): string {
     const token = `rg_${randomBytes(32).toString("base64url")}`;
-    this.db.prepare("INSERT INTO tokens (hash, agent_id, created_at, expires_at) VALUES (?, ?, ?, ?)").run(sha256(token), agentId, now(), expiresAt ?? null);
+    this.db.prepare("INSERT INTO tokens (hash, agent_id, created_at, expires_at, binding) VALUES (?, ?, ?, ?, ?)").run(sha256(token), agentId, now(), expiresAt ?? null, binding ?? null);
     this.touchAgent(agentId, this.clock(), true);
     return token;
   }

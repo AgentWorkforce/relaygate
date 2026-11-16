@@ -401,6 +401,52 @@ describe("reader_kind: how the reader authenticated to relay-control", () => {
   });
 });
 
+describe("person identities (personNames)", () => {
+  const personPolicy = () =>
+    parsePolicy({
+      ...policy(),
+      controlPrincipals: [{ match: { orgIds: ["org-1"] }, gid: 11, namePrefix: "desk-" }],
+      personNames: { prefix: "person-" },
+    });
+  const personOf = (userId: string) => `person-${sha256(userId).slice(0, 16)}`;
+
+  it("one person, two computers: one identity, each computer rotating only its own token", async () => {
+    const h = harness({ policy: personPolicy() });
+    const me = personOf("u-member");
+    // Allowed despite the rule's desk- prefix.
+    const a = await h.call("POST", "/v1/register", "sh_at_member", { name: me, recovery: "computer-a-proof-0123456789" });
+    expect(a.status).toBe(200);
+    const b = await h.call("POST", "/v1/register", "sh_at_member", { name: me, recovery: "computer-b-proof-0123456789" });
+    expect(b.status).toBe(200);
+    expect(b.body.agent_id).toBe(a.body.agent_id);
+    expect((await h.call("GET", "/v1/whoami", a.body.token)).status).toBe(200);
+    expect((await h.call("GET", "/v1/whoami", b.body.token)).status).toBe(200);
+    // Computer A re-registers: its old token ends, B's keeps working.
+    const a2 = await h.call("POST", "/v1/register", "sh_at_member", { name: me, recovery: "computer-a-proof-0123456789" });
+    expect((await h.call("GET", "/v1/whoami", a.body.token)).status).toBe(401);
+    expect((await h.call("GET", "/v1/whoami", a2.body.token)).status).toBe(200);
+    expect((await h.call("GET", "/v1/whoami", b.body.token)).status).toBe(200);
+  });
+
+  it("refuses a person prefix that can't be an agent name", () => {
+    expect(() => parsePolicy({ ...policy(), personNames: { prefix: "person/" } })).toThrow();
+    expect(() => parsePolicy({ ...policy(), personNames: { prefix: "ctl:p-" } })).toThrow();
+    expect(() => parsePolicy({ ...policy(), personNames: { prefix: "p".repeat(65) } })).toThrow();
+  });
+
+  it("nobody else enrols a person name: not another person, not a launch, not an enrollment key", async () => {
+    const h = harness({ policy: personPolicy() });
+    const me = personOf("u-member");
+    expect((await h.call("POST", "/v1/register", "sh_at_member2", { name: me, recovery: "other-proof-0123456789" })).body).toMatchObject({ error: "relaygate_name_scope" });
+    expect((await h.call("POST", "/v1/register", "sh_at_member2", { name: "person-anything" })).status).toBe(403);
+    expect((await h.call("POST", "/v1/register", "enroll-local-0000000000000000", { name: me })).status).toBe(403);
+    // Other desktop agents still follow the rule's prefix, and still need their own recovery proof.
+    expect((await h.call("POST", "/v1/register", "sh_at_member", { name: "other-1" })).status).toBe(403);
+    expect((await h.call("POST", "/v1/register", "sh_at_member", { name: "desk-1", recovery: "desk-proof-0123456789" })).status).toBe(200);
+    expect((await h.call("POST", "/v1/register", "sh_at_member", { name: "desk-1", recovery: "wrong-proof-0123456789" })).status).toBe(409);
+  });
+});
+
 describe("launched agents (relay-control launch credentials)", () => {
   it("a launch credential enrols exactly the agent it names, in the launching person's group", async () => {
     const h = harness();

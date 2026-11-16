@@ -107,6 +107,21 @@ export const PolicySchema = z.object({
     .default([]),
   /** Agent name prefixes no one may enrol at /v1/register (e.g. names a control plane registers server-side). */
   reservedNamePrefixes: z.array(z.string().min(1)).default([]),
+  /**
+   * Each relay-control user's one person identity: the name `<prefix><first hashLength hex of sha256(userId)>`, which
+   * only that user may enrol (with their device token, from any number of computers, each with its own recovery
+   * proof), whatever their rule's namePrefix. No one else may enrol a name with this prefix.
+   */
+  personNames: z
+    .object({
+      prefix: z
+        .string()
+        .regex(/^[A-Za-z0-9._:-]{1,64}$/, "prefix uses only A-Z, a-z, 0-9, '.', '_', ':' and '-' (agent name characters), at most 64")
+        .refine((p) => !p.toLowerCase().startsWith("ctl:"), "ctl: is reserved for relay-control users"),
+      hashLength: z.number().int().min(8).max(64).default(16),
+    })
+    .strict()
+    .optional(),
   /** Who may read Sessions aggregates that span every session (per-person usage, activity, digests). */
   sessionAggregates: z.object({ gids: z.array(Gid).default([]) }).default({ gids: [] }),
   /** Per group, the groups whose resources it may never touch, whatever the mode or ACL says. */
@@ -197,6 +212,12 @@ export function labelPolicyVersion(policy: Policy, label: string): void {
 }
 
 export type EnrollmentKey = Policy["enrollmentKeys"][number];
+
+/** The person identity name for a relay-control user, if the policy names them (see `personNames`). */
+export function personNameFor(policy: Policy, userId: string): string | undefined {
+  const p = policy.personNames;
+  return p ? `${p.prefix}${createHash("sha256").update(userId).digest("hex").slice(0, p.hashLength)}` : undefined;
+}
 
 /** Whether the key can still enroll agents at `now` (milliseconds since the epoch). */
 export function keyUsable(key: EnrollmentKey, now: number): boolean {
