@@ -541,8 +541,9 @@ async function main() {
     const leakedCred = /at_live_|nt_live_|rk_live_|rth_(st|at)_/.test(JSON.stringify([who.body, nt.body]));
     notes.push(`upstream credentials in anything a client received: ${leakedCred}`);
     pass &&= !leakedCred;
-    if (process.env.RELAYCAST_DIRECT_URL && (await isRelaygate(process.env.RELAYCAST_DIRECT_URL))) {
-      // Gate-only: that host is relaygate, so it can't show a way around it. DIRECT_PROBE_CMD checks from inside.
+    const castIsGate = !!process.env.RELAYCAST_DIRECT_URL && (await isRelaygate(process.env.RELAYCAST_DIRECT_URL));
+    if (castIsGate) {
+      // Gate-only: that host is relaygate, so it can't show a way around it. DIRECT_PROBE_CMD must check from inside.
       notes.push("RELAYCAST_DIRECT_URL answers as relaygate (gate-only public host): no bypass through it");
     } else if (process.env.RELAYCAST_DIRECT_URL) {
       const direct = await request(process.env.RELAYCAST_DIRECT_URL, "GET", "/v1/agent", localA.token);
@@ -551,7 +552,10 @@ async function main() {
     } else notes.push("rg_ token straight at Relaycast: SKIPPED (set RELAYCAST_DIRECT_URL)");
     const probed = directProbe(notes);
     if (probed !== undefined) pass &&= probed;
-    else notes.push("in-cluster bypass: SKIPPED (set DIRECT_PROBE_CMD to probe upstream origins from an unprivileged pod)");
+    else if (castIsGate) {
+      notes.push("gate-only: the bypass around relaygate is unchecked; set DIRECT_PROBE_CMD");
+      pass = false;
+    } else notes.push("in-cluster bypass: SKIPPED (set DIRECT_PROBE_CMD to probe upstream origins from an unprivileged pod)");
     if (process.env.RG_DOWN_CMD && process.env.RG_UP_CMD) {
       // Bring relaygate back whatever happens once the down hook starts: in finally, and on exit as a fallback.
       let upDone = false;
@@ -649,10 +653,12 @@ async function main() {
       notes.push(`${label} direct: ${r.status === 0 ? "no connection" : r.status}${leaks ? " — INSIDE SESSION READABLE WITHOUT relaygate" : refused ? " (refused)" : " (inconclusive: not a refusal)"}`);
     }
     const probed = directProbe(notes);
+    // Through relaygate's own public host only relaygate is tested: the way around it must be probed from inside.
+    if (gate && probed === undefined) notes.push("gate-only: the bypass around relaygate is unchecked; set DIRECT_PROBE_CMD");
     record(
       14,
       "bypass: the outside user's own Sessions credential straight at Sessions (around relaygate) is refused",
-      cred && !bypassed && !inconclusive && probed !== false ? "PASS" : "FAIL",
+      cred && !bypassed && !inconclusive && (gate ? probed === true : probed !== false) ? "PASS" : "FAIL",
       [...notes, ...(bypassed ? ["Sessions must accept traffic only from relaygate (NetworkPolicy, and the public history host routed to relaygate)."] : [])],
     );
   } else record(14, "bypass: own Sessions credential straight at Sessions", "SKIP", ["set DIRECT_SESSIONS_READ_URL to the Sessions read origin as reachable without relaygate"]);
