@@ -82,12 +82,13 @@ describe("admin API for relay-control (R2)", () => {
   const harness = () => {
     let t = Date.parse("2026-11-16T00:00:00Z");
     const p = pol();
-    const app = createApp({ store: new Store(":memory:"), policy: () => p, classifier: () => new RuleClassifier([]), adminToken: ADMIN, now: () => t });
+    const store = new Store(":memory:");
+    const app = createApp({ store, policy: () => p, classifier: () => new RuleClassifier([]), adminToken: ADMIN, now: () => t });
     const call = async (method: string, path: string, token: string, body?: unknown) => {
       const res = await app.request(path, { method, headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: body && JSON.stringify(body) });
       return { status: res.status, body: (await res.json()) as any };
     };
-    return { call, p, advance: (ms: number) => (t += ms) };
+    return { call, p, store, advance: (ms: number) => (t += ms) };
   };
 
   it("validates a draft with the same rules relaygate loads with, saying where it is wrong", async () => {
@@ -130,6 +131,12 @@ describe("admin API for relay-control (R2)", () => {
     const agent = (await ask({ kind: "device", as: "agent" })).body;
     expect(agent).toMatchObject({ decision: "deny", subject: { name: "<agent of u1>", gid: 1 } });
     expect(agent.steps[0].detail).toContain("controlPrincipals rule 0");
+    // A person who already uploaded owns that session in explain as in a real request.
+    const store = (h as any).store as Store;
+    const ctl = store.ensureControlAgent("u1", 1);
+    store.claimSessions(["s-own"], ctl.id, 1);
+    const own = await h.call("POST", "/admin/v1/explain", ADMIN, { as: { control: { userId: "u1", orgId: "o1", readerKind: "mcp" } }, op: "r", resource: { kind: "session", id: "s-own" } });
+    expect(own.body).toMatchObject({ decision: "allow" });
     // Against a draft with no rule for them.
     const none = await h.call("POST", "/admin/v1/explain", ADMIN, { policy: { ...h.p, controlPrincipals: [] }, as: { control: { userId: "u1", orgId: "o1" } }, op: "r", resource: { kind: "stream", id: "x:doc" } });
     expect(none.body).toMatchObject({ draft: true, decision: "deny", reason: "no_control_rule" });

@@ -117,7 +117,10 @@ function resolveSubject(subject: Subject, policy: Policy, store: Pick<Store, "ag
     if (!rule) return { ok: false, reason: "no_control_rule", detail: `no controlPrincipals rule matches ${who}` };
     const index = policy.controlPrincipals.indexOf(rule);
     const name = as === "agent" ? `<agent of ${p.userId}>` : `ctl:${p.userId}`;
-    return { ok: true, principal: { agentId: `explain:${name}`, gid: rule.gid, groups: rule.groups }, name, guest: false, notes: [`${who}, by controlPrincipals rule ${index}`] };
+    // A person who already uploaded owns their sessions as the stored ctl: agent, as a real request would.
+    const stored = as === "person" ? store?.agentByName(name) : undefined;
+    const agentId = stored && stored.keyId === "control" ? stored.id : `explain:${name}`;
+    return { ok: true, principal: { agentId, gid: rule.gid, groups: rule.groups }, name, guest: false, notes: [`${who}, by controlPrincipals rule ${index}`] };
   }
   const unknown = [s.gid, ...s.groups].find((g) => !policy.groups.some((x) => x.gid === g));
   if (unknown !== undefined) return { ok: false, reason: "unknown_gid", detail: `the policy defines no gid ${unknown}` };
