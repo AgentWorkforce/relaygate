@@ -25,7 +25,7 @@ const KEYS = { local: "enroll-local-dryrun-000000000000", pit: "enroll-pit-dryru
 const ADMIN = "admin-token-dryrun-000000000000";
 const closers: Array<() => void> = [];
 
-const DEPLOYMENT_VARS = /^(RG_|SESSIONS_READ_REFRESH_CMD$|INSIDE_LOGS_CMD$|INSIDE_AGENTS$|RELAYCAST_DIRECT_URL$|DIRECT_SESSIONS_READ_URL$|OUTSIDE_|INSIDE_SESSIONS_|ADMIN_TOKEN$|POLICY_FILE$|PEOPLE_READ_PIT$)/;
+const DEPLOYMENT_VARS = /^(RG_|SESSIONS_READ_REFRESH_CMD$|INSIDE_LOGS_CMD$|INSIDE_AGENTS$|RELAYCAST_DIRECT_URL$|DIRECT_SESSIONS_READ_URL$|OUTSIDE_|INSIDE_SESSIONS_|ADMIN_TOKEN$|POLICY_FILE$|PEOPLE_READ_PIT$|DIRECT_PROBE_CMD$)/;
 function withoutDeploymentHooks(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(env).filter(([k]) => !DEPLOYMENT_VARS.test(k)));
 }

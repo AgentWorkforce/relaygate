@@ -18,6 +18,8 @@
  *   ACCEPTANCE_INGEST_WAIT_MS (how long an upload may take to become readable; 360000 on self-hosted Sessions),
  *   DIRECT_SESSIONS_READ_URL (the Sessions read origin as reachable WITHOUT relaygate, e.g. the public history host:
  *   scenario 14 tries the outside user's own read token there and must be refused),
+ *   DIRECT_PROBE_CMD (gate-only: run from an unprivileged pod, exits 0 when Relaycast, the Sessions read API and
+ *   relaygate's internal listeners are all unreachable; used by scenarios 11 and 14, since the public hosts are relaygate),
  *   PEOPLE_READ_PIT=1 (the policy lets every person read the pit: scenario 15 expects the outside person's own read
  *   token, without an rg_, to read the inside session; then scenario 16 expects their local agent, carrying that same token with its rg_, to be refused).
  * Defaults match examples/policy.double-pit.json; nothing here is specific to a customer.
@@ -58,6 +60,29 @@ function record(id: number, title: string, verdict: Verdict, notes: string[] = [
 
 const fmt = (r: any) =>
   `#${r.seq} ${r.agent_name ?? "-"} ${r.action} ${r.op ?? ""} ${r.resource_id ?? ""} -> ${r.decision}/${r.stage ?? "-"} (${r.reason ?? ""}) policy=${r.policy_version ?? "-"}`;
+
+/**
+ * Whether an origin is relaygate itself (on gate-only installs the public Relaycast and history hosts ARE relaygate):
+ * an unauthenticated probe answers with one of relaygate's own error codes.
+ */
+async function isRelaygate(origin: string): Promise<boolean> {
+  const r = await request(origin, "GET", "/v1/relaygate-probe", undefined);
+  return /"relaygate_[a-z_]+"/.test(JSON.stringify(r.body ?? ""));
+}
+
+/** DIRECT_PROBE_CMD: run from an unprivileged pod; exit 0 means every upstream origin around relaygate is unreachable. */
+function directProbe(notes: string[]): boolean | undefined {
+  const cmd = process.env.DIRECT_PROBE_CMD;
+  if (!cmd) return undefined;
+  try {
+    execSync(cmd, { stdio: "inherit" });
+    notes.push("DIRECT_PROBE_CMD: every upstream origin around relaygate is unreachable");
+    return true;
+  } catch {
+    notes.push("DIRECT_PROBE_CMD FAILED: an upstream origin is reachable without relaygate");
+    return false;
+  }
+}
 
 async function audit(after: number, agent?: string): Promise<any[]> {
   const q = new URLSearchParams({ after: String(after), limit: "1000", ...(agent ? { agent } : {}) });
@@ -516,11 +541,17 @@ async function main() {
     const leakedCred = /at_live_|nt_live_|rk_live_|rth_(st|at)_/.test(JSON.stringify([who.body, nt.body]));
     notes.push(`upstream credentials in anything a client received: ${leakedCred}`);
     pass &&= !leakedCred;
-    if (process.env.RELAYCAST_DIRECT_URL) {
+    if (process.env.RELAYCAST_DIRECT_URL && (await isRelaygate(process.env.RELAYCAST_DIRECT_URL))) {
+      // Gate-only: that host is relaygate, so it can't show a way around it. DIRECT_PROBE_CMD checks from inside.
+      notes.push("RELAYCAST_DIRECT_URL answers as relaygate (gate-only public host): no bypass through it");
+    } else if (process.env.RELAYCAST_DIRECT_URL) {
       const direct = await request(process.env.RELAYCAST_DIRECT_URL, "GET", "/v1/agent", localA.token);
       notes.push(`rg_ token straight at Relaycast: ${direct.status}`);
       pass &&= direct.status === 401 || direct.status === 403 || direct.status === 0;
     } else notes.push("rg_ token straight at Relaycast: SKIPPED (set RELAYCAST_DIRECT_URL)");
+    const probed = directProbe(notes);
+    if (probed !== undefined) pass &&= probed;
+    else notes.push("in-cluster bypass: SKIPPED (set DIRECT_PROBE_CMD to probe upstream origins from an unprivileged pod)");
     if (process.env.RG_DOWN_CMD && process.env.RG_UP_CMD) {
       // Bring relaygate back whatever happens once the down hook starts: in finally, and on exit as a fallback.
       let upDone = false;
@@ -603,20 +634,25 @@ async function main() {
     const notes: string[] = [];
     let bypassed = false;
     let inconclusive = false;
+    // Gate-only: the history host is relaygate itself, which answers a list filtered to what the caller may read.
+    const gate = await isRelaygate(process.env.DIRECT_SESSIONS_READ_URL);
+    if (gate) notes.push("DIRECT_SESSIONS_READ_URL answers as relaygate (gate-only public host): a filtered 2xx is relaygate's answer, not a bypass");
     if (!cred) notes.push("no outside read credential (set OUTSIDE_SESSIONS_READ or SESSIONS_READ_REFRESH_CMD)");
     for (const [label, path] of cred ? probes : []) {
       const r = await request(process.env.DIRECT_SESSIONS_READ_URL, "GET", path, cred);
       const leaks = ok(r.status) && JSON.stringify(r.body ?? "").includes(docSession(RUN));
-      // Only a refusal proves the door is shut. A 2xx without the session, or a 5xx, proves nothing either way.
-      const refused = r.status === 0 || r.status === 401 || r.status === 403 || r.status === 404;
+      // Only a refusal proves the door is shut. A 2xx without the session, or a 5xx, proves nothing either way,
+      // unless relaygate itself answered it.
+      const refused = r.status === 0 || r.status === 401 || r.status === 403 || r.status === 404 || (gate && ok(r.status) && !leaks);
       bypassed ||= leaks;
       inconclusive ||= !refused && !leaks;
       notes.push(`${label} direct: ${r.status === 0 ? "no connection" : r.status}${leaks ? " — INSIDE SESSION READABLE WITHOUT relaygate" : refused ? " (refused)" : " (inconclusive: not a refusal)"}`);
     }
+    const probed = directProbe(notes);
     record(
       14,
       "bypass: the outside user's own Sessions credential straight at Sessions (around relaygate) is refused",
-      cred && !bypassed && !inconclusive ? "PASS" : "FAIL",
+      cred && !bypassed && !inconclusive && probed !== false ? "PASS" : "FAIL",
       [...notes, ...(bypassed ? ["Sessions must accept traffic only from relaygate (NetworkPolicy, and the public history host routed to relaygate)."] : [])],
     );
   } else record(14, "bypass: own Sessions credential straight at Sessions", "SKIP", ["set DIRECT_SESSIONS_READ_URL to the Sessions read origin as reachable without relaygate"]);
