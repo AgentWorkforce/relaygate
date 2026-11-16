@@ -652,7 +652,7 @@ wins, and a user no rule matches is refused:
 "sessionAggregates": {"gids": [33]}
 ```
 
-`match` takes `kinds` (`device`, `read`, `launch`), `as`, `orgIds`,
+`match` takes `kinds` (`device`, `read`, `launch`), `as`, `readerKinds`, `orgIds`,
 `workspaceIds`, `roles`, `userIds` and `emails`. `as` says what the credential
 stands for: `agent` when it enrols an agent at `POST /v1/register` (a device or
 launch credential), `person` everywhere else (Sessions uploads and reads,
@@ -663,10 +663,20 @@ people enrol land in an agent rule instead.
 `as` separates what a credential enrols, not who presents it: relaygate can't
 tell whether a person or an agent sends a bearer token. An agent that can reach
 its person's device token (it sits on the same laptop) can drop
-`X-Relaygate-Token` and be served as that person. So grant person-only reads
-to dashboard read tokens (`kinds: ["read"]`, minted by relay-control and held
-by the browser), never to device tokens. For example, every person reads the
-pit from the dashboard while their agents stay local:
+`X-Relaygate-Token` and be served as that person, and relay-control also mints
+read tokens for agents (agent-behalf MCP reads) and desktops. So grant
+person-only reads to read tokens minted for a dashboard browser session:
+`readerKinds`.
+
+`readerKinds` (`browser`, `device`, `mcp`) matches a read token by how the
+reader authenticated to relay-control when it was minted: `browser` a
+cookie-authenticated dashboard session, `device` a desktop or CLI bearer, `mcp`
+an agent-behalf read. relay-control sets `reader_kind` in the internal mint
+request body (and on refresh); relaygate keeps it with the token's hash and
+strips it before forwarding the mint to the read API. A token minted without
+it, or with an unknown value, matches no `readerKinds` rule, and neither does
+any device or launch credential. For example, every person reads the pit from
+the dashboard while their agents stay local:
 
 ```
 "groups": [..., {"gid": 44, "name": "people"}],
@@ -674,7 +684,7 @@ pit from the dashboard while their agents stay local:
 "controlPrincipals": [
   {"match": {"orgIds": ["<org>"], "emails": ["<admin>@<domain>"], "as": ["person"]}, "gid": 33},
   {"match": {"orgIds": ["<org>"], "as": ["agent"]}, "gid": 11},
-  {"match": {"orgIds": ["<org>"], "kinds": ["read"]}, "gid": 44},
+  {"match": {"orgIds": ["<org>"], "kinds": ["read"], "readerKinds": ["browser"]}, "gid": 44},
   {"match": {"orgIds": ["<org>"]}, "gid": 11}
 ]
 ```

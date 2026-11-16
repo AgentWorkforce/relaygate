@@ -168,6 +168,7 @@ export class Store {
     this.addColumn("control_read_tokens", "email", "TEXT");
     this.addColumn("agents", "groups", "TEXT");
     this.addColumn("tokens", "expires_at", "INTEGER");
+    this.addColumn("control_read_tokens", "reader_kind", "TEXT");
   }
 
   private addColumn(table: string, column: string, decl: string): void {
@@ -309,13 +310,13 @@ export class Store {
     return this.createAgent(name, gid, "control", undefined);
   }
 
-  putControlReadToken(row: { hash: string; userId: string; orgId: string; workspaceId: string | null; role: string | null; email: string | null; expiresAt: number }): void {
+  putControlReadToken(row: { hash: string; userId: string; orgId: string; workspaceId: string | null; role: string | null; email: string | null; readerKind: string | null; expiresAt: number }): void {
     this.db
       .prepare(
-        `INSERT INTO control_read_tokens (hash, user_id, org_id, workspace_id, role, email, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(hash) DO UPDATE SET user_id = excluded.user_id, org_id = excluded.org_id, workspace_id = excluded.workspace_id, role = excluded.role, email = excluded.email, expires_at = excluded.expires_at`,
+        `INSERT INTO control_read_tokens (hash, user_id, org_id, workspace_id, role, email, reader_kind, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(hash) DO UPDATE SET user_id = excluded.user_id, org_id = excluded.org_id, workspace_id = excluded.workspace_id, role = excluded.role, email = excluded.email, reader_kind = excluded.reader_kind, expires_at = excluded.expires_at`,
       )
-      .run(row.hash, row.userId, row.orgId, row.workspaceId, row.role, row.email, row.expiresAt);
+      .run(row.hash, row.userId, row.orgId, row.workspaceId, row.role, row.email, row.readerKind, row.expiresAt);
   }
 
   /** A Control user's email, as relay-control last reported it (introspection, or a mint that carried it). */
@@ -330,8 +331,8 @@ export class Store {
     return row ? String(row.email) : undefined;
   }
 
-  controlReadToken(hash: string, now: number): { userId: string; orgId: string; workspaceId: string | null; role: "owner" | "admin" | "member" | null; email: string | null; expiresAt: number } | undefined {
-    const row = this.db.prepare("SELECT user_id, org_id, workspace_id, role, email, expires_at FROM control_read_tokens WHERE hash = ? AND expires_at > ?").get(hash, now);
+  controlReadToken(hash: string, now: number): { userId: string; orgId: string; workspaceId: string | null; role: "owner" | "admin" | "member" | null; email: string | null; readerKind: string | null; expiresAt: number } | undefined {
+    const row = this.db.prepare("SELECT user_id, org_id, workspace_id, role, email, reader_kind, expires_at FROM control_read_tokens WHERE hash = ? AND expires_at > ?").get(hash, now);
     return row
       ? {
           userId: String(row.user_id),
@@ -339,6 +340,7 @@ export class Store {
           workspaceId: row.workspace_id === null ? null : String(row.workspace_id),
           role: row.role === null ? null : (String(row.role) as "owner"),
           email: row.email === null ? null : String(row.email),
+          readerKind: row.reader_kind === null || row.reader_kind === undefined ? null : String(row.reader_kind),
           expiresAt: Number(row.expires_at),
         }
       : undefined;
