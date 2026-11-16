@@ -45,10 +45,10 @@ run with `node` directly (no build step).
 | 8 | Inside session upload | outside can't read or list it; admin sees it | driver + manual (13) |
 | 9 | Classifier | see below | driver |
 | 10 | Unenrolled key; guest key with `expiresAt` in the past | 401; `key_expired` | driver (needs `POLICY_FILE` for the expired key) |
-| 11 | relaygate down / bypass | no fail-open: nothing reaches upstream; clients never hold upstream credentials | driver (needs hooks for the down part) |
+| 11 | relaygate down / bypass | no fail-open: nothing reaches upstream; clients never hold upstream credentials. A `RELAYCAST_DIRECT_URL` that answers as relaygate (gate-only public host) proves nothing either way and is noted; `DIRECT_PROBE_CMD` (run from an unprivileged pod, exit 0 when Relaycast, the read API and relaygate's internal listeners are unreachable) covers the in-cluster bypass | driver (needs hooks for the down part) |
 | 12 | Policy change takes effect | flip one ACL, rerun 2 (now allowed), restore (refused again); audit shows both policy versions | driver (needs hooks) |
 | 13 | Admin view | the org admin sees outside and inside sessions per person | manual |
-| 14 | Bypass: an outside member's own Sessions read token, straight at Sessions (e.g. the public history host), skipping relaygate | refused: no connection, 401/403/404, never the inside session | driver (needs `DIRECT_SESSIONS_READ_URL`) |
+| 14 | Bypass: an outside member's own Sessions read token, straight at Sessions (e.g. the public history host), skipping relaygate | refused: no connection, 401/403/404, never the inside session. On gate-only installs the public host answers as relaygate, so a filtered 2xx without the inside session also passes; `DIRECT_PROBE_CMD` checks the in-cluster origins | driver (needs `DIRECT_SESSIONS_READ_URL`; gate-only: also `DIRECT_PROBE_CMD`) |
 | 15 | A person (an outside member's own Control read token, no `rg_`) reads the inside session through relaygate, where the policy lets every person read the pit | allowed; the inside content comes back | driver (needs `PEOPLE_READ_PIT=1` and a read token minted through relaygate) |
 | 16 | The same person's read token, carried by their local agent (`rg_`) | refused (403 `relaygate_denied`, audit deny): the agent's token decides. Runs only when 15 passes | driver (needs `PEOPLE_READ_PIT=1`) |
 
