@@ -98,6 +98,21 @@ export function routeSessionsHosts(fetchFn: (req: Request) => Response | Promise
   };
 }
 
+/**
+ * Serves every request as a Sessions request at the root (no /sessions prefix), for an internal listener
+ * (SESSIONS_PORT) that a control plane can use as a bare-origin Sessions URL. Unlike a public Sessions host, this is
+ * not host-mounted: relay-control's internal mint calls are allowed here. Never expose this listener publicly.
+ */
+export function sessionsAtRoot(fetchFn: (req: Request) => Response | Promise<Response>) {
+  return (req: Request): Response | Promise<Response> => {
+    const headers = new Headers(req.headers);
+    headers.delete(HOST_MOUNTED);
+    const url = new URL(req.url);
+    url.pathname = `/sessions${url.pathname}`;
+    return fetchFn(new Request(url, { method: req.method, headers, body: req.body, duplex: "half" } as RequestInit));
+  };
+}
+
 const SESSION_ID = /^[A-Za-z0-9._:@-]{1,256}$/;
 const READ_VIEWS = ["events", "turns", "metadata", "thread", "catalog", "timing", "analysis", "brief", "summary"] as const;
 

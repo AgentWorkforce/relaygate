@@ -632,7 +632,9 @@ On Sessions routes, a request with one of those in `Authorization` and no
 - **Read tokens** can't be introspected: only the read API's own table knows
   them. relay-control mints them by calling the read API's internal
   `/internal/v1/session-read/sessions` (and `/refresh`, `/service-tokens`); with
-  relay-control's read API URL pointed at relaygate, relaygate forwards those
+  relay-control's read API URL pointed at relaygate (a bare origin: relaygate's
+  internal `SESSIONS_PORT` listener, which serves Sessions at its root),
+  relaygate forwards those
   calls unchanged and records the hash of each minted token with the identity
   the mint named (and its role, when the mint carries one). The mint routes are
   never served on a public Sessions host, and are checked against

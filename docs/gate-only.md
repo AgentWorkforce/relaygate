@@ -58,8 +58,13 @@ caller is a relaygate principal.
    mint carries role and email, dashboard users match by `userIds`),
    `sessionAggregates` (who sees cross-session views), and `sessionDefaults`
    with read ACLs for any admin group. Test it with `relaygate-explain`.
-3. relay-control: its session read API URL points at relaygate's `/sessions`
-   path, and relaygate's introspection audience is one Control accepts.
+3. relay-control: its session read API URL (`SESSION_READ_API_URL`) is a bare
+   origin, so give relaygate an internal Sessions listener (`SESSIONS_PORT`,
+   e.g. 8081, served at its root, on a ClusterIP Service only) and point
+   relay-control at that origin, e.g.
+   `http://agent-relay-relaygate-sessions.<ns>.svc.cluster.local:8081`. Never
+   route that port publicly: it accepts relay-control's internal mint calls.
+   relaygate's introspection audience must be one Control accepts.
 4. Network: public `cast.*` and `history.*` route to relaygate; NetworkPolicy
    on Relaycast, session-ingest and session-read-api admits only relaygate and
    the in-cluster components above.

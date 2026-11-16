@@ -4,7 +4,7 @@ import { createApp } from "../src/app.js";
 import { RuleClassifier } from "../src/classifier.js";
 import { ControlAuth } from "../src/control.js";
 import { parsePolicy } from "../src/policy.js";
-import { routeSessionsHosts } from "../src/sessions.js";
+import { routeSessionsHosts, sessionsAtRoot } from "../src/sessions.js";
 import { sha256, Store } from "../src/store.js";
 
 const SECRET = "introspect-secret";
@@ -367,6 +367,26 @@ describe("launched agents (relay-control launch credentials)", () => {
     // Reading a node stream isn't something the outside group may do.
     expect((await h.call("POST", "/v1/check", "sh_at_member", { op: "r", resource: { kind: "stream", id: "node:ws-1/inside-node" } })).status).toBe(403);
     expect((await h.call("POST", "/v1/check", "sh_at_revoked", { op: "w", resource: { kind: "stream", id: "node:ws-1/x" }, content: "x" })).status).toBe(401);
+  });
+});
+
+describe("SESSIONS_PORT: Sessions at the root of an internal listener", () => {
+  it("serves Sessions paths at the root and allows relay-control's mint there (a public host never does)", async () => {
+    const h = harness();
+    const internal = sessionsAtRoot(h.app.fetch);
+    const mint = await internal(
+      new Request("http://relaygate-sessions:8081/internal/v1/session-read/sessions", {
+        method: "POST",
+        // A forged host-mounted marker is stripped, so it can't turn this into a public request either.
+        headers: { authorization: `Bearer ${INTERNAL}`, "content-type": "application/json", "x-relaygate-host-mounted": "1" },
+        body: JSON.stringify({ userId: "u-member", orgId: "org-1", workspaceId: "ws-1" }),
+      }),
+    );
+    expect(mint.status).toBe(200);
+    const token = ((await mint.json()) as any).accessToken;
+    await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", h.batch("s-root"));
+    const read = await internal(new Request("http://relaygate-sessions:8081/v1/sessions/s-root/events?workspace=ws-1", { headers: { authorization: `Bearer ${token}` } }));
+    expect(read.status).toBe(200);
   });
 });
 
