@@ -368,8 +368,9 @@ Authorization: Bearer sh_lt_...
   introspection. A relaunch is a fresh credential naming the same agent, and
   returns the same `agent_id` (no recovery proof: the single-use credential is
   the proof).
-- The token expires after 24 hours. Because the credential can't be reused, a
-  launched agent renews its own token before then:
+- The token expires after 24 hours, whatever the launch credential's own
+  (short) expiry. Because the credential can't be reused, a launched agent
+  renews its own token before then:
 
 ```
 POST /v1/token/refresh
@@ -386,9 +387,13 @@ Authorization: Bearer rg_...   (the current, unexpired token)
 
 A spawn invocation carries the launching person's task to a node, so a
 control plane checks it before sending: `POST /v1/check` accepts a
-relay-control device token or launch credential as the caller (the launching
-person), with node streams named `node:<workspace>/<node>` and placed by prefix
-defaults like any stream. The check writes nothing.
+relay-control device token as the caller (the launching person), with node
+streams named `node:<workspace>/<node>` and placed by prefix defaults like any
+stream. The check writes nothing. It never accepts a launch credential:
+introspecting one redeems it, and the node could no longer register.
+
+Enrollment key ids `control`, `device:*` and `launch:*` are reserved, and an
+enrollment key never recovers a desktop-enrolled or launched agent.
 
 ### Reserved names
 

@@ -342,6 +342,15 @@ describe("launched agents (relay-control launch credentials)", () => {
     expect((await h.call("POST", "/v1/token/refresh", keyed)).status).toBe(403);
   });
 
+  it("a launched agent gets 24 h whatever the launch credential's own expiry, and no enrollment key can take it over", async () => {
+    DEVICES.sh_lt_short = { active: true, principal_type: "relay_launch", sub: "u-member", org: "org-1", workspace: "ws-1", scopes: ["relay:agent:enrol"], agent_name: "launched-3", exp: Math.floor(Date.now() / 1000) + 60 };
+    const h = harness();
+    const r = await h.call("POST", "/v1/register", "sh_lt_short", { name: "launched-3", recovery: "recovery-proof-0123456789" });
+    expect(Date.parse(r.body.expires_at)).toBeGreaterThan(Date.now() + 23 * 3600 * 1000);
+    expect((await h.call("POST", "/v1/register", "enroll-local-0000000000000000", { name: "launched-3", recovery: "recovery-proof-0123456789" })).status).toBe(409);
+    expect(() => parsePolicy({ ...policy(), enrollmentKeys: [{ id: "launch:u-member", gid: 11, sha256: sha256("x".repeat(32)) }] })).toThrow(/reserved/);
+  });
+
   it("reserved name prefixes can't be enrolled by anyone", async () => {
     const h = harness();
     expect((await h.call("POST", "/v1/register", "sh_at_member", { name: "control-alice" })).status).toBe(403);
@@ -350,9 +359,11 @@ describe("launched agents (relay-control launch credentials)", () => {
 
   it("a control plane checks a spawn at /v1/check as the launching person", async () => {
     const h = harness();
-    const asLauncher = await h.call("POST", "/v1/check", "sh_lt_launch", { op: "w", resource: { kind: "stream", id: "node:ws-1/inside-node" }, content: "run the tests" });
+    const asLauncher = await h.call("POST", "/v1/check", "sh_at_member", { op: "w", resource: { kind: "stream", id: "node:ws-1/inside-node" }, content: "run the tests" });
     expect(asLauncher.status).toBe(200);
     expect(asLauncher.body).toEqual({ decision: "allow" });
+    // A launch credential is never accepted here (introspecting it would redeem it).
+    expect((await h.call("POST", "/v1/check", "sh_lt_launch", { op: "w", resource: { kind: "stream", id: "node:ws-1/x" }, content: "x" })).status).toBe(401);
     // Reading a node stream isn't something the outside group may do.
     expect((await h.call("POST", "/v1/check", "sh_at_member", { op: "r", resource: { kind: "stream", id: "node:ws-1/inside-node" } })).status).toBe(403);
     expect((await h.call("POST", "/v1/check", "sh_at_revoked", { op: "w", resource: { kind: "stream", id: "node:ws-1/x" }, content: "x" })).status).toBe(401);

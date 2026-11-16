@@ -284,7 +284,9 @@ export function createApp(deps: Deps) {
     // A launch credential enrols exactly the agent it names.
     if (launch && name !== identity.agentName) return refuse(403, "relaygate_name_scope", "launch_name_mismatch", { detail: "name must equal the launch credential's agent_name" });
     const keyId = `${launch ? "launch" : "device"}:${identity.userId}`;
-    const expiresAt = Math.min(now() + DEVICE_TOKEN_MAX_MS, identity.expiresAt ?? Infinity);
+    // A desktop agent's token never outlives the device token behind it; a launched agent's is a flat 24 h (it renews
+    // with /v1/token/refresh: the single-use launch credential's own short expiry doesn't apply to the agent).
+    const expiresAt = launch ? now() + DEVICE_TOKEN_MAX_MS : Math.min(now() + DEVICE_TOKEN_MAX_MS, identity.expiresAt ?? Infinity);
     const answer = (agentId: string, gid: number, token: string) =>
       c.json({ agent_id: agentId, gid, token, expires_at: new Date(expiresAt).toISOString(), user_id: identity!.userId });
 
@@ -341,8 +343,9 @@ export function createApp(deps: Deps) {
         existing.guest = true;
       }
       const recovered =
-        // A desktop-enrolled agent belongs to its person: only their device token recovers it.
+        // A desktop-enrolled or launched agent belongs to its person: only their relay-control credential recovers it.
         !existing.keyId.startsWith("device:") &&
+        !existing.keyId.startsWith("launch:") &&
         existing.gid === enrollment.gid &&
         existing.guest === enrollment.guest &&
         recovery !== undefined &&
@@ -489,9 +492,9 @@ export function createApp(deps: Deps) {
     if (onSessions && (c.req.path === "/sessions/v1/auth/token/revoke" || c.req.path === "/sessions/healthz")) return next();
     const relaygateToken = onSessions ? c.req.header("x-relaygate-token")?.trim() : undefined;
     const presented = bearer(c);
-    // /v1/check also answers for a relay-control principal, e.g. a control plane checking a spawn as the person
-    // launching it (with that launch credential or the person's device token). It decides; it writes nothing.
-    if (c.req.path === "/v1/check" && deps.control && presented && (controlTokenKind(presented) === "device" || controlTokenKind(presented) === "launch")) {
+    // /v1/check also answers for a person's device token, e.g. a control plane checking a spawn as the person
+    // launching it. Never a launch credential: introspecting it would redeem it before the node can register.
+    if (c.req.path === "/v1/check" && deps.control && presented && controlTokenKind(presented) === "device") {
       const refused = await authenticateControl(c, presented, true);
       if (refused) return refused;
       return next();
