@@ -116,6 +116,14 @@ describe("policy from relay-control", () => {
     expect(await source.refresh()).toBe(false);
     expect(source.status().lastError).toBe("policy fetch answered 500");
 
+    // Headers, then a body that never completes.
+    const broken = new ControlPolicySource(
+      { url: "http://control.test/p", secret: SECRET, fetch: (async () => new Response(new ReadableStream({ start: (c) => c.error(new Error("reset")) }), { status: 200 })) as typeof fetch },
+      new Store(":memory:"),
+    );
+    expect(await broken.refresh()).toBe(false);
+    expect(broken.status().lastError).toMatch(/^policy body read failed/);
+
     control.serve(7, policyBody("extra"));
     expect(await source.refresh()).toBe(true);
     expect(source.current().groups.map((g) => g.name)).toEqual(["local", "extra"]);

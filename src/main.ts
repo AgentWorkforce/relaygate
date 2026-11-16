@@ -65,6 +65,9 @@ const tick = async () => {
       console.error(JSON.stringify({ msg: "policy rejected; keeping the policy in force", ...source.status().lastRejected }));
     }
     sweep();
+  } catch (error) {
+    // A poll never takes relaygate down; the policy in force stays.
+    console.error(JSON.stringify({ msg: "policy poll failed", error: (error as Error).message }));
   } finally {
     refreshing = false;
   }

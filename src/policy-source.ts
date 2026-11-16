@@ -149,7 +149,14 @@ export class ControlPolicySource implements PolicySource {
       this.st.lastError = `policy fetch answered ${res.status}`;
       return false;
     }
-    const body = await res.text();
+    let body: string;
+    try {
+      body = await res.text();
+    } catch (error) {
+      // Headers arrived, then the body didn't (timeout, dropped connection): nothing to apply.
+      this.st.lastError = `policy body read failed: ${(error as Error).name}`;
+      return false;
+    }
     const reject = (reason: string, version?: number) => {
       this.st.lastError = reason;
       this.st.lastRejected = { version, reason, at: iso(at) };
