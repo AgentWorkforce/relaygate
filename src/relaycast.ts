@@ -172,6 +172,13 @@ const dataOf = (body: unknown): unknown => (body && typeof body === "object" && 
 
 export const channelStream = (name: string) => `relaycast:channel/${name}`;
 export const inboxStream = (agentName: string) => `relaycast:inbox/${agentName}`;
+/**
+ * An agent's entry in the agent directory (GET /v1/agents, /v1/agents/:name). Only `r` is ever checked on it: it
+ * lets a group see the agent (name, status, persona, card) without any right to message it or read its inbox.
+ * Operator policy only: agents can't register these ids (PUT /v1/streams refuses them).
+ */
+export const AGENT_ENTRY_PREFIX = "relaycast:agent/";
+export const agentEntry = (agentName: string) => `${AGENT_ENTRY_PREFIX}${agentName}`;
 
 /** Relaycast stores DMs as hidden channels named dm-<pair>; they are never addressed as channels through relaygate. */
 export const isDmChannelName = (name: string) => name.startsWith("dm-") || name.startsWith("dmch_");
@@ -318,14 +325,18 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
   app.post("/v1/agents/disconnect", async (c) => pass(c, await forward(c, "POST", "/v1/agents/disconnect", (await jsonBody(c)) ?? {})));
 
   // --- agents (Relaycast refuses agent tokens here; relaygate answers with the workspace key, filtered) -------
-  // An agent sees the agents it could message or whose inbox it may read, and nothing else.
+  // An agent sees the agents it could message, whose inbox it may read, or whose directory entry
+  // (relaycast:agent/<name>) it may read, and nothing else.
   const visibleAgent = (c: Ctx, name: unknown) => {
     if (typeof name !== "string") return false;
     if (name === c.get("agent").name) return true;
     const principal = c.get("principal");
+    const ceilings = deps.policy().ceilings;
+    // Visibility only: `r` on the agent's directory entry shows it, and grants nothing else.
+    const entry = resolveStream(agentEntry(name), store, deps.policy());
+    if (entry && check(principal, entry, "r", ceilings).allowed) return true;
     const stream = resolveStream(inboxStream(name), store, deps.policy());
     if (!stream) return false;
-    const ceilings = deps.policy().ceilings;
     return check(principal, stream, "w", ceilings).allowed || check(principal, stream, "r", ceilings).allowed;
   };
   app.get("/v1/agents", async (c) => {

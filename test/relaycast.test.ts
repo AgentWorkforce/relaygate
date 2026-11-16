@@ -12,9 +12,14 @@ import { RelaycastUpstream } from "../src/relaycast.js";
 import { SecretBox, sha256, Store } from "../src/store.js";
 import { fakeRelaycast, WORKSPACE_KEY } from "./fakes/relaycast.js";
 
-const KEYS = { local: "enroll-local-0000000000000000", pit: "enroll-pit-00000000000000000000", guest: "enroll-guest-0000000000000000000" };
+const KEYS = {
+  local: "enroll-local-0000000000000000",
+  pit: "enroll-pit-00000000000000000000",
+  guest: "enroll-guest-0000000000000000000",
+  editor: "enroll-editor-000000000000000000",
+};
 
-function policy(): Policy {
+function policy(extraDefaults: Array<Record<string, unknown>> = []): Policy {
   return parsePolicy({
     groups: [
       { gid: 11, name: "local" },
@@ -25,6 +30,8 @@ function policy(): Policy {
       { id: "local", gid: 11, sha256: sha256(KEYS.local), namePrefix: "local-" },
       { id: "pit", gid: 22, sha256: sha256(KEYS.pit), namePrefix: "pit-" },
       { id: "vendor", gid: 44, sha256: sha256(KEYS.guest), namePrefix: "guest-", guest: true, expiresAt: "2099-01-01T00:00:00Z" },
+      // A local agent whose inbox no default covers (an editor agent named after its person).
+      { id: "editor", gid: 11, sha256: sha256(KEYS.editor), namePrefix: "editor-" },
     ],
     streamDefaults: [
       { prefix: "relaycast:channel/", gid: 11, mode: "660", acl: [{ gid: 22, perm: "r" }] },
@@ -33,16 +40,21 @@ function policy(): Policy {
       { prefix: "relaycast:inbox/local-", gid: 11, mode: "660", acl: [{ gid: 22, perm: "r" }] },
       { prefix: "relaycast:inbox/pit-", gid: 22, mode: "660", acl: [{ gid: 11, perm: "w" }] },
       { prefix: "relaycast:inbox/guest-", gid: 44, mode: "660", acl: [{ gid: 11, perm: "w" }] },
+      ...extraDefaults,
     ],
     ceilings: [{ gid: 44, never: [22] }],
     classifier: { rules: [{ id: "ssn", pattern: "\\b\\d{3}-\\d{2}-\\d{4}\\b" }] },
   });
 }
 
-function harness(model: Classifier = { classify: async () => ({ decision: "allow", reason: "ok" }) }, url = "http://relaycast.test") {
+function harness(
+  model: Classifier = { classify: async () => ({ decision: "allow", reason: "ok" }) },
+  url = "http://relaycast.test",
+  extraDefaults: Array<Record<string, unknown>> = [],
+) {
   const store = new Store(":memory:");
   const upstreamFake = fakeRelaycast();
-  const pol = policy();
+  const pol = policy(extraDefaults);
   const relaycast = new RelaycastUpstream({ url, workspaceKey: WORKSPACE_KEY, box: new SecretBox("s".repeat(32)), fetch: upstreamFake.fetchFn }, store);
   const classifier = new ChainClassifier([new RuleClassifier(pol.classifier.rules), model]);
   const deps: Deps = { store, policy: () => pol, classifier: () => classifier, relaycast };
@@ -281,6 +293,34 @@ describe("Relaycast proxy: the pit rules", () => {
     expect((await h.call("GET", "/v1/agents", guest)).body.data.map((a: any) => a.name)).toEqual(["guest-a"]);
     expect((await h.call("GET", "/v1/agents", local)).body.data.map((a: any) => a.name).sort()).toEqual(["guest-a", "local-a", "pit-a"]);
     expect((await h.call("GET", "/v1/agents/pit-a", guest)).status).toBe(404);
+  });
+
+  it("r on an agent's directory entry (relaycast:agent/<name>) shows it, and grants nothing else", async () => {
+    const names = async (h: ReturnType<typeof harness>, token: string) =>
+      (await h.call("GET", "/v1/agents", token)).body.data.map((a: any) => a.name).sort();
+    // Without a directory grant, an agent whose inbox no default covers is invisible to the pit.
+    const before = harness();
+    const pit0 = await before.token(KEYS.pit, "pit-a");
+    await before.token(KEYS.editor, "editor-dana");
+    expect(await names(before, pit0)).not.toContain("editor-dana");
+    expect((await before.call("GET", "/v1/agents/editor-dana", pit0)).status).toBe(404);
+
+    // The pit (22) sees every agent: group read on the whole directory, nothing for anyone else.
+    const h = harness(undefined, undefined, [{ prefix: "relaycast:agent/", gid: 22, mode: "040" }]);
+    const local = await h.token(KEYS.local, "local-a");
+    const pit = await h.token(KEYS.pit, "pit-a");
+    const guest = await h.token(KEYS.guest, "guest-a");
+    await h.token(KEYS.editor, "editor-dana");
+    expect(await names(h, pit)).toEqual(["editor-dana", "guest-a", "local-a", "pit-a"]);
+    expect((await h.call("GET", "/v1/agents/editor-dana", pit)).status).toBe(200);
+    // Seeing is not messaging: the editor's inbox stays closed to the pit, and so does a local one.
+    expect((await h.call("POST", "/v1/dm", pit, { to: "editor-dana", text: "hi" })).status).toBe(403);
+    expect((await h.call("POST", "/v1/dm", pit, { to: "local-a", text: "hi" })).status).toBe(403);
+    // Other groups see exactly what they saw before.
+    expect(await names(h, local)).toEqual(["guest-a", "local-a", "pit-a"]);
+    expect(await names(h, guest)).toEqual(["guest-a"]);
+    // Agents can't register directory entries to show themselves (or anyone) to another group.
+    expect((await h.call("PUT", `/v1/streams/${encodeURIComponent("relaycast:agent/pit-a")}`, pit, { mode: "666" })).status).toBe(403);
   });
 
   it("lists only 1:1 DM conversations", async () => {
