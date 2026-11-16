@@ -75,7 +75,7 @@ describe("acceptance driver dry run", { timeout: 300_000 }, () => {
     });
     const verdicts = Object.fromEntries([...out.text.matchAll(/^\[(PASS|FAIL|SKIP|MANUAL)\] (\d+)\./gm)].map((m) => [m[2], m[1]]));
     if (out.code !== 0) console.log(out.text);
-    expect(verdicts).toMatchObject({ "1": "PASS", "2": "PASS", "3": "PASS", "4": "PASS", "5": "PASS", "6": "PASS", "7": "PASS", "8": "PASS", "9": "PASS", "10": "PASS", "13": "MANUAL", "14": "FAIL" });
+    expect(verdicts).toMatchObject({ "1": "PASS", "2": "PASS", "3": "PASS", "4": "PASS", "5": "PASS", "6": "PASS", "7": "PASS", "8": "PASS", "9": "PASS", "10": "PASS", "13": "MANUAL", "14": "FAIL", "15": "SKIP", "16": "PASS" });
     expect(out.text).toMatch(/INSIDE SESSION READABLE WITHOUT relaygate/);
     // The only failure is the bypass the stand-in deliberately allows.
     expect(out.code).toBe(1);

@@ -565,7 +565,7 @@ export async function adoptSessions(
         continue;
       }
       const identity = { kind: "device" as const, userId, email: deps.store.controlEmail(userId), orgId: opts.orgId, workspaceId: opts.workspaceId, scopes: [] };
-      const rule = matchControlRule(identity, policy);
+      const rule = matchControlRule(identity, policy, "person");
       if (!rule) {
         report.unmatched.push({ sessionId: id, userId });
         continue;

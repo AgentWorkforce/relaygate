@@ -78,6 +78,12 @@ export const PolicySchema = z.object({
         match: z
           .object({
             kinds: z.array(z.enum(["device", "read", "launch"])).min(1).optional(),
+            /**
+             * What the credential stands for here: "agent" when it enrols an agent at /v1/register (a device or launch
+             * credential), "person" everywhere else (Sessions, /v1/check). Lets the same user read more as a person
+             * than the agents they enrol.
+             */
+            as: z.array(z.enum(["person", "agent"])).min(1).optional(),
             orgIds: z.array(z.string().min(1)).min(1).optional(),
             workspaceIds: z.array(z.string().min(1)).min(1).optional(),
             roles: z.array(z.enum(["owner", "admin", "member"])).min(1).optional(),

@@ -652,8 +652,26 @@ wins, and a user no rule matches is refused:
 "sessionAggregates": {"gids": [33]}
 ```
 
-`match` takes `kinds` (`device`, `read`), `orgIds`, `workspaceIds`, `roles`,
-`userIds` and `emails`. A rule may also set `namePrefix`, which limits the
+`match` takes `kinds` (`device`, `read`, `launch`), `as`, `orgIds`,
+`workspaceIds`, `roles`, `userIds` and `emails`. `as` says what the credential
+stands for: `agent` when it enrols an agent at `POST /v1/register` (a device or
+launch credential), `person` everywhere else (Sessions uploads and reads,
+`/v1/check`, adoption). It lets the same user read more as a person than the
+agents they enrol, e.g. every person reads the pit while their agents stay
+local:
+
+```
+"groups": [..., {"gid": 44, "name": "people"}],
+"sessionDefaults": [{"gid": 22, "mode": "660", "acl": [{"gid": 33, "perm": "r"}, {"gid": 44, "perm": "r"}]}, ...],
+"controlPrincipals": [
+  {"match": {"orgIds": ["<org>"], "as": ["agent"]}, "gid": 11},
+  {"match": {"orgIds": ["<org>"], "as": ["person"]}, "gid": 11, "groups": [44]}
+]
+```
+
+Rules without `as` match both, so put agent-only rules (and `as: ["person"]`
+on admin rules, if admins' agents shouldn't read everything) before the
+catch-all. A rule may also set `namePrefix`, which limits the
 agent names that person's desktop may enrol (see "Enrolling with a device
 token"). A read token minted without a role never matches a rule
 that needs one; without an email it uses the email relay-control last reported
