@@ -18,6 +18,8 @@ const DEVICES: Record<string, Record<string, unknown>> = {
   sh_at_inside: { active: true, principal_type: "desktop-user", sub: "u-inside", email: "inside@example.test", org: "org-1", workspace: "ws-1", role: "member", scopes: ["rth:sync"], exp: 4_102_444_800 },
   sh_at_otherorg: { active: true, principal_type: "desktop-user", sub: "u-x", org: "org-2", role: "owner", scopes: [] },
   sh_at_revoked: { active: false, reason: "revoked" },
+  sh_lt_launch: { active: true, principal_type: "relay_launch", sub: "u-member", org: "org-1", workspace: "ws-1", scopes: ["relay:agent:enrol"], agent_name: "launched-1" },
+  sh_lt_noscope: { active: true, principal_type: "relay_launch", sub: "u-member", org: "org-1", workspace: "ws-1", scopes: [], agent_name: "launched-2" },
 };
 
 function policy() {
@@ -39,6 +41,9 @@ function policy() {
       { match: { orgIds: ["org-1"] }, gid: 11 },
     ],
     sessionAggregates: { gids: [33] },
+    reservedNamePrefixes: ["control-"],
+    // Spawn targets: launching onto an inside node is a cross-group write (classified); the inside group owns it.
+    streamDefaults: [{ prefix: "node:", gid: 22, mode: "660", acl: [{ gid: 11, perm: "w" }] }],
   });
 }
 
@@ -306,6 +311,62 @@ describe("desktop enrolment: POST /v1/register with a device token", () => {
     expect((await h.call("POST", "/v1/register", "sh_at_otherorg", { name: "desk-c" })).status).toBe(403);
     expect((await h.call("POST", "/v1/register", "sh_at_revoked", { name: "desk-c" })).status).toBe(401);
     expect((await h.call("POST", "/v1/register", "sh_at_member", { name: "ctl:u-member" })).status).toBe(400);
+  });
+});
+
+describe("launched agents (relay-control launch credentials)", () => {
+  it("a launch credential enrols exactly the agent it names, in the launching person's group", async () => {
+    const h = harness();
+    expect((await h.call("POST", "/v1/register", "sh_lt_launch", { name: "someone-else" })).status).toBe(403);
+    const ok = await h.call("POST", "/v1/register", "sh_lt_launch", { name: "launched-1" });
+    expect(ok.status).toBe(200);
+    expect(ok.body).toMatchObject({ gid: 11, user_id: "u-member" });
+    expect(h.store.agentByName("launched-1")?.keyId).toBe("launch:u-member");
+    // A relaunch (a fresh credential naming the same agent) gets the same agent back, without a recovery proof.
+    const again = await h.call("POST", "/v1/register", "sh_lt_launch", { name: "launched-1" });
+    expect(again.body.agent_id).toBe(ok.body.agent_id);
+    expect((await h.call("POST", "/v1/register", "sh_lt_noscope", { name: "launched-2" })).status).toBe(403);
+  });
+
+  it("launched agents refresh their token; desktop and key agents can't", async () => {
+    const h = harness();
+    const launched = (await h.call("POST", "/v1/register", "sh_lt_launch", { name: "launched-1" })).body.token;
+    const refreshed = await h.call("POST", "/v1/token/refresh", launched);
+    expect(refreshed.status).toBe(200);
+    expect(String(refreshed.body.token)).toMatch(/^rg_/);
+    expect((await h.call("GET", "/v1/whoami", launched)).status).toBe(401);
+    expect((await h.call("GET", "/v1/whoami", refreshed.body.token)).status).toBe(200);
+    const desk = (await h.call("POST", "/v1/register", "sh_at_member", { name: "desk-r" })).body.token;
+    expect((await h.call("POST", "/v1/token/refresh", desk)).status).toBe(403);
+    const keyed = (await h.call("POST", "/v1/register", "enroll-local-0000000000000000", { name: "keyed-r" })).body.token;
+    expect((await h.call("POST", "/v1/token/refresh", keyed)).status).toBe(403);
+  });
+
+  it("a launched agent gets 24 h whatever the launch credential's own expiry, and no enrollment key can take it over", async () => {
+    DEVICES.sh_lt_short = { active: true, principal_type: "relay_launch", sub: "u-member", org: "org-1", workspace: "ws-1", scopes: ["relay:agent:enrol"], agent_name: "launched-3", exp: Math.floor(Date.now() / 1000) + 60 };
+    const h = harness();
+    const r = await h.call("POST", "/v1/register", "sh_lt_short", { name: "launched-3", recovery: "recovery-proof-0123456789" });
+    expect(Date.parse(r.body.expires_at)).toBeGreaterThan(Date.now() + 23 * 3600 * 1000);
+    expect((await h.call("POST", "/v1/register", "enroll-local-0000000000000000", { name: "launched-3", recovery: "recovery-proof-0123456789" })).status).toBe(409);
+    expect(() => parsePolicy({ ...policy(), enrollmentKeys: [{ id: "launch:u-member", gid: 11, sha256: sha256("x".repeat(32)) }] })).toThrow(/reserved/);
+  });
+
+  it("reserved name prefixes can't be enrolled by anyone", async () => {
+    const h = harness();
+    expect((await h.call("POST", "/v1/register", "sh_at_member", { name: "control-alice" })).status).toBe(403);
+    expect((await h.call("POST", "/v1/register", "enroll-local-0000000000000000", { name: "control-alice" })).status).toBe(403);
+  });
+
+  it("a control plane checks a spawn at /v1/check as the launching person", async () => {
+    const h = harness();
+    const asLauncher = await h.call("POST", "/v1/check", "sh_at_member", { op: "w", resource: { kind: "stream", id: "node:ws-1/inside-node" }, content: "run the tests" });
+    expect(asLauncher.status).toBe(200);
+    expect(asLauncher.body).toEqual({ decision: "allow" });
+    // A launch credential is never accepted here (introspecting it would redeem it).
+    expect((await h.call("POST", "/v1/check", "sh_lt_launch", { op: "w", resource: { kind: "stream", id: "node:ws-1/x" }, content: "x" })).status).toBe(401);
+    // Reading a node stream isn't something the outside group may do.
+    expect((await h.call("POST", "/v1/check", "sh_at_member", { op: "r", resource: { kind: "stream", id: "node:ws-1/inside-node" } })).status).toBe(403);
+    expect((await h.call("POST", "/v1/check", "sh_at_revoked", { op: "w", resource: { kind: "stream", id: "node:ws-1/x" }, content: "x" })).status).toBe(401);
   });
 });
 

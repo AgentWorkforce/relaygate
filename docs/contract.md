@@ -345,6 +345,62 @@ token and sends all agent traffic to that origin. Credentials relaygate
 doesn't accept, such as a Relaycast `at_live_` agent token or a Relaycast node
 token (`nt_live_`) on `/v1/node/ws`, don't work through the gate.
 
+### Launched agents
+
+An agent a person launches on a spawn node enrols with the one-time launch
+credential relay-control hands the node for that launch (`sh_lt_…`, scope
+`relay:agent:enrol`, introspecting as `principal_type: "relay_launch"` with the
+launching person and a fixed `agent_name`):
+
+```
+POST /v1/register
+Authorization: Bearer sh_lt_...
+{"name": "<the credential's agent_name>"}
+
+200 {"agent_id", "gid", "token": "rg_...", "expires_at", "user_id"}
+```
+
+- The name must equal the credential's `agent_name` (else `403
+  relaygate_name_scope`). The person is mapped through `controlPrincipals`
+  (`kinds: ["launch"]` selects launch credentials); the agent gets that
+  rule's group.
+- relay-control burns the credential on redemption; relaygate never caches its
+  introspection. A relaunch is a fresh credential naming the same agent, and
+  returns the same `agent_id` (no recovery proof: the single-use credential is
+  the proof).
+- The token expires after 24 hours, whatever the launch credential's own
+  (short) expiry. Because the credential can't be reused, a launched agent
+  renews its own token before then:
+
+```
+POST /v1/token/refresh
+Authorization: Bearer rg_...   (the current, unexpired token)
+
+200 {"token": "rg_...", "expires_at": "<ISO-8601>"}
+```
+
+  which revokes the presented token. Only launched agents refresh: a desktop
+  agent re-registers with its device token (so a revoked device token stops
+  it), and an enrollment-key agent's token doesn't expire (`403
+  relaygate_denied` for both). Removing the agent (`DELETE /v1/agent`, or a
+  release) ends it.
+
+A spawn invocation carries the launching person's task to a node, so a
+control plane checks it before sending: `POST /v1/check` accepts a
+relay-control device token as the caller (the launching person), with node
+streams named `node:<workspace>/<node>` and placed by prefix defaults like any
+stream. The check writes nothing. It never accepts a launch credential:
+introspecting one redeems it, and the node could no longer register.
+
+Enrollment key ids `control`, `device:*` and `launch:*` are reserved, and an
+enrollment key never recovers a desktop-enrolled or launched agent.
+
+### Reserved names
+
+`reservedNamePrefixes` in the policy lists agent name prefixes no one may enrol
+at `/v1/register` (`403 relaygate_name_scope`), for names a control plane
+registers server-side (e.g. `["control-"]`). `ctl:` is always reserved.
+
 ### Agent status and removal
 
 ```

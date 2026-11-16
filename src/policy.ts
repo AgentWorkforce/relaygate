@@ -77,7 +77,7 @@ export const PolicySchema = z.object({
       z.object({
         match: z
           .object({
-            kinds: z.array(z.enum(["device", "read"])).min(1).optional(),
+            kinds: z.array(z.enum(["device", "read", "launch"])).min(1).optional(),
             orgIds: z.array(z.string().min(1)).min(1).optional(),
             workspaceIds: z.array(z.string().min(1)).min(1).optional(),
             roles: z.array(z.enum(["owner", "admin", "member"])).min(1).optional(),
@@ -93,6 +93,8 @@ export const PolicySchema = z.object({
       }),
     )
     .default([]),
+  /** Agent name prefixes no one may enrol at /v1/register (e.g. names a control plane registers server-side). */
+  reservedNamePrefixes: z.array(z.string().min(1)).default([]),
   /** Who may read Sessions aggregates that span every session (per-person usage, activity, digests). */
   sessionAggregates: z.object({ gids: z.array(Gid).default([]) }).default({ gids: [] }),
   /** Per group, the groups whose resources it may never touch, whatever the mode or ACL says. */
@@ -145,9 +147,11 @@ export function parsePolicy(raw: unknown): Policy {
   if (unknown.length > 0) {
     throw new Error(`policy names groups it doesn't define: ${unknown.map((u) => `${u.where} (gid ${u.gid})`).join(", ")}`);
   }
-  // `device:<userId>` and `control` mark agents relaygate enrols from relay-control identities; no policy key may use them.
+  // `device:<userId>`, `launch:<userId>` and `control` mark agents relaygate enrols from relay-control identities; no policy key may use them.
   for (const k of policy.enrollmentKeys) {
-    if (k.id === "control" || k.id.startsWith("device:")) throw new Error(`enrollment key id ${k.id} is reserved (control, device:*)`);
+    if (k.id === "control" || k.id.startsWith("device:") || k.id.startsWith("launch:")) {
+      throw new Error(`enrollment key id ${k.id} is reserved (control, device:*, launch:*)`);
+    }
   }
     // A key can't put an agent into a group its own ceiling forbids: the ceiling would always win, so it's a mistake.
   for (const k of policy.enrollmentKeys) {

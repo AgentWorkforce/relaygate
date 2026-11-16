@@ -207,6 +207,10 @@ export class Store {
     return rows.map((r) => String(r.hash));
   }
 
+  revokeTokenHash(hash: string): void {
+    this.db.prepare("UPDATE tokens SET revoked = 1 WHERE hash = ?").run(hash);
+  }
+
   /** Revokes every token issued to guest agents enrolled with the key; returns the revoked hashes. */
   revokeGuestKeyTokens(keyId: string): string[] {
     const agents = "SELECT id FROM agents WHERE key_id = ? AND guest = 1";

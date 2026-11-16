@@ -28,7 +28,9 @@ export interface ControlConfig {
 export type ControlRole = "owner" | "admin" | "member";
 
 export interface ControlIdentity {
-  kind: "device" | "read";
+  kind: "device" | "read" | "launch";
+  /** Launch credentials only: the one agent name it may enrol. */
+  agentName?: string;
   userId: string;
   email?: string;
   orgId: string;
@@ -49,8 +51,9 @@ const CACHE_MAX = 10_000;
 const MAX_READ_TOKEN_MS = 90 * 24 * 3600 * 1000;
 
 /** Which credential a bearer token is, by its prefix. */
-export function controlTokenKind(token: string): "device" | "read" | undefined {
+export function controlTokenKind(token: string): "device" | "read" | "launch" | undefined {
   if (token.startsWith("sh_at_")) return "device";
+  if (token.startsWith("sh_lt_")) return "launch";
   if (token.startsWith("rth_at_read_") || token.startsWith("rth_st_read_")) return "read";
   return undefined;
 }
@@ -71,7 +74,7 @@ export class ControlAuth {
   async identify(token: string): Promise<ControlIdentity | undefined> {
     const kind = controlTokenKind(token);
     if (kind === "read") return this.readToken(token);
-    if (kind === "device") return this.introspect(token);
+    if (kind === "device" || kind === "launch") return this.introspect(token, kind);
     return undefined;
   }
 
@@ -83,9 +86,9 @@ export class ControlAuth {
     return { kind: "read", userId: row.userId, email, orgId: row.orgId, workspaceId: row.workspaceId ?? undefined, role: row.role ?? undefined, scopes: ["rth:read"], expiresAt: row.expiresAt ?? undefined };
   }
 
-  private async introspect(token: string): Promise<ControlIdentity | undefined> {
+  private async introspect(token: string, kind: "device" | "launch"): Promise<ControlIdentity | undefined> {
     const key = sha256(token);
-    const hit = this.cache.get(key);
+    const hit = kind === "device" ? this.cache.get(key) : undefined;
     if (hit && hit.until > this.now()) return hit.identity;
     let res: Response;
     try {
@@ -108,9 +111,13 @@ export class ControlAuth {
       throw new ControlUnavailable("introspection answer could not be read");
     }
     if (!body || body.active !== true) return undefined;
-    if (body.principal_type !== "desktop-user" || typeof body.sub !== "string" || typeof body.org !== "string") return undefined;
+    // A device token is a person on their desktop; a launch credential is one agent a person launched.
+    const expected = kind === "device" ? "desktop-user" : "relay_launch";
+    if (body.principal_type !== expected || typeof body.sub !== "string" || typeof body.org !== "string") return undefined;
+    if (kind === "launch" && (typeof body.agent_name !== "string" || !body.agent_name)) return undefined;
     const identity: ControlIdentity = {
-      kind: "device",
+      kind,
+      ...(kind === "launch" ? { agentName: body.agent_name as string } : {}),
       userId: body.sub,
       email: typeof body.email === "string" ? body.email : undefined,
       orgId: body.org,
@@ -120,8 +127,11 @@ export class ControlAuth {
       expiresAt: typeof body.exp === "number" ? body.exp * 1000 : undefined,
     };
     if (identity.email) this.store.rememberControlEmail(identity.userId, identity.email);
-    const until = Math.min(this.now() + (this.cfg.cacheMs ?? 15_000), identity.expiresAt ?? Infinity);
-    this.remember(key, { identity, until });
+    // Launch credentials are single-use (relay-control burns them): never answered from cache.
+    if (kind === "device") {
+      const until = Math.min(this.now() + (this.cfg.cacheMs ?? 15_000), identity.expiresAt ?? Infinity);
+      this.remember(key, { identity, until });
+    }
     return identity;
   }
 

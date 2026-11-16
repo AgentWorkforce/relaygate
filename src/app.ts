@@ -248,7 +248,14 @@ export function createApp(deps: Deps) {
   /** Longest a device-enrolled agent's token lives before the desktop must register again (docs/contract.md). */
   const DEVICE_TOKEN_MAX_MS = 24 * 3600 * 1000;
 
-  /** POST /v1/register with a person's device token: identified by relay-control, grouped by controlPrincipals. */
+  /** Names the policy reserves for someone else (a control plane's server-side identities). */
+  const reservedName = (name: string, policy: Policy) => policy.reservedNamePrefixes.some((p) => name.startsWith(p));
+
+  /**
+   * POST /v1/register with a relay-control credential, identified by relay-control and grouped by
+   * controlPrincipals: a person's device token (their desktop's agents), or a one-time launch credential (one agent a
+   * person launched, whose name the credential fixes).
+   */
   const registerWithDevice = async (c: Context<Env>, deviceToken: string) => {
     const control = deps.control!;
     const policy = deps.policy();
@@ -263,24 +270,33 @@ export function createApp(deps: Deps) {
       store.audit({ agentId: null, action: "register", op: null, resourceKind: "agent", resourceId: identity ? `ctl:${identity.userId}` : null, decision: "deny", stage: "registration", reason });
       return deny(c, status, error, extra);
     };
-    if (!identity) return refuse(401, "relaygate_unauthenticated", "device_token_invalid");
-    if (!identity.scopes.includes("cli:auth")) return refuse(403, "relaygate_denied", "device_token_no_cli_auth", { detail: "the device token needs cli:auth" });
+    if (!identity) return refuse(401, "relaygate_unauthenticated", "control_credential_invalid");
+    const launch = identity.kind === "launch";
+    const needed = launch ? "relay:agent:enrol" : "cli:auth";
+    if (!identity.scopes.includes(needed)) return refuse(403, "relaygate_denied", `control_credential_no_${needed}`, { detail: `the credential needs ${needed}` });
     const rule = matchControlRule(identity, policy);
     if (!rule) return refuse(403, "relaygate_denied", "no_control_rule", { detail: "no controlPrincipals rule matches this person" });
     const parsed = RegisterBody.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return deny(c, 400, "relaygate_bad_request", { detail: parsed.error.issues[0]?.message });
     const { name, recovery } = parsed.data;
     if (rule.namePrefix && !name.startsWith(rule.namePrefix)) return refuse(403, "relaygate_name_scope", "name_scope");
-    const keyId = `device:${identity.userId}`;
-    const expiresAt = Math.min(now() + DEVICE_TOKEN_MAX_MS, identity.expiresAt ?? Infinity);
+    if (reservedName(name, policy)) return refuse(403, "relaygate_name_scope", "name_reserved");
+    // A launch credential enrols exactly the agent it names.
+    if (launch && name !== identity.agentName) return refuse(403, "relaygate_name_scope", "launch_name_mismatch", { detail: "name must equal the launch credential's agent_name" });
+    const keyId = `${launch ? "launch" : "device"}:${identity.userId}`;
+    // A desktop agent's token never outlives the device token behind it; a launched agent's is a flat 24 h (it renews
+    // with /v1/token/refresh: the single-use launch credential's own short expiry doesn't apply to the agent).
+    const expiresAt = launch ? now() + DEVICE_TOKEN_MAX_MS : Math.min(now() + DEVICE_TOKEN_MAX_MS, identity.expiresAt ?? Infinity);
     const answer = (agentId: string, gid: number, token: string) =>
       c.json({ agent_id: agentId, gid, token, expires_at: new Date(expiresAt).toISOString(), user_id: identity!.userId });
 
     const existing = store.agentByName(name);
     if (existing) {
-      // Only the same person, with the recovery proof, gets an existing name back.
+      // Only the same person gets an existing name back: with the recovery proof, or (a relaunch) with a fresh
+      // single-use launch credential naming that very agent.
       const recovered =
-        existing.keyId === keyId && recovery !== undefined && existing.recoveryHash !== null && sameHash(existing.recoveryHash, sha256(recovery));
+        existing.keyId === keyId &&
+        (launch || (recovery !== undefined && existing.recoveryHash !== null && sameHash(existing.recoveryHash, sha256(recovery))));
       if (!recovered) return refuse(409, "relaygate_name_taken", "name_taken");
       store.revokeTokens(existing.id);
       deps.onTokensRevoked?.();
@@ -300,7 +316,8 @@ export function createApp(deps: Deps) {
 
   app.post("/v1/register", async (c) => {
     const key = bearer(c);
-    if (key && deps.control && controlTokenKind(key) === "device") return registerWithDevice(c, key);
+    const credentialKind = key && deps.control ? controlTokenKind(key) : undefined;
+    if (credentialKind === "device" || credentialKind === "launch") return registerWithDevice(c, key!);
     const policy = deps.policy();
     const matches: EnrollmentKey[] = key ? policy.enrollmentKeys.filter((k) => sameHash(k.sha256, sha256(key))) : [];
     const enrollment = matches.find((k) => keyUsable(k, now()));
@@ -313,7 +330,7 @@ export function createApp(deps: Deps) {
     const parsed = RegisterBody.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return deny(c, 400, "relaygate_bad_request", { detail: parsed.error.issues[0]?.message });
     const { name, recovery } = parsed.data;
-    if (enrollment.namePrefix && !name.startsWith(enrollment.namePrefix)) {
+    if ((enrollment.namePrefix && !name.startsWith(enrollment.namePrefix)) || reservedName(name, policy)) {
       store.audit({ agentId: null, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "deny", stage: "registration", reason: "name_scope" });
       return deny(c, 403, "relaygate_name_scope");
     }
@@ -326,8 +343,9 @@ export function createApp(deps: Deps) {
         existing.guest = true;
       }
       const recovered =
-        // A desktop-enrolled agent belongs to its person: only their device token recovers it.
+        // A desktop-enrolled or launched agent belongs to its person: only their relay-control credential recovers it.
         !existing.keyId.startsWith("device:") &&
+        !existing.keyId.startsWith("launch:") &&
         existing.gid === enrollment.gid &&
         existing.guest === enrollment.guest &&
         recovery !== undefined &&
@@ -419,7 +437,7 @@ export function createApp(deps: Deps) {
 
   // Everything below needs an rg_ token.
   /** A caller holding only a relay-control credential (Sessions routes only): identified, then mapped by policy. */
-  const authenticateControl = async (c: Context<Env>, token: string): Promise<Response | undefined> => {
+  const authenticateControl = async (c: Context<Env>, token: string, checkOnly = false): Promise<Response | undefined> => {
     const control = deps.control!;
     let identity;
     try {
@@ -442,12 +460,12 @@ export function createApp(deps: Deps) {
       return deny(c, 403, "relaygate_denied", { detail: "no controlPrincipals rule matches this user" });
     }
     // Uploads need a device token that may sync; a read token (or a device token without rth:sync) only reads.
-    const writes = c.req.method !== "GET" && c.req.method !== "HEAD";
+    const writes = !checkOnly && c.req.method !== "GET" && c.req.method !== "HEAD";
     if (writes && (identity.kind !== "device" || !identity.scopes.includes("rth:sync"))) {
       store.audit({ agentId: null, action: "auth", op: "w", resourceKind: "agent", resourceId: `ctl:${identity.userId}`, decision: "deny", stage: "auth", reason: `control_${identity.kind}_cannot_write` });
       return deny(c, 403, "relaygate_denied", { detail: "uploads need a device token with rth:sync" });
     }
-    if (!writes && !identity.scopes.includes("rth:read")) {
+    if (!checkOnly && !writes && !identity.scopes.includes("rth:read")) {
       return deny(c, 403, "relaygate_denied", { detail: "this credential has no rth:read" });
     }
     let resolved;
@@ -474,6 +492,13 @@ export function createApp(deps: Deps) {
     if (onSessions && (c.req.path === "/sessions/v1/auth/token/revoke" || c.req.path === "/sessions/healthz")) return next();
     const relaygateToken = onSessions ? c.req.header("x-relaygate-token")?.trim() : undefined;
     const presented = bearer(c);
+    // /v1/check also answers for a person's device token, e.g. a control plane checking a spawn as the person
+    // launching it. Never a launch credential: introspecting it would redeem it before the node can register.
+    if (c.req.path === "/v1/check" && deps.control && presented && controlTokenKind(presented) === "device") {
+      const refused = await authenticateControl(c, presented, true);
+      if (refused) return refused;
+      return next();
+    }
     if (onSessions && !relaygateToken && deps.control && presented && controlTokenKind(presented)) {
       const refused = await authenticateControl(c, presented);
       if (refused) return refused;
@@ -508,6 +533,22 @@ export function createApp(deps: Deps) {
   // Registered before auth, so relaygate's own refusals reach the dashboard with CORS headers too.
   if (deps.sessions?.corsOrigins?.length) app.use("/sessions/*", sessionsCors(deps.sessions));
   app.use("/sessions/*", authenticate);
+
+  // Launched agents can't re-register (their launch credential is single-use): they refresh before expiry instead.
+  app.post("/v1/token/refresh", (c) => {
+    const agent = c.get("agent");
+    if (!agent.keyId.startsWith("launch:")) {
+      return deny(c, 403, "relaygate_denied", {
+        detail: agent.keyId.startsWith("device:") ? "re-register with your device token" : "this token doesn't expire",
+      });
+    }
+    const expiresAt = now() + DEVICE_TOKEN_MAX_MS;
+    store.revokeTokenHash(c.get("tokenHash"));
+    deps.onTokensRevoked?.();
+    const token = store.issueToken(agent.id, expiresAt);
+    store.audit({ agentId: agent.id, action: "token.refresh", op: null, resourceKind: "agent", resourceId: agent.name, decision: "allow", stage: "auth", reason: agent.keyId });
+    return c.json({ token, expires_at: new Date(expiresAt).toISOString() });
+  });
 
   app.get("/v1/whoami", (c) => {
     const policy = deps.policy();
