@@ -477,9 +477,11 @@ async function main() {
       const h = await auditHead();
       const asAgent = await localA.call("GET", `/sessions/v1/sessions/${docSession(RUN)}/events`);
       const row = (await audit(h, localA.name)).find((r) => r.action === "session.read" && r.resource_id === docSession(RUN));
-      const refused = asAgent.status === 403 && asAgent.body?.error === "relaygate_denied" && row?.decision === "deny";
+      // relaygate's own shape ({error: "<code>"}) or the Relaycast-shaped one ({error: {code}}).
+      const code = typeof asAgent.body?.error === "string" ? asAgent.body.error : asAgent.body?.error?.code;
+      const refused = asAgent.status === 403 && code === "relaygate_denied" && row?.decision === "deny";
       record(16, "a local agent (rg_, with the same person's read token) reads the inside session: refused", refused ? "PASS" : "FAIL", [
-        `agent read ${asAgent.status} ${asAgent.body?.error ?? ""}; gate ${row?.decision ?? "no audit row"}`,
+        `agent read ${asAgent.status} ${code ?? ""}; gate ${row?.decision ?? "no audit row"}`,
         "This proves relaygate's decision for the agent's rg_. An agent that holds a person credential can present it as the person: keep person-only grants on dashboard read tokens.",
       ], row ? [fmt(row)] : []);
     } else record(16, "a local agent reads the inside session", "SKIP", ["scenario 15 didn't show the person can read, so a refusal here would prove nothing"]);
@@ -649,10 +651,13 @@ async function main() {
     if (!cred) notes.push("no outside read credential (set OUTSIDE_SESSIONS_READ or SESSIONS_READ_REFRESH_CMD)");
     for (const [label, path] of cred ? probes : []) {
       const r = await request(process.env.DIRECT_SESSIONS_READ_URL, "GET", path, cred);
-      const leaks = ok(r.status) && JSON.stringify(r.body ?? "").includes(docSession(RUN));
+      // When every person may read the pit, relaygate's own host serving it to the person is policy (scenario 15),
+      // not a way around relaygate: the bypass is then proven by DIRECT_PROBE_CMD alone.
+      const leaks = ok(r.status) && JSON.stringify(r.body ?? "").includes(docSession(RUN)) && !(gate && process.env.PEOPLE_READ_PIT === "1");
       // Only a refusal proves the door is shut. A 2xx without the session, or a 5xx, proves nothing either way,
       // unless relaygate itself answered it.
       const refused = r.status === 0 || r.status === 401 || r.status === 403 || r.status === 404 || (gate && ok(r.status) && !leaks);
+      if (gate && ok(r.status) && process.env.PEOPLE_READ_PIT === "1") notes.push(`${label}: relaygate answered ${r.status} to the person (PEOPLE_READ_PIT=1: policy, not a bypass)`);
       bypassed ||= leaks;
       inconclusive ||= !refused && !leaks;
       notes.push(`${label} direct: ${r.status === 0 ? "no connection" : r.status}${leaks ? " — INSIDE SESSION READABLE WITHOUT relaygate" : refused ? " (refused)" : " (inconclusive: not a refusal)"}`);
