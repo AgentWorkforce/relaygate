@@ -84,6 +84,11 @@ canary; outside agents try every way to get it; the audit log is the evidence)
 is in [docs/acceptance-pit.md](docs/acceptance-pit.md), with the driver and the
 inside test agent in `scripts/acceptance/`.
 
+To badge sessions by group in a dashboard, give groups display labels in the
+policy (`"groupLabels": {"22": {"label": "pit"}}`); readable sessions those
+groups own then carry `relaygate: {"gid": 22, "label": "pit"}` in session lists,
+metadata and catalog reads. See "Group labels" in the contract.
+
 Example policies with their cases: `examples/policy.pit.json` (with a guest)
 and `examples/policy.double-pit.json` (two groups: laptops outside the
 regulated boundary, cloud agents inside it).

@@ -27,6 +27,7 @@
     {"gid": 22, "mode": "660"}
   ],
   "sessionOverrides": [],
+  "groupLabels": {"22": {"label": "pit", "description": "Agents inside the boundary"}},
   "ceilings": [
     {"gid": 44, "never": [22]}
   ],

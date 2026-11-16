@@ -122,6 +122,24 @@ export const PolicySchema = z.object({
     })
     .strict()
     .optional(),
+  /**
+   * Display labels for groups, keyed by gid in decimal (e.g. `{"22": {"label": "pit"}}`). relaygate adds
+   * `relaygate: {"gid", "label"}` to each readable session a group with a label owns, so a dashboard can badge it.
+   * Display only: a label grants nothing. No group has a label unless the policy gives it one.
+   */
+  groupLabels: z
+    .record(
+      z.string().regex(/^(0|[1-9][0-9]*)$/, "groupLabels keys are gids in decimal"),
+      z
+        .object({
+          label: z
+            .string()
+            .regex(/^[A-Za-z0-9](?:[A-Za-z0-9 ._-]{0,22}[A-Za-z0-9._-])?$/, "label is 1-24 characters: A-Z, a-z, 0-9, space, '.', '_' and '-', starting with a letter or digit and not ending in a space"),
+          description: z.string().min(1).max(200).regex(/^[^\u0000-\u001f\u007f]+$/u, "description has no control characters").optional(),
+        })
+        .strict(),
+    )
+    .optional(),
   /** Who may read Sessions aggregates that span every session (per-person usage, activity, digests). */
   sessionAggregates: z.object({ gids: z.array(Gid).default([]) }).default({ gids: [] }),
   /** Per group, the groups whose resources it may never touch, whatever the mode or ACL says. */
@@ -170,6 +188,7 @@ export function parsePolicy(raw: unknown): Policy {
     ...policy.controlPrincipals.flatMap((rule, i) => [rule.gid, ...rule.groups].map((gid) => ({ where: `control principal rule ${i}`, gid }))),
     ...policy.sessionAggregates.gids.map((gid) => ({ where: "sessionAggregates", gid })),
     ...policy.ceilings.flatMap((c) => [c.gid, ...c.never].map((gid) => ({ where: `ceiling for ${c.gid}`, gid }))),
+    ...Object.keys(policy.groupLabels ?? {}).map((key) => ({ where: "groupLabels", gid: Number(key) })),
   ].filter((r) => !gids.has(r.gid));
   if (unknown.length > 0) {
     throw new Error(`policy names groups it doesn't define: ${unknown.map((u) => `${u.where} (gid ${u.gid})`).join(", ")}`);
@@ -226,4 +245,9 @@ export function keyUsable(key: EnrollmentKey, now: number): boolean {
 
 export function loadPolicyFile(path: string): Policy {
   return parsePolicy(JSON.parse(readFileSync(path, "utf8")));
+}
+
+/** The display label a policy gives a group, if any (see `groupLabels`). */
+export function groupLabel(policy: Policy, gid: number): string | undefined {
+  return policy.groupLabels?.[String(gid)]?.label;
 }

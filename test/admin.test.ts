@@ -103,6 +103,10 @@ describe("admin API for relay-control (R2)", () => {
     expect(unknownGid.body).toMatchObject({ ok: false, errors: [{ message: expect.stringContaining("gid 9") }] });
     const reserved = await h.call("POST", "/admin/v1/policy/validate", ADMIN, { policy: { groups: [{ gid: 1, name: "a" }], enrollmentKeys: [{ id: "device:u1", gid: 1, sha256: sha256("x") }] } });
     expect(reserved.body.ok).toBe(false);
+    const labels = (groupLabels: unknown) => h.call("POST", "/admin/v1/policy/validate", ADMIN, { policy: { groups: [{ gid: 1, name: "a" }], enrollmentKeys: [], groupLabels } });
+    expect((await labels({ "1": { label: "pit", description: "Pit crew" } })).body.ok).toBe(true);
+    expect((await labels({ "1": { label: "<script>" } })).body).toMatchObject({ ok: false, errors: [{ path: "groupLabels.1.label" }] });
+    expect((await labels({ "2": { label: "b" } })).body).toMatchObject({ ok: false, errors: [{ message: expect.stringContaining("groupLabels (gid 2)") }] });
     expect((await h.call("POST", "/admin/v1/policy/validate", ADMIN, {})).status).toBe(400);
     expect((await h.call("POST", "/admin/v1/policy/validate", "rg_nope", { policy: h.p })).status).toBe(401);
   });
