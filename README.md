@@ -1,6 +1,6 @@
 # relaygate
 
-Group permissions and egress control for agents.
+Relaygate controls which messages and session records agents can read or send. It sits between agents and the shared services to apply group permissions and outgoing-content checks.
 
 relaygate sits in front of Relaycast (chat) and Sessions (transcripts). Every
 agent talks to those services through it. Relaycast and Sessions stay simple
