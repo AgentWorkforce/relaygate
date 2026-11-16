@@ -65,9 +65,13 @@ const fmt = (r: any) =>
  * Whether an origin is relaygate itself (on gate-only installs the public Relaycast and history hosts ARE relaygate):
  * an unauthenticated probe answers with one of relaygate's own error codes.
  */
-async function isRelaygate(origin: string): Promise<boolean> {
-  const r = await request(origin, "GET", "/v1/relaygate-probe", undefined);
-  return /"relaygate_[a-z_]+"/.test(JSON.stringify(r.body ?? ""));
+async function isRelaygate(origin: string, paths: string[]): Promise<boolean> {
+  // An ingress may route only the paths relaygate serves: probe those first, unauthenticated.
+  for (const path of [...paths, "/v1/relaygate-probe"]) {
+    const r = await request(origin, "GET", path, undefined);
+    if (/"relaygate_[a-z_]+"/.test(JSON.stringify(r.body ?? ""))) return true;
+  }
+  return false;
 }
 
 /** DIRECT_PROBE_CMD: run from an unprivileged pod; exit 0 means every upstream origin around relaygate is unreachable. */
@@ -541,7 +545,7 @@ async function main() {
     const leakedCred = /at_live_|nt_live_|rk_live_|rth_(st|at)_/.test(JSON.stringify([who.body, nt.body]));
     notes.push(`upstream credentials in anything a client received: ${leakedCred}`);
     pass &&= !leakedCred;
-    const castIsGate = !!process.env.RELAYCAST_DIRECT_URL && (await isRelaygate(process.env.RELAYCAST_DIRECT_URL));
+    const castIsGate = !!process.env.RELAYCAST_DIRECT_URL && (await isRelaygate(process.env.RELAYCAST_DIRECT_URL, ["/v1/agent", "/v1/whoami"]));
     if (castIsGate) {
       // Gate-only: that host is relaygate, so it can't show a way around it. DIRECT_PROBE_CMD must check from inside.
       notes.push("RELAYCAST_DIRECT_URL answers as relaygate (gate-only public host): no bypass through it");
@@ -639,7 +643,7 @@ async function main() {
     let bypassed = false;
     let inconclusive = false;
     // Gate-only: the history host is relaygate itself, which answers a list filtered to what the caller may read.
-    const gate = await isRelaygate(process.env.DIRECT_SESSIONS_READ_URL);
+    const gate = await isRelaygate(process.env.DIRECT_SESSIONS_READ_URL, ["/v1/sessions"]);
     if (gate) notes.push("DIRECT_SESSIONS_READ_URL answers as relaygate (gate-only public host): a filtered 2xx is relaygate's answer, not a bypass");
     if (!cred) notes.push("no outside read credential (set OUTSIDE_SESSIONS_READ or SESSIONS_READ_REFRESH_CMD)");
     for (const [label, path] of cred ? probes : []) {
