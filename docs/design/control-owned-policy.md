@@ -133,7 +133,11 @@ The first version is imported from the current ConfigMap (`POST /api/v1/relaygat
 6. **Guest access**:
    - Create a key: label, group, extra groups, name prefix, expiry (required for guests) and a guest flag. The key is shown once with a copy button and a "this won't be shown again" notice.
    - The list shows group, expiry, last used, agents and active tokens.
-   - Revoke asks for confirmation and states that every token from this key ends within seconds.
+   - Revoke asks for confirmation and states what it does:
+     - for a guest key, every token issued from it ends on relaygate's next poll (within seconds);
+     - for an ordinary key, it stops new enrolments only, and agents already enrolled keep working (contract.md, "Guests").
+
+     Contractor and guest keys created on this screen are always guest keys, so revoking one always ends access.
 7. **Explain**: "may [person or agent] [read or write] [stream or session id]". Shows the decision, the steps and the matching rule. "Preview with my unsaved changes" sends the draft.
 8. **History**: versions with author, time and comment; a diff against the previous version; rollback.
 
