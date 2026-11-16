@@ -326,13 +326,13 @@ export function createApp(deps: Deps) {
       deps.onTokensRevoked?.();
       // The person's current rule decides the group (their role or the policy may have changed).
       store.setAgentGroups(existing.id, rule.gid, rule.groups);
-      const token = store.issueToken(existing.id, expiresAt, ownPerson ? (binding ?? undefined) : undefined);
+      const token = store.issueToken(existing.id, expiresAt, launch ? undefined : (binding ?? undefined));
       store.audit({ agentId: existing.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: `device_recovered:${identity.userId}` });
       await enrollUpstream({ ...existing, gid: rule.gid, groups: rule.groups });
       return answer(existing.id, rule.gid, token);
     }
     const agent = store.createAgent(name, rule.gid, keyId, recovery, false, rule.groups);
-    const token = store.issueToken(agent.id, expiresAt, ownPerson ? (binding ?? undefined) : undefined);
+    const token = store.issueToken(agent.id, expiresAt, launch ? undefined : (binding ?? undefined));
     store.audit({ agentId: agent.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: `device:${identity.userId}` });
     await enrollUpstream(agent);
     return answer(agent.id, rule.gid, token);
