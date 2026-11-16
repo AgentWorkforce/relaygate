@@ -191,6 +191,11 @@ export function policyVersion(policy: Policy): string {
   return v;
 }
 
+/** Names a policy's version as its source knows it (e.g. relay-control's number); audit rows record this. */
+export function labelPolicyVersion(policy: Policy, label: string): void {
+  versions.set(policy, label);
+}
+
 export type EnrollmentKey = Policy["enrollmentKeys"][number];
 
 /** Whether the key can still enroll agents at `now` (milliseconds since the epoch). */

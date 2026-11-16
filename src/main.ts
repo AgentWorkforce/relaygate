@@ -1,8 +1,8 @@
-import { statSync } from "node:fs";
 import { serve } from "@hono/node-server";
 import { createApp, sweepGuestKeys } from "./app.js";
 import { classifierFromPolicy, type Classifier } from "./classifier.js";
-import { loadPolicyFile, type Policy } from "./policy.js";
+import { policyVersion, type Policy } from "./policy.js";
+import { ControlPolicySource, FilePolicySource, type PolicySource } from "./policy-source.js";
 import { NodeSockets } from "./realtime.js";
 import { RelaycastUpstream } from "./relaycast.js";
 import { routeSessionsHosts, sessionsAtRoot } from "./sessions.js";
@@ -10,8 +10,14 @@ import { ControlAuth } from "./control.js";
 import { SecretBox, Store } from "./store.js";
 
 const policyPath = process.env.RELAYGATE_POLICY;
-if (!policyPath) {
-  console.error("RELAYGATE_POLICY must point at the operator policy JSON file");
+const policyUrl = process.env.RELAYCONTROL_POLICY_URL;
+if (!policyPath === !policyUrl) {
+  console.error("set exactly one policy source: RELAYGATE_POLICY (a JSON file) or RELAYCONTROL_POLICY_URL (pulled from relay-control)");
+  process.exit(1);
+}
+const policySecret = process.env.RELAYCONTROL_POLICY_SECRET ?? "";
+if (policyUrl && policySecret.length < 32) {
+  console.error("RELAYCONTROL_POLICY_URL needs RELAYCONTROL_POLICY_SECRET (at least 32 characters)");
   process.exit(1);
 }
 const dbPath = process.env.RELAYGATE_DB ?? "/data/relaygate.db";
@@ -19,30 +25,52 @@ const port = Number(process.env.PORT ?? 8080);
 const reloadMs = Number(process.env.RELAYGATE_POLICY_RELOAD_MS ?? 5000);
 
 const store = new Store(dbPath);
-let policy: Policy = loadPolicyFile(policyPath);
-let classifier: Classifier = classifierFromPolicy(policy);
-let mtime = statSync(policyPath).mtimeMs;
+// A file must parse at startup. relay-control may be down: relaygate starts from its cached copy, or refuses
+// everything (503) until the first good pull.
+const source: PolicySource = policyUrl ? new ControlPolicySource({ url: policyUrl, secret: policySecret }, store) : new FilePolicySource(policyPath!);
+const classifiers = new WeakMap<Policy, Classifier>();
+const policy = () => source.current();
+const classifier = () => {
+  const p = policy();
+  let c = classifiers.get(p);
+  if (!c) classifiers.set(p, (c = classifierFromPolicy(p)));
+  return c;
+};
 
-// Keep the last good policy if a new one doesn't parse, so a bad edit never opens the gate.
-setInterval(() => {
+const sweep = () => {
+  let p: Policy;
+  try {
+    p = policy();
+  } catch {
+    return;
+  }
   // Guest keys that were revoked or have expired end their tokens even if no one calls with them.
-  const ended = sweepGuestKeys(store, policy, Date.now());
+  const ended = sweepGuestKeys(store, p, Date.now());
   if (ended.length > 0) {
     console.log(JSON.stringify({ msg: "guest tokens ended", count: ended.length }));
     sockets?.revalidate();
   }
+};
+let refreshing = false;
+const tick = async () => {
+  if (refreshing) return;
+  refreshing = true;
   try {
-    const m = statSync(policyPath).mtimeMs;
-    if (m === mtime) return;
-    const next = loadPolicyFile(policyPath);
-    policy = next;
-    classifier = classifierFromPolicy(next);
-    mtime = m;
-    console.log(JSON.stringify({ msg: "policy reloaded", groups: next.groups.length, keys: next.enrollmentKeys.length }));
-  } catch (error) {
-    console.error(JSON.stringify({ msg: "policy reload failed; keeping the previous policy", error: (error as Error).message }));
+    const before = source.status().lastRejected?.at;
+    if (await source.refresh()) {
+      const p = policy();
+      console.log(JSON.stringify({ msg: "policy applied", version: policyVersion(p), groups: p.groups.length, keys: p.enrollmentKeys.length }));
+    } else if (source.status().lastRejected && source.status().lastRejected?.at !== before) {
+      // Keep the last good policy if a new one doesn't verify or parse, so a bad edit never opens the gate.
+      console.error(JSON.stringify({ msg: "policy rejected; keeping the policy in force", ...source.status().lastRejected }));
+    }
+    sweep();
+  } finally {
+    refreshing = false;
   }
-}, reloadMs).unref();
+};
+setInterval(() => void tick(), reloadMs).unref();
+if (policyUrl) void tick();
 
 const adminToken = process.env.RELAYGATE_ADMIN_TOKEN || undefined;
 if (adminToken !== undefined && adminToken.length < 24) {
@@ -85,12 +113,12 @@ if (process.env.RELAYCONTROL_INTROSPECT_URL) {
   control = new ControlAuth({ introspectUrl: process.env.RELAYCONTROL_INTROSPECT_URL, introspectSecret: secret, audience }, store);
 }
 let sockets: NodeSockets | undefined;
-const deps = { store, policy: () => policy, classifier: () => classifier, adminToken, relaycast, sessions, control, onTokensRevoked: () => sockets?.revalidate() };
+const deps = { store, policy, classifier, policyStatus: () => source.status(), adminToken, relaycast, sessions, control, onTokensRevoked: () => sockets?.revalidate() };
 const app = createApp(deps);
 
 const fetchFn = sessions?.hosts?.length ? routeSessionsHosts(app.fetch, sessions.hosts) : app.fetch;
 const server = serve({ fetch: fetchFn, port }, (info) => {
-  console.log(JSON.stringify({ msg: "relaygate listening", port: info.port, model_classifier: policy.classifier.model.enabled, relaycast: !!relaycast, sessions: !!sessions, sessions_hosts: sessions?.hosts ?? [], control_principals: !!control }));
+  console.log(JSON.stringify({ msg: "relaygate listening", port: info.port, policy_source: source.status().source, relaycast: !!relaycast, sessions: !!sessions, sessions_hosts: sessions?.hosts ?? [], control_principals: !!control }));
 });
 // An internal listener serving Sessions at its root, so a control plane that requires a bare-origin Sessions URL can
 // point at relaygate (and mint read tokens through it). Keep it off any public route.
