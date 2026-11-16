@@ -428,6 +428,12 @@ describe("person identities (personNames)", () => {
     expect((await h.call("GET", "/v1/whoami", b.body.token)).status).toBe(200);
   });
 
+  it("refuses a person prefix that can't be an agent name", () => {
+    expect(() => parsePolicy({ ...policy(), personNames: { prefix: "person/" } })).toThrow();
+    expect(() => parsePolicy({ ...policy(), personNames: { prefix: "ctl:p-" } })).toThrow();
+    expect(() => parsePolicy({ ...policy(), personNames: { prefix: "p".repeat(65) } })).toThrow();
+  });
+
   it("nobody else enrols a person name: not another person, not a launch, not an enrollment key", async () => {
     const h = harness({ policy: personPolicy() });
     const me = personOf("u-member");

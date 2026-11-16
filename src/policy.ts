@@ -112,7 +112,16 @@ export const PolicySchema = z.object({
    * only that user may enrol (with their device token, from any number of computers, each with its own recovery
    * proof), whatever their rule's namePrefix. No one else may enrol a name with this prefix.
    */
-  personNames: z.object({ prefix: z.string().min(1), hashLength: z.number().int().min(8).max(64).default(16) }).strict().optional(),
+  personNames: z
+    .object({
+      prefix: z
+        .string()
+        .regex(/^[A-Za-z0-9._:-]{1,64}$/, "prefix uses only A-Z, a-z, 0-9, '.', '_', ':' and '-' (agent name characters), at most 64")
+        .refine((p) => !p.toLowerCase().startsWith("ctl:"), "ctl: is reserved for relay-control users"),
+      hashLength: z.number().int().min(8).max(64).default(16),
+    })
+    .strict()
+    .optional(),
   /** Who may read Sessions aggregates that span every session (per-person usage, activity, digests). */
   sessionAggregates: z.object({ gids: z.array(Gid).default([]) }).default({ gids: [] }),
   /** Per group, the groups whose resources it may never touch, whatever the mode or ACL says. */

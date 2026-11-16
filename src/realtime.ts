@@ -213,7 +213,10 @@ export class NodeSockets {
 
   /** Whether a pushed delivery is something the agent may read. Anything unrecognised is dropped. */
   private deliverable(conn: Conn, frame: Record<string, unknown>): boolean {
-    const { agent } = conn;
+    // Groups can change while a socket is open (the same person re-registering elsewhere): decide on the stored agent.
+    const agent = this.deps.store.agentForTokenHash(conn.row.agentTokenHash);
+    if (!agent || agent.id !== conn.agent.id) return false;
+    conn.agent = agent;
     if (frame.agent !== agent.name) return false;
     const payload = frame.payload as { type?: unknown; data?: Record<string, unknown> } | undefined;
     const kind = payload?.type;
@@ -237,6 +240,7 @@ export class NodeSockets {
     const now = (this.deps.now ?? Date.now)();
     for (const conn of this.conns) {
       const agent = this.deps.store.agentForTokenHash(conn.row.agentTokenHash);
+      if (agent) conn.agent = agent;
       if (!agent || guestEnded(agent, this.deps.policy(), now)) {
         this.deps.store.audit({ agentId: conn.agent.id, action: "node_ws", op: null, resourceKind: null, resourceId: null, decision: "deny", stage: "auth", reason: "token_revoked" });
         this.end(conn, 4401, "token revoked");
