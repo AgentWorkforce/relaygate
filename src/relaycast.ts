@@ -333,6 +333,21 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
     return res.status === 200;
   };
 
+  /**
+   * The other participant of a 1:1 DM the caller is in, or undefined when the caller isn't in it (or it can't be
+   * told). Replying to the other's message: its author. Replying under your own message: an author of the
+   * conversation who isn't you.
+   */
+  const dmCounterpart = async (c: Ctx, me: string, author: string, conversationId: string | undefined): Promise<string | undefined> => {
+    if (!conversationId || !DM_ID.test(conversationId)) return undefined;
+    const res = await forward(c, "GET", `/v1/dm/${encodeURIComponent(conversationId)}/messages?limit=50`);
+    // Relaycast answers only participants.
+    if (res.status !== 200) return undefined;
+    if (author && author !== me) return author;
+    const other = asArray(dataOf(res.body)).map((m) => m.agent_name).find((n) => typeof n === "string" && n !== "" && n !== me);
+    return typeof other === "string" ? other : undefined;
+  };
+
   const MSG_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
   // --- self ------------------------------------------------------------------------------------------------
@@ -525,10 +540,20 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
       const where = await messageStream(c, messageId);
       if ("status" in where) return pass(c, where);
       if ("authorOnly" in where) {
-        // A DM message (or a thread under it) is readable by id only by the two participants. Writes into DM threads
-        // aren't modelled (which inbox would they go to?), so they are refused; answer with POST /v1/dm.
+        // A DM message (or a thread under it) is readable by id only by the two participants. A thread reply under a
+        // DM is a DM to the other participant, so it is decided exactly as POST /v1/dm to them: w on their inbox.
+        // Other writes into DM threads (reactions) aren't modelled and are refused.
         // Reading a DM is reading your own inbox, so the inbox's read bit (and any ceiling) applies too.
         const me = c.get("agent").name;
+        if (op === "w" && action === "thread.reply") {
+          const other = await dmCounterpart(c, me, where.author, where.conversationId);
+          if (!other) {
+            audit(c, action, op, `relaycast:message/${messageId}`, "deny", "mode", "dm_reply_not_participant");
+            return denied(c, op, `relaycast:message/${messageId}`);
+          }
+          const refused = await gateWrite(c, action, inboxStream(other), writeContent(body!));
+          return refused ?? handler(c, messageId, body);
+        }
         const mine =
           op === "r" &&
           canRead(deps, c.get("principal"), inboxStream(me)) &&

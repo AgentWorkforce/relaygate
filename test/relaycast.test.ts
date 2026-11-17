@@ -265,8 +265,42 @@ describe("Relaycast proxy: the pit rules", () => {
     expect((await h.call("GET", `/v1/messages/${id}`, pit)).status).toBe(200);
     expect((await h.call("GET", `/v1/messages/${id}`, local)).status).toBe(200);
     expect((await h.call("GET", `/v1/messages/${id}`, guest)).status).toBe(403);
-    // Writes into a DM thread aren't modelled.
+    // A thread reply under the DM is a DM back to local-a: the pit may not write local-a's inbox.
     expect((await h.call("POST", `/v1/messages/${id}/replies`, pit, { text: "x" })).status).toBe(403);
+  });
+
+  it("a thread reply under a DM is a DM to the other participant", async () => {
+    const h = harness();
+    const a = await h.token(KEYS.local, "local-a");
+    const b = await h.token(KEYS.local, "local-b");
+    const c = await h.token(KEYS.local, "local-c");
+    const pit = await h.token(KEYS.pit, "pit-a");
+    const lastAudit = () => h.store.recentAudit(1)[0];
+
+    // local B answers local A's DM in its thread: decided as w on A's inbox, and forwarded.
+    const dm = await h.call("POST", "/v1/dm", a, { to: "local-b", text: "ping" });
+    const id = dm.body.data.message.id;
+    const reply = await h.call("POST", `/v1/messages/${id}/replies`, b, { text: "pong", from: "local-z" });
+    expect(reply.status).toBe(201);
+    expect(lastAudit()).toMatchObject({ action: "thread.reply", decision: "allow", resource_id: "relaycast:inbox/local-a" });
+    const sent = h.up.calls.filter((x) => x.method === "POST" && x.path === `/v1/messages/${id}/replies`);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].body).not.toHaveProperty("from");
+    expect((sent[0].body as any).data.relaygate.agent).toBe("local-b");
+    // A, replying under its own message, writes to B's inbox.
+    expect((await h.call("POST", `/v1/messages/${id}/replies`, a, { text: "again" })).status).toBe(201);
+    expect(lastAudit()).toMatchObject({ decision: "allow", resource_id: "relaycast:inbox/local-b" });
+
+    // Someone outside the conversation can't reply into it, even in the same group.
+    expect((await h.call("POST", `/v1/messages/${id}/replies`, c, { text: "butting in" })).status).toBe(403);
+    expect(lastAudit()).toMatchObject({ decision: "deny", reason: "dm_reply_not_participant" });
+
+    // A pit agent replying to a local agent's DM is refused by the local inbox's mode.
+    const toPit = await h.call("POST", "/v1/dm", a, { to: "pit-a", text: "review?" });
+    expect((await h.call("POST", `/v1/messages/${toPit.body.data.message.id}/replies`, pit, { text: "ok" })).status).toBe(403);
+    expect(lastAudit()).toMatchObject({ decision: "deny", resource_id: "relaycast:inbox/local-a", reason: "mode:660+acl:22:r:prefix" });
+    // Other writes into a DM thread stay unmodelled.
+    expect((await h.call("POST", `/v1/messages/${id}/reactions`, b, { emoji: "x" })).status).toBe(403);
   });
 
   it("filters search, channel lists, the inbox and the agent list", async () => {

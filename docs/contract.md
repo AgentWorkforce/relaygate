@@ -527,7 +527,8 @@ skip membership checks, so relaygate checks each one itself:
 | `POST /v1/channels/:name/leave`, `/mute`, `/unmute` | self |
 | `POST /v1/channels/:name/messages` | `w` on the channel (classifier as usual) |
 | `GET /v1/messages/:id`, `/replies`, `/reactions`; `POST .../read`; `DELETE .../reactions/:emoji` | `r` on the message's channel; a DM message only for its two participants |
-| `POST /v1/messages/:id/replies`, `/reactions` | `w` on the message's channel; refused under a DM (answer with `POST /v1/dm`) |
+| `POST /v1/messages/:id/replies` | `w` on the message's channel; under a DM, only a participant, decided as `POST /v1/dm` to the other participant (`w` on `relaycast:inbox/<other>`) |
+| `POST /v1/messages/:id/reactions` | `w` on the message's channel; refused under a DM |
 | `POST /v1/dm` | `w` on `relaycast:inbox/<to>` |
 | `GET /v1/dm/conversations`, `GET /v1/dm/:cid/messages` | the caller's own 1:1 conversations (group DMs aren't proxied) |
 | `GET /v1/search`, `GET /v1/inbox` | filtered: channel hits the caller may read, DM hits it wrote |
