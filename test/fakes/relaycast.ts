@@ -26,6 +26,7 @@ export function fakeRelaycast() {
   const deliveries: Array<Record<string, unknown> & { agent: string }> = [];
   const failed: Array<{ id: string; body: unknown }> = [];
   let channelsDown = false;
+  let conversationsDown = false;
   const app = new Hono();
   const who = (auth: string) => [...agents.entries()].find(([, a]) => `Bearer ${a.token}` === auth)?.[0];
   const pairOf = (a: string, b: string) => [a, b].sort().join("~");
@@ -110,7 +111,13 @@ export function fakeRelaycast() {
     const me = who(c.req.header("authorization")!)!;
     const ids = new Set(messages.filter((m) => m.channel_id.startsWith("dmch_") && m.channel_id.slice(5).split("~").includes(me)).map((m) => `dm_${m.channel_id.slice(5)}`));
     // Shapes as in Relaycast's engine (engine/dm.ts): 1:1 conversations are type "1:1", group DMs "group".
-    return c.json({ ok: true, data: [...ids].map((id) => ({ id, type: "1:1" })).concat([{ id: "gdm_1", type: "group" }]) });
+    if (conversationsDown) return c.json({ ok: false, error: { code: "rate_limited" } }, 429, { "retry-after": "7" });
+    return c.json({
+      ok: true,
+      data: [...ids]
+        .map((id) => ({ id, type: "1:1", participants: id.slice(3).split("~").map((n) => ({ agent_id: `up_${n}`, agent_name: n })) }))
+        .concat([{ id: "gdm_1", type: "group", participants: [] }]),
+    });
   });
   app.get("/v1/search", (c) =>
     c.json({
@@ -157,6 +164,7 @@ export function fakeRelaycast() {
     calls,
     revokeUpstreamTokens: () => (revokeAll = true),
     setChannelsDown: (v: boolean) => (channelsDown = v),
+    setConversationsDown: (v: boolean) => (conversationsDown = v),
   };
 }
 
