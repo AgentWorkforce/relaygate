@@ -299,6 +299,20 @@ describe("Relaycast proxy: the pit rules", () => {
     const toPit = await h.call("POST", "/v1/dm", a, { to: "pit-a", text: "review?" });
     expect((await h.call("POST", `/v1/messages/${toPit.body.data.message.id}/replies`, pit, { text: "ok" })).status).toBe(403);
     expect(lastAudit()).toMatchObject({ decision: "deny", resource_id: "relaycast:inbox/local-a", reason: "mode:660+acl:22:r:prefix" });
+    // The sender may follow up under its own DM before the recipient has written anything.
+    const fresh = await h.call("POST", "/v1/dm", b, { to: "local-c", text: "first" });
+    expect((await h.call("POST", `/v1/messages/${fresh.body.data.message.id}/replies`, b, { text: "follow-up" })).status).toBe(201);
+    expect(lastAudit()).toMatchObject({ decision: "allow", resource_id: "relaycast:inbox/local-c" });
+    // An upstream rate limit on the participant lookup is passed back, not turned into a refusal.
+    h.up.setConversationsDown(true);
+    const limited = await h.app.request(`/v1/messages/${id}/replies`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${b}` },
+      body: JSON.stringify({ text: "later" }),
+    });
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("retry-after")).toBe("7");
+    h.up.setConversationsDown(false);
     // Other writes into a DM thread stay unmodelled.
     expect((await h.call("POST", `/v1/messages/${id}/reactions`, b, { emoji: "x" })).status).toBe(403);
   });

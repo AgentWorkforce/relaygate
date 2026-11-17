@@ -334,18 +334,20 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
   };
 
   /**
-   * The other participant of a 1:1 DM the caller is in, or undefined when the caller isn't in it (or it can't be
-   * told). Replying to the other's message: its author. Replying under your own message: an author of the
-   * conversation who isn't you.
+   * The other participant of a 1:1 DM the caller is in, from Relaycast's own participant list (GET
+   * /v1/dm/conversations lists only the caller's conversations, unpaged, with their participants). Undefined when the
+   * caller isn't in it; an upstream failure is returned as is, so a rate limit or outage isn't mistaken for a refusal.
    */
-  const dmCounterpart = async (c: Ctx, me: string, author: string, conversationId: string | undefined): Promise<string | undefined> => {
+  const dmCounterpart = async (c: Ctx, me: string, conversationId: string | undefined): Promise<string | undefined | UpstreamResponse> => {
     if (!conversationId || !DM_ID.test(conversationId)) return undefined;
-    const res = await forward(c, "GET", `/v1/dm/${encodeURIComponent(conversationId)}/messages?limit=50`);
-    // Relaycast answers only participants.
-    if (res.status !== 200) return undefined;
-    if (author && author !== me) return author;
-    const other = asArray(dataOf(res.body)).map((m) => m.agent_name).find((n) => typeof n === "string" && n !== "" && n !== me);
-    return typeof other === "string" ? other : undefined;
+    const res = await forward(c, "GET", "/v1/dm/conversations");
+    if (res.status !== 200) return res;
+    const conv = asArray(dataOf(res.body)).find((x) => x.id === conversationId && x.type === "1:1");
+    if (!conv) return undefined;
+    const names = asArray(conv.participants).map((p) => p.agent_name).filter((n): n is string => typeof n === "string" && n !== "");
+    const others = names.filter((n) => n !== me);
+    // Exactly the caller and one other agent.
+    return names.includes(me) && others.length === 1 ? others[0] : undefined;
   };
 
   const MSG_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -546,7 +548,8 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
         // Reading a DM is reading your own inbox, so the inbox's read bit (and any ceiling) applies too.
         const me = c.get("agent").name;
         if (op === "w" && action === "thread.reply") {
-          const other = await dmCounterpart(c, me, where.author, where.conversationId);
+          const other = await dmCounterpart(c, me, where.conversationId);
+          if (typeof other === "object") return pass(c, other);
           if (!other) {
             audit(c, action, op, `relaycast:message/${messageId}`, "deny", "mode", "dm_reply_not_participant");
             return denied(c, op, `relaycast:message/${messageId}`);
