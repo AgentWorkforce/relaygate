@@ -523,3 +523,32 @@ describe("SESSIONS_PORT: Sessions at the root of an internal listener", () => {
   });
 });
 
+
+describe("an agent uploading with a person's device token as its Sessions credential", () => {
+  // A headless uploader (e.g. the Slack app's agent host) sends the agent's rg_ token in X-Relaygate-Token and an
+  // uploader user's device token in Authorization. The agent is the principal: the session is the agent's, in the
+  // agent's group, even though the device token alone would map to another group.
+  it("owns the new session in the agent's group, forwards the device token, and never introspects it", async () => {
+    const pol = parsePolicy({
+      ...policy(),
+      enrollmentKeys: [...policy().enrollmentKeys, { id: "slack-bridge", gid: 22, sha256: sha256("enroll-pit-00000000000000000000") }],
+      controlPrincipals: [{ match: { orgIds: ["org-1"], kinds: ["device", "launch"] }, gid: 11 }],
+    });
+    const h = harness({ policy: pol });
+    const reg = await h.call("POST", "/v1/register", "enroll-pit-00000000000000000000", { name: "slack-c1-1", recovery: "recovery-proof-0123456789" });
+    expect(reg.status).toBe(200);
+    expect(reg.body).toMatchObject({ gid: 22 });
+    // The same device token on its own is a local (11) principal: its own upload lands in local.
+    expect((await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", h.batch("person-1"))).status).toBe(200);
+    expect(h.store.session("person-1")).toMatchObject({ gid: 11 });
+    const before = h.introspections.length;
+    const up = await h.call("POST", "/sessions/v1/delivery/batches", undefined, h.batch("slack-1"), { "x-relaygate-token": reg.body.token, authorization: "Bearer sh_at_member" });
+    expect(up.status).toBe(200);
+    expect(h.store.session("slack-1")).toMatchObject({ owner: reg.body.agent_id, gid: 22 });
+    expect(h.calls.at(-1)).toMatchObject({ path: "/v1/delivery/batches", auth: "Bearer sh_at_member" });
+    expect(h.introspections.length).toBe(before);
+    // A later upload by the local person (the pit's sessionDefaults grant 11:w here) never moves it.
+    expect((await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", h.batch("slack-1"))).status).toBe(200);
+    expect(h.store.session("slack-1")).toMatchObject({ owner: reg.body.agent_id, gid: 22 });
+  });
+});
