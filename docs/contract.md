@@ -136,7 +136,8 @@ registered, the inbox follows that agent: it is owned by the agent, takes the
 agent's group, and gets the mode, ACL and classify flag of the policy's
 `inboxDefaults` entry for that group, or `660` with no ACL when the group has
 no entry (so its own group may message it and no one else). A name no agent
-has is still refused as an unknown stream. Audit reasons for such an inbox end
+has is still refused as an unknown stream, and so is a relay-control user's
+`ctl:` identity (it holds no token to read an inbox with). Audit reasons for such an inbox end
 in `:agent-inbox`.
 
 ```

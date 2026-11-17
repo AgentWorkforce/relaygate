@@ -147,12 +147,17 @@ export function resolveStream(
 
 /**
  * The inbox of a registered agent that no operator rule places: owned by the agent, in the agent's group, with that
- * group's `inboxDefaults` entry (or `660` and no ACL). A name no agent has stays unknown.
+ * group's `inboxDefaults` entry (or `660` and no ACL). A name no agent has, and a relay-control user's synthetic
+ * `ctl:` identity, stay unknown.
  */
 export function agentInbox(id: string, store: Partial<Pick<Store, "agentByName">> | undefined, policy: Policy): ResolvedStream | undefined {
   if (!id.startsWith(INBOX_PREFIX)) return undefined;
-  const agent = store?.agentByName?.(id.slice(INBOX_PREFIX.length));
-  if (!agent) return undefined;
+  const name = id.slice(INBOX_PREFIX.length);
+  // Only agents that hold a relaygate token can read an inbox: a relay-control user's synthetic `ctl:` identity
+  // (keyId `control`, which owns that user's sessions) has none, so it is never a DM recipient through this rule.
+  if (name.toLowerCase().startsWith("ctl:")) return undefined;
+  const agent = store?.agentByName?.(name);
+  if (!agent || agent.keyId === "control") return undefined;
   const def = policy.inboxDefaults.find((d) => d.gid === agent.gid);
   return { id, owner: agent.id, gid: agent.gid, mode: def?.mode ?? "660", classify: def?.classify ?? false, acl: def?.acl ?? [], source: "agent-inbox" };
 }

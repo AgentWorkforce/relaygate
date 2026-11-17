@@ -142,6 +142,18 @@ describe("an unplaced inbox follows its registered agent", () => {
     expect(resolveStream("relaycast:agent/cursor-x", h.store, h.pol)).toBeUndefined();
   });
 
+  it("a relay-control user's synthetic ctl: identity is never a DM recipient through this rule", async () => {
+    const h = harness();
+    const cursor = await h.enrol("sh_at_one", "cursor-x");
+    // What a Sessions upload by a Control-only user creates: an agent row with no token, in the user's group.
+    const ctl = h.store.ensureControlAgent("u-two", 11);
+    expect(ctl).toMatchObject({ name: "ctl:u-two", keyId: "control", gid: 11 });
+    expect(resolveStream("relaycast:inbox/ctl:u-two", h.store, h.pol)).toBeUndefined();
+    expect(await h.check(cursor, "w", "relaycast:inbox/ctl:u-two")).toEqual({ status: 403, decision: "deny", reason: "unknown_stream" });
+    expect((await h.dm(cursor, "ctl:u-two")).status).toBe(403);
+    expect(h.store.upstreamAgent(ctl.id)).toBeUndefined();
+  });
+
   it("directory visibility is unchanged: a derived inbox doesn't show the agent", async () => {
     const h = harness();
     const cursor = await h.enrol("sh_at_one", "cursor-x");
