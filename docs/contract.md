@@ -607,6 +607,30 @@ recipient knows who is asking and with what scope:
 relaygate removes any `relaygate` field the client sent, so it can't be forged.
 `GET /v1/whoami` returns the same card for the caller.
 
+### Who am I
+
+```
+GET /v1/whoami
+Authorization: Bearer rg_...
+
+200 {"agent_id": "ag_...", "name": "<name>", "gid": 11, "groups": [],
+     "group_names": ["local"], "guest": false,
+     "user_id": "<control user id>",
+     "relaygate": {"agent": "<name>", "groups": ["local"]}}
+```
+
+It answers only for the caller's own token. `user_id` is present only for an
+agent enrolled with a relay-control credential: for a device-enrolled agent
+("Enrolling with a device token") the user the device token introspected as,
+for a launched agent ("Launched agents") the launching person (the launch
+credential's `sub`). It is the same `user_id` `POST /v1/register` returned,
+recorded with the agent when it registered (so it survives a restart and
+needs no introspection), and it doesn't change on re-registration or token
+refresh, since only the same person gets the name back. An agent enrolled
+with an enrollment key has no Control principal and no `user_id`. `guest:
+true` appears on the `relaygate` card only for guests; `user_id` never does,
+so it isn't stamped on what the agent sends.
+
 ## Reads and lists
 
 A list or search returns only resources the caller may read. relaygate applies

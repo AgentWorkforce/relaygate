@@ -95,6 +95,18 @@ export function sweepGuestKeys(store: Store, policy: Policy, now: number): strin
   });
 }
 
+/**
+ * The relay-control user behind a device- or launch-enrolled agent: the introspected `sub` its credential carried at
+ * registration, persisted as the agent's key id (`device:<userId>` / `launch:<userId>`, ids no policy key may use).
+ * Undefined for an agent enrolled with a key (or anything else): it has no Control principal.
+ */
+export function controlUserId(agent: Agent): string | undefined {
+  for (const prefix of ["device:", "launch:"]) {
+    if (agent.keyId.startsWith(prefix)) return agent.keyId.slice(prefix.length) || undefined;
+  }
+  return undefined;
+}
+
 /** The sender card stamped on everything relaygate forwards and returned by /v1/whoami. */
 export function provenance(agent: Agent, principal: Principal, policy: Policy) {
   return {
@@ -628,6 +640,8 @@ export function createApp(deps: Deps) {
     const policy = deps.policy();
     const p = c.get("principal");
     const agent = c.get("agent");
+    // Self only: the caller's own Control user, never stamped on what it sends (the provenance card stays as it was).
+    const userId = controlUserId(agent);
     return c.json({
       agent_id: p.agentId,
       name: agent.name,
@@ -635,6 +649,7 @@ export function createApp(deps: Deps) {
       groups: p.groups,
       group_names: allGroups(p).map((g) => groupName(policy, g)),
       guest: isGuest(agent, policy),
+      ...(userId !== undefined ? { user_id: userId } : {}),
       relaygate: provenance(agent, p, policy),
     });
   });
