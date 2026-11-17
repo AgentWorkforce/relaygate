@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
+import { HOSTED_CLIENTS } from "./hosted-clients.js";
 
 /**
  * The operator's policy. In production relay-control is the source of truth
@@ -83,7 +84,16 @@ export const PolicySchema = z.object({
       z.object({
         match: z
           .object({
-            kinds: z.array(z.enum(["device", "read", "launch"])).min(1).optional(),
+            /**
+             * Credential kinds the rule matches. A hosted credential (a hosted MCP participant) matches only rules
+             * that list "hosted" here: rules without `kinds` never match it.
+             */
+            kinds: z.array(z.enum(["device", "read", "launch", "hosted"])).min(1).optional(),
+            /**
+             * Hosted credentials only: the hosted MCP client the participant belongs to. Every other credential
+             * matches no rule that sets this.
+             */
+            clients: z.array(z.enum(HOSTED_CLIENTS)).min(1).optional(),
             /**
              * What the credential stands for here: "agent" when it enrols an agent at /v1/register (a device or launch
              * credential), "person" everywhere else (Sessions, /v1/check). Lets the same user read more as a person
@@ -203,12 +213,19 @@ export function parsePolicy(raw: unknown): Policy {
   const inboxGids = policy.inboxDefaults.map((d) => d.gid);
   const twice = inboxGids.find((gid, i) => inboxGids.indexOf(gid) !== i);
   if (twice !== undefined) throw new Error(`inboxDefaults has more than one entry for gid ${twice}`);
-  // `device:<userId>`, `launch:<userId>` and `control` mark agents relaygate enrols from relay-control identities; no policy key may use them.
+  // `device:<userId>`, `launch:<userId>`, `hosted:<userId>` and `control` mark agents relaygate enrols from
+  // relay-control identities; no policy key may use them.
   for (const k of policy.enrollmentKeys) {
-    if (k.id === "control" || k.id.startsWith("device:") || k.id.startsWith("launch:")) {
-      throw new Error(`enrollment key id ${k.id} is reserved (control, device:*, launch:*)`);
+    if (k.id === "control" || k.id.startsWith("device:") || k.id.startsWith("launch:") || k.id.startsWith("hosted:")) {
+      throw new Error(`enrollment key id ${k.id} is reserved (control, device:*, launch:*, hosted:*)`);
     }
   }
+  // `clients` only selects hosted credentials: on a rule that can't match one it would silently match nothing.
+  policy.controlPrincipals.forEach((rule, i) => {
+    if (rule.match.clients && !rule.match.kinds?.includes("hosted")) {
+      throw new Error(`control principal rule ${i} sets clients but its kinds don't include "hosted"`);
+    }
+  });
     // A key can't put an agent into a group its own ceiling forbids: the ceiling would always win, so it's a mistake.
   for (const k of policy.enrollmentKeys) {
     const mine = [k.gid, ...k.groups];
