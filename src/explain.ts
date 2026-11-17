@@ -166,7 +166,7 @@ export function explain(policy: Policy, store: Pick<Store, "agentByName" | "stre
   } else {
     const found = resolveStream(id, store, policy);
     if (!found) {
-      steps.push({ step: "resource", detail: `${id} matches no override, registered stream or prefix default` });
+      steps.push({ step: "resource", detail: `${id} matches no override, registered stream, prefix default or registered agent's inbox` });
       return { decision: "deny", reason: "unknown_stream", classified: false, subject: card, resource: null, steps, summary: `${name} may not ${verb} ${id}: unknown stream` };
     }
     stream = found;

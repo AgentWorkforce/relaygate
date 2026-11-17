@@ -120,18 +120,41 @@ export interface ResolvedStream extends Guarded {
   id: string;
   classify: boolean;
   acl: AclEntry[];
-  source: "override" | "registered" | "prefix";
+  source: "override" | "registered" | "prefix" | "agent-inbox";
 }
 
-/** Operator override, then the registered stream, then the longest matching prefix default. */
-export function resolveStream(id: string, store: Pick<Store, "stream"> | undefined, policy: Policy): ResolvedStream | undefined {
+const INBOX_PREFIX = "relaycast:inbox/";
+
+/**
+ * Operator override, then the registered stream, then the longest matching prefix default, then (for
+ * `relaycast:inbox/<name>` only, unless `agentInboxes` is false) the inbox of the registered agent with that name.
+ */
+export function resolveStream(
+  id: string,
+  store: (Pick<Store, "stream"> & Partial<Pick<Store, "agentByName">>) | undefined,
+  policy: Policy,
+  opts: { agentInboxes?: boolean } = {},
+): ResolvedStream | undefined {
   const override = policy.streamOverrides.find((o) => o.id === id);
   if (override) return { id, owner: null, gid: override.gid, mode: override.mode, classify: override.classify, acl: override.acl, source: "override" };
   const row = store?.stream(id);
   if (row) return { id, owner: row.owner, gid: row.gid, mode: row.mode, classify: row.classify, acl: row.acl, source: "registered" };
   const prefix = longestPrefix(id, policy);
   if (prefix) return { id, owner: null, gid: prefix.gid, mode: prefix.mode, classify: prefix.classify, acl: prefix.acl, source: "prefix" };
+  if (opts.agentInboxes !== false) return agentInbox(id, store, policy);
   return undefined;
+}
+
+/**
+ * The inbox of a registered agent that no operator rule places: owned by the agent, in the agent's group, with that
+ * group's `inboxDefaults` entry (or `660` and no ACL). A name no agent has stays unknown.
+ */
+export function agentInbox(id: string, store: Partial<Pick<Store, "agentByName">> | undefined, policy: Policy): ResolvedStream | undefined {
+  if (!id.startsWith(INBOX_PREFIX)) return undefined;
+  const agent = store?.agentByName?.(id.slice(INBOX_PREFIX.length));
+  if (!agent) return undefined;
+  const def = policy.inboxDefaults.find((d) => d.gid === agent.gid);
+  return { id, owner: agent.id, gid: agent.gid, mode: def?.mode ?? "660", classify: def?.classify ?? false, acl: def?.acl ?? [], source: "agent-inbox" };
 }
 
 export function longestPrefix(id: string, policy: Policy) {

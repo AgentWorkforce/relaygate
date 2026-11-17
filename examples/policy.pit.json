@@ -22,6 +22,9 @@
     {"prefix": "kb:", "gid": 22, "mode": "660", "classify": true}
   ],
   "streamOverrides": [],
+  "inboxDefaults": [
+    {"gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}]}
+  ],
   "sessionDefaults": [
     {"gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}]},
     {"gid": 22, "mode": "660"}

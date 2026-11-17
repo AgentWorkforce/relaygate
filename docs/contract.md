@@ -129,6 +129,24 @@ A DM is a write to the recipient's **inbox**, a stream owned by the recipient.
 Whether A may DM B is therefore decided by B's inbox mode, and whether B may
 answer is decided by A's inbox mode.
 
+An inbox id, `relaycast:inbox/<name>`, resolves like any stream: an operator
+override for the exact id, then a registered stream, then the longest matching
+prefix default. When none of those places it and an agent with that name is
+registered, the inbox follows that agent: it is owned by the agent, takes the
+agent's group, and gets the mode, ACL and classify flag of the policy's
+`inboxDefaults` entry for that group, or `660` with no ACL when the group has
+no entry (so its own group may message it and no one else). A name no agent
+has is still refused as an unknown stream. Audit reasons for such an inbox end
+in `:agent-inbox`.
+
+```
+"inboxDefaults": [{"gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}]}]
+```
+
+`inboxDefaults` names each group at most once. A derived inbox counts for
+messaging and reading, not for the agent directory below: it doesn't by itself
+show the agent to anyone.
+
 ### The agent directory
 
 Who appears in `GET /v1/agents` (and `GET /v1/agents/:name`) is, by default,
@@ -240,8 +258,14 @@ names.
 Stream ids for inboxes carry the agent's name, so the prefix defaults only
 place an inbox in the right group if names do. In this deployment each
 enrollment key has its own name prefix (`local-`, `pit-`, `slack-`, `guest-`)
-and inbox defaults are per prefix, with no catch-all: an inbox that matches no
-prefix is refused rather than defaulting into the wrong group.
+and inbox defaults are per prefix. Agents a person's desktop enrols (through
+`controlPrincipals`) are named by their harness (`cursor-…`, `claude-…`), so no
+prefix covers them; their inboxes follow the registered agent instead (see
+"Resources" above): its own group, with `inboxDefaults` for gid 11 mirroring the
+`local-` rule. There is still no catch-all: an inbox whose name no prefix
+covers and no registered agent has is refused rather than defaulting into the
+wrong group, and a gid-22 agent never gets `w` on a gid-11 inbox unless the
+policy grants it.
 
 The `slack:` and `kb:` rows are prefix defaults this deployment configures.
 relaygate itself has no notion of Slack or knowledge bases.

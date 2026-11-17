@@ -64,6 +64,12 @@ export const PolicySchema = z.object({
   /** Mode and ACL for sessions, by the owning (first uploader's) group. A group without an entry gets 600. */
   sessionDefaults: z.array(z.object({ gid: Gid, mode: Mode, acl: AclSchema })).default([]),
   /**
+   * Mode and ACL for the inbox (`relaycast:inbox/<name>`) of a registered agent whose name matches no stream override
+   * or prefix default, by the agent's group. Such an inbox is owned by the agent and takes its group; a group without
+   * an entry gets `660` and no ACL (its own group may message it, no one else).
+   */
+  inboxDefaults: z.array(z.object({ gid: Gid, mode: Mode, classify: z.boolean().default(false), acl: AclSchema })).default([]),
+  /**
    * Per-session changes, e.g. sharing one session with a guest: `{"id": "...", "acl": [{"gid": <gid>, "perm": "r"}]}`.
    * An override can't move a session to another group: its owning group is what ceilings are checked against.
    */
@@ -182,6 +188,7 @@ export function parsePolicy(raw: unknown): Policy {
       x.acl.map((e) => ({ where: `${x.where} acl`, gid: e.gid })),
     ),
     ...policy.sessionDefaults.flatMap((d) => [d.gid, ...d.acl.map((e) => e.gid)].map((gid) => ({ where: `session default for ${d.gid}`, gid }))),
+    ...policy.inboxDefaults.flatMap((d) => [d.gid, ...d.acl.map((e) => e.gid)].map((gid) => ({ where: `inbox default for ${d.gid}`, gid }))),
     ...policy.sessionOverrides.flatMap((o) =>
       o.acl.map((e) => ({ where: `session override ${o.id}`, gid: e.gid })),
     ),
@@ -193,6 +200,9 @@ export function parsePolicy(raw: unknown): Policy {
   if (unknown.length > 0) {
     throw new Error(`policy names groups it doesn't define: ${unknown.map((u) => `${u.where} (gid ${u.gid})`).join(", ")}`);
   }
+  const inboxGids = policy.inboxDefaults.map((d) => d.gid);
+  const twice = inboxGids.find((gid, i) => inboxGids.indexOf(gid) !== i);
+  if (twice !== undefined) throw new Error(`inboxDefaults has more than one entry for gid ${twice}`);
   // `device:<userId>`, `launch:<userId>` and `control` mark agents relaygate enrols from relay-control identities; no policy key may use them.
   for (const k of policy.enrollmentKeys) {
     if (k.id === "control" || k.id.startsWith("device:") || k.id.startsWith("launch:")) {
