@@ -351,7 +351,9 @@ export function mountRelaycast(app: Hono<Env>, deps: Deps, upstream: RelaycastUp
     // Visibility only: `r` on the agent's directory entry shows it, and grants nothing else.
     const entry = directoryEntry(name, deps.policy());
     if (entry && check(principal, entry, "r", ceilings).allowed) return true;
-    const stream = resolveStream(inboxStream(name), store, deps.policy());
+    // Operator rules only: an inbox placed by its registered agent (no prefix default) lets that agent be messaged,
+    // but doesn't by itself show it in the directory.
+    const stream = resolveStream(inboxStream(name), store, deps.policy(), { agentInboxes: false });
     if (!stream) return false;
     return check(principal, stream, "w", ceilings).allowed || check(principal, stream, "r", ceilings).allowed;
   };
