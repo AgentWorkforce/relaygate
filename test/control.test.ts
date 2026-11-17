@@ -1,4 +1,7 @@
 import { Hono } from "hono";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import { RuleClassifier } from "../src/classifier.js";
@@ -47,7 +50,7 @@ function policy() {
   });
 }
 
-function harness(opts: { controlDown?: boolean; internalSecret?: string; garbled?: boolean; ceilingOnAdmins?: boolean; policy?: ReturnType<typeof parsePolicy> } = {}) {
+function harness(opts: { controlDown?: boolean; internalSecret?: string; garbled?: boolean; ceilingOnAdmins?: boolean; policy?: ReturnType<typeof parsePolicy>; store?: Store } = {}) {
   const introspections: Array<Record<string, unknown>> = [];
   const control = new Hono();
   control.post("/internal/v1/auth/introspect", async (c) => {
@@ -79,7 +82,7 @@ function harness(opts: { controlDown?: boolean; internalSecret?: string; garbled
   sessions.on("OPTIONS", "*", (c) => c.body(null, 204, { "access-control-allow-origin": "https://app.example.test", "access-control-allow-headers": "authorization" }));
 
   const toFetch = (app: Hono) => (async (input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init))) as typeof fetch;
-  const store = new Store(":memory:");
+  const store = opts.store ?? new Store(":memory:");
   const pol = opts.policy ? opts.policy : opts.ceilingOnAdmins ? parsePolicy({ ...policy(), ceilings: [{ gid: 33, never: [22] }] }) : policy();
   const controlAuth = new ControlAuth({ introspectUrl: "http://control.test/internal/v1/auth/introspect", introspectSecret: SECRET, audience: AUD, fetch: toFetch(control) }, store);
   const app = createApp({
@@ -523,3 +526,60 @@ describe("SESSIONS_PORT: Sessions at the root of an internal listener", () => {
   });
 });
 
+describe("GET /v1/whoami: the Control user behind the caller", () => {
+  it("a device-enrolled agent's whoami carries the device token's user", async () => {
+    const h = harness();
+    const r = await h.call("POST", "/v1/register", "sh_at_member2", { name: "desk-w", recovery: "recovery-proof-0123456789" });
+    const who = await h.call("GET", "/v1/whoami", r.body.token);
+    expect(who.status).toBe(200);
+    expect(who.body).toMatchObject({ agent_id: r.body.agent_id, name: "desk-w", user_id: "u-member2" });
+    // Self only, and never on the provenance card relaygate stamps on what the agent sends.
+    expect(who.body.relaygate).not.toHaveProperty("user_id");
+  });
+
+  it("a launched agent's whoami carries the launching person's user", async () => {
+    const h = harness();
+    const r = await h.call("POST", "/v1/register", "sh_lt_launch", { name: "launched-1" });
+    expect((await h.call("GET", "/v1/whoami", r.body.token)).body).toMatchObject({ name: "launched-1", user_id: "u-member" });
+    // A refreshed token is the same agent, so the same person.
+    const refreshed = await h.call("POST", "/v1/token/refresh", r.body.token);
+    expect((await h.call("GET", "/v1/whoami", refreshed.body.token)).body).toMatchObject({ user_id: "u-member" });
+  });
+
+  it("a key-enrolled agent's whoami has no user_id", async () => {
+    const h = harness();
+    const r = await h.call("POST", "/v1/register", "enroll-local-0000000000000000", { name: "keyed-w" });
+    const who = await h.call("GET", "/v1/whoami", r.body.token);
+    expect(who.status).toBe(200);
+    expect(who.body).not.toHaveProperty("user_id");
+  });
+
+  it("each caller sees only its own user", async () => {
+    const h = harness();
+    const a = await h.call("POST", "/v1/register", "sh_at_member", { name: "desk-a1" });
+    const b = await h.call("POST", "/v1/register", "sh_at_member2", { name: "desk-b1" });
+    expect((await h.call("GET", "/v1/whoami", a.body.token)).body.user_id).toBe("u-member");
+    expect((await h.call("GET", "/v1/whoami", b.body.token)).body.user_id).toBe("u-member2");
+  });
+
+  it("a persisted registration keeps its user_id across a restart", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "relaygate-whoami-"));
+    try {
+      const path = join(dir, "relaygate.db");
+      const before = harness({ store: new Store(path) });
+      const desk = await before.call("POST", "/v1/register", "sh_at_member", { name: "desk-p", recovery: "recovery-proof-0123456789" });
+      const launched = await before.call("POST", "/v1/register", "sh_lt_launch", { name: "launched-1" });
+      const keyed = await before.call("POST", "/v1/register", "enroll-local-0000000000000000", { name: "keyed-p" });
+      before.store.close();
+      // A fresh process: new store on the same file, and no introspection behind the answer.
+      const after = harness({ store: new Store(path) });
+      expect((await after.call("GET", "/v1/whoami", desk.body.token)).body).toMatchObject({ name: "desk-p", user_id: "u-member" });
+      expect((await after.call("GET", "/v1/whoami", launched.body.token)).body).toMatchObject({ name: "launched-1", user_id: "u-member" });
+      expect((await after.call("GET", "/v1/whoami", keyed.body.token)).body).not.toHaveProperty("user_id");
+      expect(after.introspections).toHaveLength(0);
+      after.store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
