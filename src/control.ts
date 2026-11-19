@@ -1,6 +1,8 @@
 import type { Principal } from "./mode.js";
 import type { Policy } from "./policy.js";
 import { sha256, type Agent, type Store } from "./store.js";
+import { isHostedClient, type HostedClient } from "./hosted-clients.js";
+export { HOSTED_CLIENTS, type HostedClient } from "./hosted-clients.js";
 
 /**
  * Principals that hold only relay-control credentials (docs/contract.md, "Control principals"): the desktop app
@@ -27,10 +29,14 @@ export interface ControlConfig {
 
 export type ControlRole = "owner" | "admin" | "member";
 
+export type ControlKind = "device" | "read" | "launch" | "hosted";
+
 export interface ControlIdentity {
-  kind: "device" | "read" | "launch";
-  /** Launch credentials only: the one agent name it may enrol. */
+  kind: ControlKind;
+  /** Launch and hosted credentials only: the one agent name it may enrol. */
   agentName?: string;
+  /** Hosted credentials only: which hosted MCP client the agent belongs to. */
+  client?: HostedClient;
   userId: string;
   email?: string;
   orgId: string;
@@ -74,9 +80,10 @@ const CACHE_MAX = 10_000;
 const MAX_READ_TOKEN_MS = 90 * 24 * 3600 * 1000;
 
 /** Which credential a bearer token is, by its prefix. */
-export function controlTokenKind(token: string): "device" | "read" | "launch" | undefined {
+export function controlTokenKind(token: string): ControlKind | undefined {
   if (token.startsWith("sh_at_")) return "device";
   if (token.startsWith("sh_lt_")) return "launch";
+  if (token.startsWith("sh_ht_")) return "hosted";
   if (token.startsWith("rth_at_read_") || token.startsWith("rth_st_read_")) return "read";
   return undefined;
 }
@@ -97,7 +104,7 @@ export class ControlAuth {
   async identify(token: string): Promise<ControlIdentity | undefined> {
     const kind = controlTokenKind(token);
     if (kind === "read") return this.readToken(token);
-    if (kind === "device" || kind === "launch") return this.introspect(token, kind);
+    if (kind === "device" || kind === "launch" || kind === "hosted") return this.introspect(token, kind);
     return undefined;
   }
 
@@ -110,7 +117,7 @@ export class ControlAuth {
     return { kind: "read", userId: row.userId, email, orgId: row.orgId, workspaceId: row.workspaceId ?? undefined, role: row.role ?? undefined, scopes: ["rth:read"], expiresAt: row.expiresAt ?? undefined, readerKind };
   }
 
-  private async introspect(token: string, kind: "device" | "launch"): Promise<ControlIdentity | undefined> {
+  private async introspect(token: string, kind: "device" | "launch" | "hosted"): Promise<ControlIdentity | undefined> {
     const key = sha256(token);
     const hit = kind === "device" ? this.cache.get(key) : undefined;
     if (hit && hit.until > this.now()) return hit.identity;
@@ -135,13 +142,17 @@ export class ControlAuth {
       throw new ControlUnavailable("introspection answer could not be read");
     }
     if (!body || body.active !== true) return undefined;
-    // A device token is a person on their desktop; a launch credential is one agent a person launched.
-    const expected = kind === "device" ? "desktop-user" : "relay_launch";
+    // A device token is a person on their desktop; a launch credential is one agent a person launched; a hosted
+    // credential is one hosted MCP participant a person's connector (ChatGPT, Cursor cloud agents, ...) joins with.
+    const expected = kind === "device" ? "desktop-user" : kind === "launch" ? "relay_launch" : "relay_hosted";
     if (body.principal_type !== expected || typeof body.sub !== "string" || typeof body.org !== "string") return undefined;
-    if (kind === "launch" && (typeof body.agent_name !== "string" || !body.agent_name)) return undefined;
+    if (kind !== "device" && (typeof body.agent_name !== "string" || !body.agent_name)) return undefined;
+    // An unknown client is refused, never treated as a generic one: it would match rules meant for another client.
+    if (kind === "hosted" && !isHostedClient(body.client)) return undefined;
     const identity: ControlIdentity = {
       kind,
-      ...(kind === "launch" ? { agentName: body.agent_name as string } : {}),
+      ...(kind !== "device" ? { agentName: body.agent_name as string } : {}),
+      ...(kind === "hosted" ? { client: body.client as HostedClient } : {}),
       userId: body.sub,
       email: typeof body.email === "string" ? body.email : undefined,
       orgId: body.org,
@@ -151,7 +162,7 @@ export class ControlAuth {
       expiresAt: typeof body.exp === "number" ? body.exp * 1000 : undefined,
     };
     if (identity.email) this.store.rememberControlEmail(identity.userId, identity.email);
-    // Launch credentials are single-use (relay-control burns them): never answered from cache.
+    // Launch and hosted credentials are single-use (relay-control burns them): never answered from cache.
     if (kind === "device") {
       const until = Math.min(this.now() + (this.cfg.cacheMs ?? 15_000), identity.expiresAt ?? Infinity);
       this.remember(key, { identity, until });
@@ -201,7 +212,12 @@ export function matchControlRule(identity: ControlIdentity, policy: Policy, as: 
   return policy.controlPrincipals.find((rule) => {
     const m = rule.match;
     if (m.as && !m.as.includes(as)) return false;
+    // Fails closed: a hosted credential matches only a rule that names the hosted kind, so a catch-all rule (no
+    // `kinds`) written for people and their desktops never takes a hosted MCP participant into its group.
+    if (identity.kind === "hosted" && !m.kinds?.includes("hosted")) return false;
     if (m.kinds && !m.kinds.includes(identity.kind)) return false;
+    // Only a hosted credential carries a client; any other credential matches no rule that sets `clients`.
+    if (m.clients && (!identity.client || !m.clients.includes(identity.client))) return false;
     // Fails closed: a read token minted without a reader_kind (an older relay-control) matches no readerKinds rule.
     if (m.readerKinds && (!identity.readerKind || !m.readerKinds.includes(identity.readerKind))) return false;
     if (m.orgIds && !m.orgIds.includes(identity.orgId)) return false;

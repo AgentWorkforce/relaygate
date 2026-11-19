@@ -4,6 +4,7 @@ import { resolveSession } from "./sessions.js";
 import { allGroups, check, inGroup, type CheckStep, type Op, type Principal } from "./mode.js";
 import { keyUsable, type Policy } from "./policy.js";
 import { matchControlRule } from "./control.js";
+import { HOSTED_CLIENTS } from "./hosted-clients.js";
 import type { Store } from "./store.js";
 
 /**
@@ -33,8 +34,10 @@ export const SubjectSchema = z.union([
           email: z.string().min(3).optional(),
           role: z.enum(["owner", "admin", "member"]).optional(),
           workspaceId: z.string().min(1).optional(),
-          kind: z.enum(["device", "read", "launch"]).default("read"),
+          kind: z.enum(["device", "read", "launch", "hosted"]).default("read"),
           readerKind: z.enum(["browser", "device", "mcp"]).optional(),
+          /** kind hosted only: the hosted MCP client (default "mcp"). */
+          client: z.enum(HOSTED_CLIENTS).optional(),
           as: z.enum(["person", "agent"]).optional(),
         })
         .strict(),
@@ -109,11 +112,12 @@ function resolveSubject(subject: Subject, policy: Policy, store: Pick<Store, "ag
   }
   if ("control" in s) {
     const p = s.control;
-    const as = p.as ?? (p.kind === "launch" ? "agent" : "person");
+    const as = p.as ?? (p.kind === "launch" || p.kind === "hosted" ? "agent" : "person");
     const readerKind = p.kind === "read" ? (p.readerKind ?? "browser") : undefined;
-    const identity = { kind: p.kind, userId: p.userId, orgId: p.orgId, email: p.email, role: p.role, workspaceId: p.workspaceId, scopes: [], readerKind };
+    const client = p.kind === "hosted" ? (p.client ?? "mcp") : undefined;
+    const identity = { kind: p.kind, userId: p.userId, orgId: p.orgId, email: p.email, role: p.role, workspaceId: p.workspaceId, scopes: [], readerKind, client };
     const rule = matchControlRule(identity, policy, as);
-    const who = as === "agent" ? `an agent ${p.userId} enrols (${p.kind} credential)` : `relay-control user ${p.userId} (${p.kind}${readerKind ? `, ${readerKind}` : ""})`;
+    const who = as === "agent" ? `an agent ${p.userId} enrols (${p.kind}${client ? ` ${client}` : ""} credential)` : `relay-control user ${p.userId} (${p.kind}${readerKind ? `, ${readerKind}` : ""})`;
     if (!rule) return { ok: false, reason: "no_control_rule", detail: `no controlPrincipals rule matches ${who}` };
     const index = policy.controlPrincipals.indexOf(rule);
     const name = as === "agent" ? `<agent of ${p.userId}>` : `ctl:${p.userId}`;

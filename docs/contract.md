@@ -458,8 +458,79 @@ streams named `node:<workspace>/<node>` and placed by prefix defaults like any
 stream. The check writes nothing. It never accepts a launch credential:
 introspecting one redeems it, and the node could no longer register.
 
-Enrollment key ids `control`, `device:*` and `launch:*` are reserved, and an
-enrollment key never recovers a desktop-enrolled or launched agent.
+Enrollment key ids `control`, `device:*`, `launch:*` and `hosted:*` are
+reserved, and an enrollment key never recovers a desktop-enrolled, launched or
+hosted agent.
+
+### Hosted participants
+
+A hosted participant is an agent relay-control runs for a person's MCP
+connector (a chat in ChatGPT, a Cursor cloud agent, any MCP client that joins
+the relay through relay-control's hosted MCP endpoint, without Agent Relay
+Desktop). On a gate-only install relay-control enrols each one here with a
+one-time hosted credential (`sh_ht_…`, scope `relay:hosted:enrol`,
+introspecting as `principal_type: "relay_hosted"` with the person, a fixed
+`agent_name` and the `client` it belongs to):
+
+```
+POST /v1/register
+Authorization: Bearer sh_ht_...
+{"name": "<the credential's agent_name>"}
+
+200 {"agent_id", "gid", "token": "rg_...", "expires_at", "user_id"}
+```
+
+- `client` is one of `chatgpt`, `grok-bot`, `muse`, `cursor-cloud` or `mcp` (any
+  other MCP client). relay-control derives it from the connector's registered
+  OAuth redirect URIs, never from a name the client reports. An unknown or
+  missing client makes the credential invalid (`401`).
+- **Fails closed.** A hosted credential matches only `controlPrincipals` rules
+  whose `kinds` lists `"hosted"`. A rule without `kinds`, such as the usual
+  catch-all `{"match": {"orgIds": ["<org>"]}, "gid": 11}`, never matches one.
+  With no matching rule, registration answers `403 relaygate_denied`. The
+  detail names the rule to add, and the audit reason is
+  `no_hosted_rule:<client>`. A hosted participant can't silently land in the
+  group meant for people's desktops.
+- `match.clients` narrows a rule to some clients. Only hosted credentials
+  carry a client, so a rule with `clients` must list `"hosted"` in `kinds`
+  (the policy is refused otherwise).
+- The name must equal the credential's `agent_name`, and the rule's
+  `namePrefix` applies. `reservedNamePrefixes` don't apply: relay-control is
+  the control plane those names are reserved for. So an operator can reserve
+  `cursor-cloud-` against desktops and enrollment keys and still let hosted
+  Cursor agents enrol it.
+- Like a launch credential, relay-control burns it on redemption. relaygate
+  never caches its introspection and accepts it only at `/v1/register` (never
+  on Sessions or `/v1/check`). A rejoin is a fresh credential naming the same
+  agent, and returns the same `agent_id`. The token lives 24 hours and renews
+  with `POST /v1/token/refresh`.
+- The agent's key id is `hosted:<userId>`. `whoami` carries the person's
+  `user_id`, and no enrollment key or desktop can recover it.
+
+Example rules, one per client an operator allows (put them before any
+catch-all; order only matters among rules that can match):
+
+```
+"controlPrincipals": [
+  {"match": {"orgIds": ["<org>"], "kinds": ["hosted"], "clients": ["cursor-cloud"], "as": ["agent"]}, "gid": 22, "namePrefix": "cursor-cloud-"},
+  {"match": {"orgIds": ["<org>"], "kinds": ["hosted"], "clients": ["chatgpt", "muse"], "as": ["agent"]}, "gid": 22},
+  {"match": {"orgIds": ["<org>"], "kinds": ["hosted"], "clients": ["mcp"], "roles": ["owner", "admin"], "as": ["agent"]}, "gid": 22},
+  ...
+  {"match": {"orgIds": ["<org>"]}, "gid": 11}
+],
+"reservedNamePrefixes": ["cursor-cloud-"]
+```
+
+Hosted participants run outside the company network, in someone else's cloud,
+so the pit (gid 22) is the natural home: they may write into local inboxes
+only as `inboxDefaults` allow, and never read local.
+
+**Migration.** Before this, relay-control registered hosted participants in
+Relaycast directly with the workspace key, so on gate-only installs they
+bypassed relaygate. Once relay-control enrols them here, an install whose
+policy has no hosted rule refuses them. Each hosted participant's next
+`join_relay` (or tool call) fails with the missing rule named, until the
+operator adds rules like the ones above.
 
 ### Reserved names
 
@@ -794,10 +865,11 @@ wins, and a user no rule matches is refused:
 "sessionAggregates": {"gids": [33]}
 ```
 
-`match` takes `kinds` (`device`, `read`, `launch`), `as`, `readerKinds`, `orgIds`,
+`match` takes `kinds` (`device`, `read`, `launch`, `hosted`), `clients` (hosted
+only, see "Hosted participants"), `as`, `readerKinds`, `orgIds`,
 `workspaceIds`, `roles`, `userIds` and `emails`. `as` says what the credential
 stands for: `agent` when it enrols an agent at `POST /v1/register` (a device or
-launch credential), `person` everywhere else (Sessions uploads and reads,
+launch or hosted credential), `person` everywhere else (Sessions uploads and reads,
 `/v1/check`, adoption). Rules without `as` match both. Put `as: ["person"]` on
 rules that grant more than an agent should have (admins), so the agents those
 people enrol land in an agent rule instead.

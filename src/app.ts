@@ -97,11 +97,12 @@ export function sweepGuestKeys(store: Store, policy: Policy, now: number): strin
 
 /**
  * The relay-control user behind a device- or launch-enrolled agent: the introspected `sub` its credential carried at
- * registration, persisted as the agent's key id (`device:<userId>` / `launch:<userId>`, ids no policy key may use).
+ * registration, persisted as the agent's key id (`device:<userId>` / `launch:<userId>` / `hosted:<userId>`, ids no
+ * policy key may use).
  * Undefined for an agent enrolled with a key (or anything else): it has no Control principal.
  */
 export function controlUserId(agent: Agent): string | undefined {
-  for (const prefix of ["device:", "launch:"]) {
+  for (const prefix of ["device:", "launch:", "hosted:"]) {
     if (agent.keyId.startsWith(prefix)) return agent.keyId.slice(prefix.length) || undefined;
   }
   return undefined;
@@ -311,8 +312,9 @@ export function createApp(deps: Deps) {
 
   /**
    * POST /v1/register with a relay-control credential, identified by relay-control and grouped by
-   * controlPrincipals: a person's device token (their desktop's agents), or a one-time launch credential (one agent a
-   * person launched, whose name the credential fixes).
+   * controlPrincipals: a person's device token (their desktop's agents), a one-time launch credential (one agent a
+   * person launched, whose name the credential fixes), or a one-time hosted credential (one hosted MCP participant of a
+   * person's connector, whose name and client the credential fixes; it matches only rules naming the hosted kind).
    */
   const registerWithDevice = async (c: Context<Env>, deviceToken: string) => {
     const control = deps.control!;
@@ -329,11 +331,19 @@ export function createApp(deps: Deps) {
       return deny(c, status, error, extra);
     };
     if (!identity) return refuse(401, "relaygate_unauthenticated", "control_credential_invalid");
-    const launch = identity.kind === "launch";
-    const needed = launch ? "relay:agent:enrol" : "cli:auth";
+    const hosted = identity.kind === "hosted";
+    // Both single-use credentials name exactly one agent and renew with /v1/token/refresh.
+    const launch = identity.kind === "launch" || hosted;
+    const needed = hosted ? "relay:hosted:enrol" : launch ? "relay:agent:enrol" : "cli:auth";
     if (!identity.scopes.includes(needed)) return refuse(403, "relaygate_denied", `control_credential_no_${needed}`, { detail: `the credential needs ${needed}` });
     const rule = matchControlRule(identity, policy, "agent");
-    if (!rule) return refuse(403, "relaygate_denied", "no_control_rule", { detail: "no controlPrincipals rule matches this person" });
+    if (!rule) {
+      return refuse(403, "relaygate_denied", hosted ? `no_hosted_rule:${identity.client}` : "no_control_rule", {
+        detail: hosted
+          ? `no controlPrincipals rule allows hosted ${identity.client} participants: add one with "kinds": ["hosted"] (and "clients": ["${identity.client}"])`
+          : "no controlPrincipals rule matches this person",
+      });
+    }
     const parsed = RegisterBody.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return deny(c, 400, "relaygate_bad_request", { detail: parsed.error.issues[0]?.message });
     const { name, recovery } = parsed.data;
@@ -342,10 +352,16 @@ export function createApp(deps: Deps) {
     const binding = recovery === undefined ? null : sha256(recovery);
     if (!ownPerson && personPrefixed(name, policy)) return refuse(403, "relaygate_name_scope", "person_name_not_own", { detail: "this name is another person's identity" });
     if (!ownPerson && rule.namePrefix && !name.startsWith(rule.namePrefix)) return refuse(403, "relaygate_name_scope", "name_scope");
-    if (!ownPerson && reservedName(name, policy)) return refuse(403, "relaygate_name_scope", "name_reserved");
-    // A launch credential enrols exactly the agent it names.
-    if (launch && name !== identity.agentName) return refuse(403, "relaygate_name_scope", "launch_name_mismatch", { detail: "name must equal the launch credential's agent_name" });
-    const keyId = `${launch ? "launch" : "device"}:${identity.userId}`;
+    // Reserved prefixes are for names a control plane registers server-side: relay-control's hosted participants are
+    // exactly that, so a hosted credential may use one (its rule's namePrefix still applies).
+    if (!ownPerson && !hosted && reservedName(name, policy)) return refuse(403, "relaygate_name_scope", "name_reserved");
+    // A launch or hosted credential enrols exactly the agent it names.
+    if (launch && name !== identity.agentName) {
+      return refuse(403, "relaygate_name_scope", hosted ? "hosted_name_mismatch" : "launch_name_mismatch", {
+        detail: `name must equal the ${hosted ? "hosted" : "launch"} credential's agent_name`,
+      });
+    }
+    const keyId = `${hosted ? "hosted" : launch ? "launch" : "device"}:${identity.userId}`;
     // A desktop agent's token never outlives the device token behind it; a launched agent's is a flat 24 h (it renews
     // with /v1/token/refresh: the single-use launch credential's own short expiry doesn't apply to the agent).
     const expiresAt = launch ? now() + DEVICE_TOKEN_MAX_MS : Math.min(now() + DEVICE_TOKEN_MAX_MS, identity.expiresAt ?? Infinity);
@@ -354,8 +370,8 @@ export function createApp(deps: Deps) {
 
     const existing = store.agentByName(name);
     if (existing) {
-      // Only the same person gets an existing name back: with the recovery proof, or (a relaunch) with a fresh
-      // single-use launch credential naming that very agent.
+      // Only the same person gets an existing name back: with the recovery proof, or (a relaunch or a hosted rejoin)
+      // with a fresh single-use credential of the same kind naming that very agent.
       // A person identity is one name across their computers: each computer's recovery proof rotates only its own token.
       const recovered =
         existing.keyId === keyId &&
@@ -373,7 +389,7 @@ export function createApp(deps: Deps) {
     }
     const agent = store.createAgent(name, rule.gid, keyId, recovery, false, rule.groups);
     const token = store.issueToken(agent.id, expiresAt, launch ? undefined : (binding ?? undefined));
-    store.audit({ agentId: agent.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: `device:${identity.userId}` });
+    store.audit({ agentId: agent.id, action: "register", op: null, resourceKind: "agent", resourceId: name, decision: "allow", stage: "registration", reason: hosted ? `hosted:${identity.client}:${identity.userId}` : `device:${identity.userId}` });
     await enrollUpstream(agent);
     return answer(agent.id, rule.gid, token);
   };
@@ -381,7 +397,7 @@ export function createApp(deps: Deps) {
   app.post("/v1/register", async (c) => {
     const key = bearer(c);
     const credentialKind = key && deps.control ? controlTokenKind(key) : undefined;
-    if (credentialKind === "device" || credentialKind === "launch") return registerWithDevice(c, key!);
+    if (credentialKind === "device" || credentialKind === "launch" || credentialKind === "hosted") return registerWithDevice(c, key!);
     const policy = deps.policy();
     const matches: EnrollmentKey[] = key ? policy.enrollmentKeys.filter((k) => sameHash(k.sha256, sha256(key))) : [];
     const enrollment = matches.find((k) => keyUsable(k, now()));
@@ -410,6 +426,7 @@ export function createApp(deps: Deps) {
         // A desktop-enrolled or launched agent belongs to its person: only their relay-control credential recovers it.
         !existing.keyId.startsWith("device:") &&
         !existing.keyId.startsWith("launch:") &&
+        !existing.keyId.startsWith("hosted:") &&
         existing.gid === enrollment.gid &&
         existing.guest === enrollment.guest &&
         recovery !== undefined &&
@@ -612,7 +629,10 @@ export function createApp(deps: Deps) {
       if (refused) return refused;
       return next();
     }
-    if (onSessions && !relaygateToken && deps.control && presented && controlTokenKind(presented)) {
+    // A hosted credential only ever enrols at /v1/register (introspecting it here would redeem it): it falls through to
+    // the rg_ check below and is refused.
+    const presentedKind = presented ? controlTokenKind(presented) : undefined;
+    if (onSessions && !relaygateToken && deps.control && presented && presentedKind && presentedKind !== "hosted") {
       const refused = await authenticateControl(c, presented);
       if (refused) return refused;
       return next();
@@ -648,10 +668,11 @@ export function createApp(deps: Deps) {
   if (deps.sessions?.corsOrigins?.length) app.use("/sessions/*", sessionsCors(deps.sessions));
   app.use("/sessions/*", authenticate);
 
-  // Launched agents can't re-register (their launch credential is single-use): they refresh before expiry instead.
+  // Launched agents and hosted participants can't re-register (their credential is single-use): they refresh before
+  // expiry instead.
   app.post("/v1/token/refresh", (c) => {
     const agent = c.get("agent");
-    if (!agent.keyId.startsWith("launch:")) {
+    if (!agent.keyId.startsWith("launch:") && !agent.keyId.startsWith("hosted:")) {
       return deny(c, 403, "relaygate_denied", {
         detail: agent.keyId.startsWith("device:") ? "re-register with your device token" : "this token doesn't expire",
       });
