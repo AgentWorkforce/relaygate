@@ -507,23 +507,52 @@ Authorization: Bearer sh_ht_...
 - The agent's key id is `hosted:<userId>`. `whoami` carries the person's
   `user_id`, and no enrollment key or desktop can recover it.
 
-Example rules, one per client an operator allows (put them before any
-catch-all; order only matters among rules that can match):
+Hosted participants run outside the company network, in someone else's
+cloud. Don't put them in the pit (gid 22) of `examples/policy.pit.json`: there
+the pit is the inside group and reads `relaycast:channel/` and
+`relaycast:inbox/local-`. Give them a group of their own with a pit ceiling,
+and grant only what they need. For example, a `hosted` group (55) that local
+agents may DM and that may DM local agents but read nothing of theirs (put
+the rules before any catch-all; order only matters among rules that can
+match):
 
 ```
+"groups": [..., {"gid": 55, "name": "hosted"}],
 "controlPrincipals": [
-  {"match": {"orgIds": ["<org>"], "kinds": ["hosted"], "clients": ["cursor-cloud"], "as": ["agent"]}, "gid": 22, "namePrefix": "cursor-cloud-"},
-  {"match": {"orgIds": ["<org>"], "kinds": ["hosted"], "clients": ["chatgpt", "muse"], "as": ["agent"]}, "gid": 22},
-  {"match": {"orgIds": ["<org>"], "kinds": ["hosted"], "clients": ["mcp"], "roles": ["owner", "admin"], "as": ["agent"]}, "gid": 22},
+  {"match": {"orgIds": ["<org>"], "kinds": ["hosted"], "clients": ["cursor-cloud"], "as": ["agent"]}, "gid": 55, "namePrefix": "cursor-cloud-"},
+  {"match": {"orgIds": ["<org>"], "kinds": ["hosted"], "clients": ["chatgpt", "muse"], "as": ["agent"]}, "gid": 55},
+  {"match": {"orgIds": ["<org>"], "kinds": ["hosted"], "clients": ["mcp"], "roles": ["owner", "admin"], "as": ["agent"]}, "gid": 55},
   ...
   {"match": {"orgIds": ["<org>"]}, "gid": 11}
 ],
+"streamDefaults": [
+  {"prefix": "relaycast:inbox/local-", "gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}, {"gid": 55, "perm": "w"}]},
+  ...
+],
+"inboxDefaults": [
+  {"gid": 11, "mode": "660", "acl": [{"gid": 22, "perm": "r"}, {"gid": 55, "perm": "w"}]},
+  {"gid": 55, "mode": "660", "acl": [{"gid": 11, "perm": "w"}]}
+],
+"ceilings": [..., {"gid": 55, "never": [22]}],
 "reservedNamePrefixes": ["cursor-cloud-"]
 ```
 
-Hosted participants run outside the company network, in someone else's cloud,
-so the pit (gid 22) is the natural home: they may write into local inboxes
-only as `inboxDefaults` allow, and never read local.
+The `inboxDefaults` entries cover inboxes no prefix default names. They
+cover hosted participants whose names don't start with `cursor-cloud-` (a
+ChatGPT chat, any MCP client), and local agents a desktop enrols under their
+own names. The `local-` stream default carries the same grant for
+enrollment-key agents.
+
+With `examples/policy.pit.json` and these entries, `POST /v1/check` gives:
+
+- for a `cursor-cloud-…` participant and a ChatGPT participant named
+  without that prefix:
+  - allowed: writing a desktop-enrolled local agent's inbox and a `local-…`
+    inbox;
+  - refused: reading either inbox, reading `relaycast:channel/<name>`, any pit
+    stream, and `slack:`.
+- local agents, desktop-enrolled and key-enrolled: allowed to write both
+  hosted participants' inboxes.
 
 **Migration.** Before this, relay-control registered hosted participants in
 Relaycast directly with the workspace key, so on gate-only installs they
