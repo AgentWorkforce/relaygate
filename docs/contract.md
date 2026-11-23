@@ -783,6 +783,9 @@ strong as the network rule that Sessions accepts traffic from relaygate alone
 | `GET /sessions/v1/events?q=<text>` | transcript search, filtered to events of sessions the caller may read |
 | `GET/PATCH /sessions/v1/sessions/:id/access` | runtime access policy, restricted to `sessionAccessAdmins` groups |
 | `GET /sessions/v1/sessions/:id/access/history` | immutable runtime-policy history, restricted to `sessionAccessAdmins` groups |
+| `GET /sessions/v1/relayfacts[/:topic]` | passed to the read API after normal relaygate/Control authentication |
+| `GET /sessions/v1/coordination/{overlaps,advisories}` | passed to the read API after normal relaygate/Control authentication |
+| `POST /sessions/v1/coordination/advisories/:id/ack` | read-plane acknowledgement passed to the read API; requires `rth:read`, not upload scope |
 
 A write is decided before anything is recorded; the classifier sees every
 forwarded field, not only `content`. New sessions are claimed in one
@@ -840,6 +843,26 @@ the current and previous kid/key but relaygate signs only with the current
 one. Assertions and credentials must not be logged. The assertion proves the
 gate's decision; the upstream still validates the caller's ordinary Sessions
 credential.
+
+### Relayfacts and coordination
+
+Gate-only history hosts also proxy the read API features under
+`/v1/relayfacts` and `/v1/coordination`; otherwise an ingress route to
+relaygate would turn a feature-disabled answer into an unrelated edge 404/503.
+The allowlist is deliberately exact:
+
+- `GET /v1/relayfacts` and `GET /v1/relayfacts/:topic`;
+- `GET /v1/coordination/overlaps`;
+- `GET /v1/coordination/advisories`;
+- `POST /v1/coordination/advisories/:advisoryId/ack`.
+
+They use the caller's forwarded Sessions credential, the same Control
+principal mapping and `rth:read` check as session reads, and a read-API upstream
+assertion when assertions are enabled. The acknowledgement is a read-plane
+state change and therefore does not require `rth:sync`. Feature flags,
+workspace scoping, response status and request-body validation remain owned by
+the read API. Every other path under either prefix gets
+`404 relaygate_route_not_proxied` without reaching upstream.
 
 ### Group labels
 

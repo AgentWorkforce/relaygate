@@ -64,6 +64,7 @@ function harness(pol = policy(), opts: { token?: string; assertion?: UpstreamAss
   upstream.get("/v1/events", (c) =>
     c.json({ events: c.req.query("q") ? [{ sessionId: "s-local", text: "a" }, { sessionId: "s-pit", text: "b" }, { text: "no session" }] : [] }),
   );
+  upstream.get("/v1/relayfacts", (c) => c.json({ topics: [] }));
   const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => upstream.fetch(new Request(input, init))) as typeof fetch;
 
   const store = new Store(":memory:");
@@ -321,6 +322,12 @@ describe("Sessions proxy: signed upstream assertions", () => {
     expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, key]]), {
       method: "GET", path: "/v1/events?q=work&limit=10", credential: `Bearer ${SERVICE}`, audience: "session-read-api", access: "filter", sessionIds: [],
     }, at).access).toBe("filter");
+
+    await h.call("GET", "/sessions/v1/relayfacts?limit=5", local);
+    sent = h.calls.at(-1)!;
+    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, key]]), {
+      method: "GET", path: "/v1/relayfacts?limit=5", credential: `Bearer ${SERVICE}`, audience: "session-read-api", access: "passthrough", sessionIds: [],
+    }, at).access).toBe("passthrough");
   });
 });
 

@@ -71,6 +71,7 @@ const PASS_RESPONSE = [
 const HOST_MOUNTED = "x-relaygate-host-mounted";
 /** The largest upload body relaygate inspects (wire and decoded); Sessions' own cap is 2 MiB. */
 const MAX_UPLOAD = 4 * 1024 * 1024;
+const MAX_COORDINATION_ACK = 8 * 1024;
 
 /**
  * Adds CORS headers to Sessions responses relaygate produces itself (refusals, auth errors) for allowed browser
@@ -636,6 +637,22 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     } catch {
       return new Response(null, { status: 502 });
     }
+  });
+
+  // Read-API features that live beside Sessions. Keep this an exact allowlist: unknown relayfacts/coordination
+  // paths fall through to relaygate_route_not_proxied instead of turning relaygate into an open reverse proxy.
+  const readFeature = (path: string) =>
+    app.get(`/sessions${path}`, async (c) =>
+      pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c), undefined, undefined, { audience: "session-read-api", access: "passthrough" })),
+    );
+  readFeature("/v1/relayfacts");
+  readFeature("/v1/relayfacts/:topic");
+  readFeature("/v1/coordination/overlaps");
+  readFeature("/v1/coordination/advisories");
+  app.post("/sessions/v1/coordination/advisories/:advisoryId/ack", async (c) => {
+    const body = Buffer.from(await c.req.arrayBuffer());
+    if (body.byteLength > MAX_COORDINATION_ACK) return deny(c, 413, "relaygate_bad_request", { detail: "acknowledgement body too large" });
+    return pass(await upstream(c, cfg.readUrl, "POST", upstreamPath(c), body, undefined, { audience: "session-read-api", access: "passthrough" }));
   });
 
   // Aggregates over every session (per-person usage, activity, output, digests): only for the groups the policy

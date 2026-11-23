@@ -63,10 +63,16 @@ function harness(opts: { controlDown?: boolean; internalSecret?: string; garbled
     return c.json(DEVICES[body.token] ?? { active: false, reason: "unknown" });
   });
 
-  const calls: Array<{ method: string; path: string; auth: string; headers: Headers }> = [];
+  const calls: Array<{ method: string; path: string; auth: string; headers: Headers; body?: string }> = [];
   const sessions = new Hono();
   sessions.use("*", async (c, next) => {
-    calls.push({ method: c.req.method, path: c.req.path + new URL(c.req.url).search, auth: c.req.header("authorization") ?? "", headers: c.req.raw.headers });
+    calls.push({
+      method: c.req.method,
+      path: c.req.path + new URL(c.req.url).search,
+      auth: c.req.header("authorization") ?? "",
+      headers: c.req.raw.headers,
+      body: c.req.method === "GET" || c.req.method === "HEAD" ? undefined : await c.req.raw.clone().text(),
+    });
     await next();
   });
   let minted = 0;
@@ -80,6 +86,11 @@ function harness(opts: { controlDown?: boolean; internalSecret?: string; garbled
   sessions.post("/v1/delivery/batches", (c) => c.json({ protocolVersion: 1, receiptId: "rhr_1" }));
   sessions.get("/v1/sessions/:id/events", (c) => c.json({ sessionId: c.req.param("id"), events: [] }, 200, { "x-relayhistory-workspace-id": "ws-1", "access-control-allow-origin": "https://app.example.test" }));
   sessions.get("/v1/sessions/users", (c) => c.json({ users: [{ userId: "u-member" }] }));
+  sessions.get("/v1/relayfacts", (c) => c.json({ topics: ["handoff"] }));
+  sessions.get("/v1/relayfacts/:topic", (c) => c.json({ topic: c.req.param("topic"), facts: [] }));
+  sessions.get("/v1/coordination/overlaps", (c) => c.json({ overlaps: [] }));
+  sessions.get("/v1/coordination/advisories", (c) => c.json({ advisories: [] }));
+  sessions.post("/v1/coordination/advisories/:advisoryId/ack", (c) => c.json({ advisoryId: c.req.param("advisoryId"), acknowledged: true }));
   sessions.on("OPTIONS", "*", (c) => c.body(null, 204, { "access-control-allow-origin": "https://app.example.test", "access-control-allow-headers": "authorization" }));
 
   const toFetch = (app: Hono) => (async (input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init))) as typeof fetch;
@@ -205,6 +216,32 @@ describe("relay-control principals: dashboard read tokens", () => {
     expect(changed).toMatchObject({ status: 200, body: { access: { version: 1, label: "restricted" } } });
     expect((await h.call("GET", "/sessions/v1/sessions/s-sensitive/events", member)).status).toBe(403);
     expect((await h.call("GET", "/sessions/v1/sessions/s-sensitive/events", admin)).status).toBe(200);
+  });
+
+  it("proxies only the read API's relayfacts and coordination allowlist, including read-scoped acknowledgements", async () => {
+    const h = harness();
+    const token = (await h.mint("u-member")).body.accessToken;
+    for (const path of [
+      "/sessions/v1/relayfacts?limit=10",
+      "/sessions/v1/relayfacts/handoff",
+      "/sessions/v1/coordination/overlaps",
+      "/sessions/v1/coordination/advisories",
+    ]) {
+      expect((await h.call("GET", path, token)).status, path).toBe(200);
+      expect(h.calls.at(-1)).toMatchObject({ path: path.replace(/^\/sessions/, ""), auth: `Bearer ${token}` });
+    }
+    const ack = await h.call("POST", "/sessions/v1/coordination/advisories/abc123/ack", token, { seen: true });
+    expect(ack).toMatchObject({ status: 200, body: { advisoryId: "abc123", acknowledged: true } });
+    expect(h.calls.at(-1)).toMatchObject({ path: "/v1/coordination/advisories/abc123/ack", auth: `Bearer ${token}`, body: '{"seen":true}' });
+    const afterAck = h.calls.length;
+    expect((await h.call("POST", "/sessions/v1/coordination/advisories/abc123/ack", token, "x".repeat(9_000))).status).toBe(413);
+    expect(h.calls).toHaveLength(afterAck);
+
+    const before = h.calls.length;
+    for (const path of ["/sessions/v1/relayfacts/a/b", "/sessions/v1/coordination/unknown", "/sessions/v1/coordination/advisories/abc123/delete"]) {
+      expect((await h.call("GET", path, token)).status, path).toBe(404);
+    }
+    expect(h.calls).toHaveLength(before);
   });
 
   it("mints only off the internal path: never through a public Sessions host, and with the internal secret when configured", async () => {
