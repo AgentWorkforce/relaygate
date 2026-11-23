@@ -8,6 +8,7 @@ import { allGroups, check, type AclEntry, type Op } from "./mode.js";
 import { groupLabel, GroupLabelSchema, type Policy } from "./policy.js";
 import { deny } from "./relaycast.js";
 import type { Agent, SessionAccessRow } from "./store.js";
+import { signUpstreamAssertion, UPSTREAM_ASSERTION_HEADER, type AssertionAccess, type AssertionAudience, type UpstreamAssertionConfig } from "./upstream-assertion.js";
 
 /**
  * The Sessions proxy (docs/contract.md, "Session uploads" and "Reads and lists"), mounted at /sessions, so a client's
@@ -43,6 +44,8 @@ export interface SessionsConfig {
    * against it before forwarding them; the read API checks it again either way.
    */
   internalSecret?: string;
+  /** Signed proof attached after relaygate authorizes an upstream request. Unset keeps legacy unsigned behavior. */
+  assertion?: UpstreamAssertionConfig;
   fetch?: typeof fetch;
 }
 
@@ -181,7 +184,15 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     text: string;
   }
 
-  const upstream = async (c: Ctx, base: string, method: string, path: string, body?: BodyInit, contentType?: string): Promise<Upstream | Response> => {
+  const upstream = async (
+    c: Ctx,
+    base: string,
+    method: string,
+    path: string,
+    body: BodyInit | undefined,
+    contentType: string | undefined,
+    scope: { audience: AssertionAudience; access: AssertionAccess; sessionIds?: string[] },
+  ): Promise<Upstream | Response> => {
     const auth = credential(c);
     if (!auth) return deny(c, 401, "relaygate_unauthenticated", { detail: "send your Sessions credential in Authorization and your rg_ token in X-Relaygate-Token" });
     const headers: Record<string, string> = { authorization: auth };
@@ -193,6 +204,22 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     if (contentType) {
       headers["content-type"] = contentType;
       delete headers["content-encoding"];
+    }
+    if (cfg.assertion) {
+      if (body !== undefined && typeof body !== "string" && !(body instanceof Uint8Array)) {
+        console.error(JSON.stringify({ msg: "sessions assertion cannot hash body type" }));
+        return deny(c, 503, "relaygate_unavailable");
+      }
+      headers[UPSTREAM_ASSERTION_HEADER] = signUpstreamAssertion(cfg.assertion, {
+        method,
+        path,
+        body: body as string | Uint8Array | undefined,
+        credential: auth,
+        audience: scope.audience,
+        principal: c.get("principal"),
+        access: scope.access,
+        sessionIds: scope.sessionIds,
+      });
     }
     try {
       const res = await doFetch(new URL(path.replace(/^\//, ""), slash(base)), { method, headers, body });
@@ -300,8 +327,8 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
    * session that a concurrent upload filled to another group. A failed first upload leaves the session with the
    * agent that will retry it (session ids are chosen by the uploader).
    */
-  const upload = async (c: Ctx, path: string, body: unknown) =>
-    pass(await upstream(c, cfg.uploadUrl, "POST", path, JSON.stringify(body), "application/json"));
+  const upload = async (c: Ctx, path: string, body: unknown, sessionIds: string[]) =>
+    pass(await upstream(c, cfg.uploadUrl, "POST", path, JSON.stringify(body), "application/json", { audience: "ingest-edge", access: "write", sessionIds }));
 
   // No request body is buffered past the cap (Sessions' own limit is 2 MiB).
   app.use(
@@ -424,7 +451,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     // The classifier sees everything that is forwarded, not only `content`.
     const gate = await gateWrites(c, new Map([[id, JSON.stringify(forwarded)]]));
     if (gate instanceof Response) return gate;
-    return upload(c, `/v1/sessions/${encodeURIComponent(id)}/turns`, forwarded);
+    return upload(c, `/v1/sessions/${encodeURIComponent(id)}/turns`, forwarded, [id]);
   });
 
   // Batch upload. Every session a batch touches must be writable, or nothing is forwarded.
@@ -448,12 +475,12 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     const { records: _records, ...envelope } = body as Record<string, unknown>;
     const gate = await gateWrites(c, new Map([...bySession].map(([id, rs]) => [id, JSON.stringify({ ...envelope, records: rs })])));
     if (gate instanceof Response) return gate;
-    return upload(c, "/v1/ingest", { ...envelope, records });
+    return upload(c, "/v1/ingest", { ...envelope, records }, [...bySession.keys()]);
   });
 
   // List and search: only sessions the caller may read. Filtering after the fact means a page can come back short.
   app.get("/sessions/v1/sessions", async (c) => {
-    const res = await upstream(c, cfg.readUrl, "GET", upstreamPath(c));
+    const res = await upstream(c, cfg.readUrl, "GET", upstreamPath(c), undefined, undefined, { audience: "session-read-api", access: "filter" });
     if (res instanceof Response || res.status !== 200) return pass(res);
     const page = json(res) ?? {};
     const policy = deps.policy();
@@ -469,7 +496,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
       const id = c.req.param("id");
       const refused = gateRead(c, id);
       if (refused) return refused;
-      const res = await upstream(c, cfg.readUrl, "GET", upstreamPath(c));
+      const res = await upstream(c, cfg.readUrl, "GET", upstreamPath(c), undefined, undefined, { audience: "session-read-api", access: "read", sessionIds: [id] });
       if (!LABELED_VIEWS.has(view) || res instanceof Response || res.status !== 200) return pass(res);
       // One session's metadata and catalog carry its group label; otherwise the body passes byte for byte.
       const body = json(res);
@@ -484,9 +511,9 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   app.get("/sessions/v1/events", async (c) => {
     const ids = c.req.queries("session") ?? [];
     if (ids.length > 1) return deny(c, 400, "relaygate_bad_request", { detail: "at most one session= through relaygate" });
-    if (ids.length === 1) return gateRead(c, ids[0]!) ?? pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c)));
+    if (ids.length === 1) return gateRead(c, ids[0]!) ?? pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c), undefined, undefined, { audience: "session-read-api", access: "read", sessionIds: [ids[0]!] }));
     if (!c.req.query("q")) return deny(c, 400, "relaygate_bad_request", { detail: "session= or q= is required through relaygate" });
-    const res = await upstream(c, cfg.readUrl, "GET", upstreamPath(c));
+    const res = await upstream(c, cfg.readUrl, "GET", upstreamPath(c), undefined, undefined, { audience: "session-read-api", access: "filter" });
     if (res instanceof Response || res.status !== 200) return pass(res);
     const page = json(res) ?? {};
     const events = (Array.isArray(page.events) ? page.events : []).filter((e: any) => typeof e?.sessionId === "string" && canRead(c, e.sessionId));
@@ -526,7 +553,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     const { records: _r, ...batchEnvelope } = body.batch;
     const gate = await gateWrites(c, new Map([...bySession].map(([id, rs]) => [id, JSON.stringify({ ...body, batch: { ...batchEnvelope, records: rs } })])));
     if (gate instanceof Response) return gate;
-    return pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/delivery/batches", raw));
+    return pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/delivery/batches", raw, undefined, { audience: "ingest-edge", access: "write", sessionIds: [...bySession.keys()] }));
   });
 
   // --- relay-control principals ------------------------------------------------------------------------------
@@ -621,13 +648,13 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
       const ceilinged = policy.ceilings.some((cl) => cl.gid === principal.gid || principal.groups.includes(cl.gid));
       const allowed = !ceilinged && policy.sessionAggregates.gids.some((g) => principal.gid === g || principal.groups.includes(g));
       audit(c, "session.aggregate", "r", c.req.path.replace(/^\/sessions/, ""), allowed ? "allow" : "deny", "mode", allowed ? "sessionAggregates" : "not_in_sessionAggregates");
-      return allowed ? pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c))) : deny(c, 403, "relaygate_denied", { op: "r", resource: `sessions${path}` });
+      return allowed ? pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c), undefined, undefined, { audience: "session-read-api", access: "aggregate" })) : deny(c, 403, "relaygate_denied", { op: "r", resource: `sessions${path}` });
     });
   for (const path of ["/v1/sessions/users", "/v1/sessions/activity", "/v1/sessions/summaries/activity", "/v1/sessions/output", "/v1/sessions/titles", "/v1/delivery/records", "/v1/digest/*"]) aggregate(path);
 
   // Upload-side calls the desktop makes that carry no session content.
-  app.get("/sessions/v1/delivery/admission", async (c) => pass(await upstream(c, cfg.uploadUrl, "GET", upstreamPath(c))));
-  app.post("/sessions/v1/upload-consent", async (c) => pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/upload-consent", await c.req.text())));
+  app.get("/sessions/v1/delivery/admission", async (c) => pass(await upstream(c, cfg.uploadUrl, "GET", upstreamPath(c), undefined, undefined, { audience: "ingest-edge", access: "passthrough" })));
+  app.post("/sessions/v1/upload-consent", async (c) => pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/upload-consent", await c.req.text(), undefined, { audience: "ingest-edge", access: "passthrough" })));
   // Choosing which sessions sync is a write on each session it names.
   app.post("/sessions/v1/delivery/sessions/selection", async (c) => {
     const raw = await c.req.text();
@@ -645,13 +672,13 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     const content = JSON.stringify(body);
     const gate = await gateWrites(c, new Map(named.map((x: any) => [x.session_id, content])));
     if (gate instanceof Response) return gate;
-    return pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/delivery/sessions/selection", raw));
+    return pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/delivery/sessions/selection", raw, undefined, { audience: "ingest-edge", access: "write", sessionIds: named.map((x: any) => x.session_id) }));
   });
 
   // Upload-side housekeeping that carries no session content.
-  app.get("/sessions/v1/delivery/limits", async (c) => pass(await upstream(c, cfg.uploadUrl, "GET", "/v1/delivery/limits")));
-  app.post("/sessions/v1/auth/token/refresh", async (c) => pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/auth/token/refresh", await c.req.text())));
-  app.post("/sessions/v1/onboarding/heartbeat", async (c) => pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/onboarding/heartbeat", await c.req.text())));
+  app.get("/sessions/v1/delivery/limits", async (c) => pass(await upstream(c, cfg.uploadUrl, "GET", "/v1/delivery/limits", undefined, undefined, { audience: "ingest-edge", access: "passthrough" })));
+  app.post("/sessions/v1/auth/token/refresh", async (c) => pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/auth/token/refresh", await c.req.text(), undefined, { audience: "ingest-edge", access: "passthrough" })));
+  app.post("/sessions/v1/onboarding/heartbeat", async (c) => pass(await upstream(c, cfg.uploadUrl, "POST", "/v1/onboarding/heartbeat", await c.req.text(), undefined, { audience: "ingest-edge", access: "passthrough" })));
 
   app.all("/sessions/*", (c) => deny(c, 404, "relaygate_route_not_proxied", { path: c.req.path }));
 }

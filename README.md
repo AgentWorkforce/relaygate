@@ -50,6 +50,9 @@ Relaycast client's base URL at relaygate and use the `rg_` token (see
 | `SESSION_INGEST_AUDIENCE` | none | The audience device tokens are introspected for (the Sessions ingest origin relay-control accepts). Required with the URL. |
 | `SESSIONS_CORS_ORIGINS` | none | Comma-separated browser origins allowed to read Sessions directly (match the read API's list); relaygate's own refusals carry CORS headers for them. |
 | `SESSIONS_INTERNAL_SECRET` | none | The read API's internal secret; when set, relaygate checks relay-control's mint calls against it. |
+| `RELAYGATE_UPSTREAM_ASSERTION_KEY` | none | At least 32 characters. Enables short-lived HMAC assertions on proxied Sessions read/ingest requests; the upstreams must hold the same key and reject unsigned content routes. |
+| `RELAYGATE_UPSTREAM_ASSERTION_KID` | with assertion key | 1-64 character rotation id. Upstreams can retain the previous kid/key while this value rolls. |
+| `RELAYGATE_UPSTREAM_ASSERTION_TTL_SECONDS` | `30` | Assertion lifetime, from 5 through 60 seconds. |
 | `ANTHROPIC_API_KEY` | none | Needed only when `classifier.model.enabled` is true. |
 
 Health: `GET /healthz` (process up) and `GET /readyz` (policy loaded, database

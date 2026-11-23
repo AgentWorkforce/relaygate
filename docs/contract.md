@@ -798,6 +798,49 @@ run headless on Linux servers, so their sessions come from a headless uploader
 on that server, authenticated with the agent's `rg_` token, not from the
 desktop app.
 
+### Signed upstream authorization
+
+Network reachability is defense in depth, not the Sessions authorization
+boundary. When `RELAYGATE_UPSTREAM_ASSERTION_KEY` and
+`RELAYGATE_UPSTREAM_ASSERTION_KID` are set, relaygate adds
+`X-Relaygate-Assertion` after it has allowed each proxied read or write. The
+read API and ingest edge must hold the same current/previous key map and reject
+an unsigned or invalid assertion on every content route.
+
+The header is `v1.<base64url-json>.<base64url-hmac-sha256>`. The MAC input is
+the ASCII prefix `relaygate-upstream-v1\n` followed by the payload segment
+exactly as sent. Its JSON claims are:
+
+```json
+{
+  "v": 1, "iss": "relaygate", "aud": "session-read-api", "kid": "current-1",
+  "iat": 1800000000, "exp": 1800000030, "jti": "<uuid>",
+  "method": "GET", "path": "/v1/events?session=s-1",
+  "body_sha256": "<hex>", "credential_sha256": "<hex>",
+  "principal": {"agent_id": "ag_...", "gid": 11, "groups": [22]},
+  "access": "read", "session_ids": ["s-1"]
+}
+```
+
+The path is the exact upstream pathname and query; the body hash covers the
+exact forwarded bytes, including compressed delivery batches; and the
+credential hash binds the proof to the forwarded `Authorization` value
+without exposing that credential. `session_ids` is sorted and de-duplicated.
+`aud` is `session-read-api` or `ingest-edge`, preventing cross-service replay
+even when both services share the rotation key.
+Single-session reads and writes name their sessions. Lists and transcript
+search carry `access: "filter"` and an empty list because relaygate filters the
+upstream page; permitted whole-workspace aggregates carry `aggregate`.
+
+The default lifetime is 30 seconds and the configurable range is 5 through
+60. A verifier checks the MAC in constant time, selects the key by `kid`,
+allows at most five seconds of future clock skew, checks expiry and maximum
+lifetime, then recomputes every request binding. During rotation it accepts
+the current and previous kid/key but relaygate signs only with the current
+one. Assertions and credentials must not be logged. The assertion proves the
+gate's decision; the upstream still validates the caller's ordinary Sessions
+credential.
+
 ### Group labels
 
 A deployment can name its groups for people reading sessions, so a dashboard
