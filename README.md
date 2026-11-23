@@ -28,6 +28,9 @@ keys (`guest`, `expiresAt`; revoking or expiring one ends its tokens), group
 ceilings and guest provenance. Build 2 adds the Relaycast proxy: point a
 Relaycast client's base URL at relaygate and use the `rg_` token (see
 "Proxied Relaycast routes" in the contract). The Sessions proxy is mounted at `/sessions`.
+Gate-only history hosts also allowlist the read API's `/v1/relayfacts` and
+`/v1/coordination` routes through that mount; no other path under those
+prefixes is proxied.
 
 | Setting | Default | Meaning |
 |---|---|---|

@@ -590,10 +590,11 @@ export function createApp(deps: Deps) {
       return deny(c, 403, "relaygate_denied", { detail: "no controlPrincipals rule matches this user" });
     }
     // Uploads need a device token that may sync; a read token (or a device token without rth:sync) only reads.
-    // Session access management is a Control-plane action, not an upload: a librarian may call it with an
-    // agent-behalf/browser read credential and is authorized again by sessionAccessAdmins in the Sessions router.
+    // These are read-plane actions, not uploads: a librarian may manage access with an agent-behalf/browser read
+    // credential, and the coordination acknowledgement uses the read API's ordinary rth:read authorization.
     const managesSessionAccess = /^\/sessions\/v1\/sessions\/[^/]+\/access(?:\/history)?$/.test(c.req.path);
-    const writes = !checkOnly && !managesSessionAccess && c.req.method !== "GET" && c.req.method !== "HEAD";
+    const acknowledgesAdvisory = /^\/sessions\/v1\/coordination\/advisories\/[A-Za-z0-9_-]+\/ack$/.test(c.req.path);
+    const writes = !checkOnly && !managesSessionAccess && !acknowledgesAdvisory && c.req.method !== "GET" && c.req.method !== "HEAD";
     if (writes && (identity.kind !== "device" || !identity.scopes.includes("rth:sync"))) {
       store.audit({ agentId: null, action: "auth", op: "w", resourceKind: "agent", resourceId: `ctl:${identity.userId}`, decision: "deny", stage: "auth", reason: `control_${identity.kind}_cannot_write` });
       return deny(c, 403, "relaygate_denied", { detail: "uploads need a device token with rth:sync" });
