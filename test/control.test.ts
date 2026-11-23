@@ -44,6 +44,7 @@ function policy() {
       { match: { orgIds: ["org-1"] }, gid: 11 },
     ],
     sessionAggregates: { gids: [33] },
+    sessionAccessAdmins: { gids: [33] },
     reservedNamePrefixes: ["control-"],
     // Spawn targets: launching onto an inside node is a cross-group write (classified); the inside group owns it.
     streamDefaults: [{ prefix: "node:", gid: 22, mode: "660", acl: [{ gid: 11, perm: "w" }] }],
@@ -187,6 +188,23 @@ describe("relay-control principals: dashboard read tokens", () => {
     expect((await h.call("GET", "/sessions/v1/sessions/s-pit/events", admin)).status).toBe(200);
     expect((await h.call("GET", "/sessions/v1/sessions/users?workspace=ws-1", admin)).status).toBe(200);
     expect((await h.call("GET", "/sessions/v1/sessions/users?workspace=ws-1", member)).status).toBe(403);
+  });
+
+  it("lets a mapped librarian group manage runtime access with an agent-behalf/read credential", async () => {
+    const h = harness();
+    await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", h.batch("s-sensitive"));
+    const member = (await h.mint("u-member")).body.accessToken;
+    const admin = (await h.mint("u-admin", "admin")).body.accessToken;
+    expect((await h.call("PATCH", "/sessions/v1/sessions/s-sensitive/access", member, { mode: "000" })).status).toBe(403);
+    const changed = await h.call("PATCH", "/sessions/v1/sessions/s-sensitive/access", admin, {
+      mode: "000",
+      acl: [{ gid: 33, perm: "r" }],
+      label: "restricted",
+      expectedVersion: 0,
+    });
+    expect(changed).toMatchObject({ status: 200, body: { access: { version: 1, label: "restricted" } } });
+    expect((await h.call("GET", "/sessions/v1/sessions/s-sensitive/events", member)).status).toBe(403);
+    expect((await h.call("GET", "/sessions/v1/sessions/s-sensitive/events", admin)).status).toBe(200);
   });
 
   it("mints only off the internal path: never through a public Sessions host, and with the internal secret when configured", async () => {

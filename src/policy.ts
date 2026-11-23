@@ -15,6 +15,10 @@ const Mode = z
 
 const Gid = z.number().int().nonnegative();
 
+export const GroupLabelSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9](?:[A-Za-z0-9 ._-]{0,22}[A-Za-z0-9._-])?$/, "label is 1-24 characters: A-Z, a-z, 0-9, space, '.', '_' and '-', starting with a letter or digit and not ending in a space");
+
 /** Extra group entries that only add access (docs/contract.md, "Access lists"). */
 export const AclSchema = z.array(z.object({ gid: Gid, perm: z.enum(["r", "w", "rw"]) })).default([]);
 
@@ -75,6 +79,8 @@ export const PolicySchema = z.object({
    * An override can't move a session to another group: its owning group is what ceilings are checked against.
    */
   sessionOverrides: z.array(z.object({ id: z.string().min(1), mode: Mode.optional(), acl: AclSchema }).strict()).default([]),
+  /** Groups allowed to replace a session's runtime gid/mode/ACL/label through the access API. */
+  sessionAccessAdmins: z.object({ gids: z.array(Gid).default([]) }).strict().default({ gids: [] }),
   /**
    * relay-control users without an rg_ token (the desktop app's device token, dashboard read tokens), mapped to
    * groups: the first rule whose every given field matches wins; no match means refused.
@@ -148,9 +154,7 @@ export const PolicySchema = z.object({
       z.string().regex(/^(0|[1-9][0-9]*)$/, "groupLabels keys are gids in decimal"),
       z
         .object({
-          label: z
-            .string()
-            .regex(/^[A-Za-z0-9](?:[A-Za-z0-9 ._-]{0,22}[A-Za-z0-9._-])?$/, "label is 1-24 characters: A-Z, a-z, 0-9, space, '.', '_' and '-', starting with a letter or digit and not ending in a space"),
+          label: GroupLabelSchema,
           description: z.string().min(1).max(200).regex(/^[^\u0000-\u001f\u007f]+$/u, "description has no control characters").optional(),
         })
         .strict(),
@@ -202,6 +206,7 @@ export function parsePolicy(raw: unknown): Policy {
     ...policy.sessionOverrides.flatMap((o) =>
       o.acl.map((e) => ({ where: `session override ${o.id}`, gid: e.gid })),
     ),
+    ...policy.sessionAccessAdmins.gids.map((gid) => ({ where: "sessionAccessAdmins", gid })),
     ...policy.controlPrincipals.flatMap((rule, i) => [rule.gid, ...rule.groups].map((gid) => ({ where: `control principal rule ${i}`, gid }))),
     ...policy.sessionAggregates.gids.map((gid) => ({ where: "sessionAggregates", gid })),
     ...policy.ceilings.flatMap((c) => [c.gid, ...c.never].map((gid) => ({ where: `ceiling for ${c.gid}`, gid }))),

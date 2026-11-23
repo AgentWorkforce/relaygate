@@ -1,12 +1,13 @@
 import { gunzipSync, zstdDecompressSync } from "node:zlib";
 import type { Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
+import { z } from "zod";
 import { decideResource, type Deps, type Env, type ResolvedResource } from "./app.js";
 import { matchControlRule, takeReaderKind } from "./control.js";
-import { check, type AclEntry, type Op } from "./mode.js";
-import { groupLabel, type Policy } from "./policy.js";
+import { allGroups, check, type AclEntry, type Op } from "./mode.js";
+import { groupLabel, GroupLabelSchema, type Policy } from "./policy.js";
 import { deny } from "./relaycast.js";
-import type { Agent } from "./store.js";
+import type { Agent, SessionAccessRow } from "./store.js";
 
 /**
  * The Sessions proxy (docs/contract.md, "Session uploads" and "Reads and lists"), mounted at /sessions, so a client's
@@ -117,9 +118,31 @@ const SESSION_ID = /^[A-Za-z0-9._:@-]{1,256}$/;
 const READ_VIEWS = ["events", "turns", "metadata", "thread", "catalog", "timing", "analysis", "brief", "summary"] as const;
 /** Single-session views that describe the session itself, so they carry its group label (docs/contract.md, "Group labels"). */
 const LABELED_VIEWS = new Set<string>(["metadata", "catalog"]);
+const SessionAccessPatch = z
+  .object({
+    gid: z.number().int().nonnegative().optional(),
+    mode: z.string().regex(/^[0246]{3}$/).optional(),
+    acl: z.array(z.object({ gid: z.number().int().nonnegative(), perm: z.enum(["r", "w", "rw"]) }).strict()).max(64).optional(),
+    label: GroupLabelSchema.nullable().optional(),
+    expectedVersion: z.number().int().nonnegative().optional(),
+    reason: z.string().min(1).max(200).regex(/^[^\u0000-\u001f\u007f]+$/u).optional(),
+  })
+  .strict()
+  .refine((b) => b.gid !== undefined || b.mode !== undefined || b.acl !== undefined || b.label !== undefined, "one access field is required");
 
 /** A session's effective owner, group, mode and ACL. */
-export function resolveSession(id: string, row: { owner: string; gid: number }, policy: Policy): ResolvedResource {
+export function resolveSession(id: string, row: { owner: string; gid: number }, policy: Policy, runtime?: SessionAccessRow): ResolvedResource {
+  if (runtime) {
+    return {
+      kind: "session",
+      id,
+      owner: row.owner,
+      gid: runtime.gid,
+      mode: runtime.mode,
+      acl: runtime.acl,
+      source: "session-runtime",
+    };
+  }
   const def = policy.sessionDefaults.find((d) => d.gid === row.gid);
   const override = policy.sessionOverrides.find((o) => o.id === id);
   const acl: AclEntry[] = [...(def?.acl ?? []), ...(override?.acl ?? [])];
@@ -209,8 +232,10 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
    */
   const annotation = (id: string, policy: Policy): { gid: number; label: string } | undefined => {
     const row = store.session(id);
-    const label = row && groupLabel(policy, row.gid);
-    return row && label ? { gid: row.gid, label } : undefined;
+    const runtime = row && store.sessionAccess(id);
+    const gid = runtime?.gid ?? row?.gid;
+    const label = runtime ? runtime.label : gid === undefined ? undefined : groupLabel(policy, gid);
+    return gid !== undefined && label ? { gid, label } : undefined;
   };
   /** A session object with relaygate's annotation set, and any upstream `relaygate` key dropped (only relaygate says it). */
   const annotate = (s: Record<string, unknown>, id: string, policy: Policy): Record<string, unknown> => {
@@ -223,7 +248,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     const row = store.session(id);
     if (!row) return false;
     const policy = deps.policy();
-    return check(c.get("principal"), resolveSession(id, row, policy), "r", policy.ceilings).allowed;
+    return check(c.get("principal"), resolveSession(id, row, policy, store.sessionAccess(id)), "r", policy.ceilings).allowed;
   };
 
   /** The write decision for one session; a new session is decided as if the caller owned it (it will). */
@@ -231,7 +256,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     const agent: Agent = c.get("agent");
     const principal = c.get("principal");
     const target = row ?? { owner: agent.id, gid: principal.gid };
-    return decideResource(deps, agent, principal, "w", resolveSession(id, target, deps.policy()), content);
+    return decideResource(deps, agent, principal, "w", resolveSession(id, target, deps.policy(), row ? store.sessionAccess(id) : undefined), content);
   };
 
   const refusal = (c: Ctx, id: string, d: Awaited<ReturnType<typeof decideWrite>>): Response | undefined => {
@@ -289,6 +314,103 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     audit(c, "session.read", "r", id, ok ? "allow" : "deny", "mode", ok ? "read" : "read_denied");
     return ok ? undefined : deny(c, 403, "relaygate_denied", { op: "r", resource: `session:${id}` });
   };
+
+  const canManageAccess = (c: Ctx): boolean => {
+    const allowed = new Set(deps.policy().sessionAccessAdmins.gids);
+    return allGroups(c.get("principal")).some((gid) => allowed.has(gid));
+  };
+  const accessRefusal = (c: Ctx, id: string): Response | undefined => {
+    const ok = canManageAccess(c);
+    audit(c, "session.access.manage", "w", id, ok ? "allow" : "deny", "mode", ok ? "sessionAccessAdmins" : "not_in_sessionAccessAdmins");
+    return ok ? undefined : deny(c, 403, "relaygate_denied", { op: "w", resource: `session:${id}:access` });
+  };
+  const accessCard = (row: SessionAccessRow) => ({
+    sessionId: row.sessionId,
+    gid: row.gid,
+    mode: row.mode,
+    acl: row.acl,
+    label: row.label,
+    version: row.version,
+    updatedAt: row.updatedAt,
+  });
+
+  // A librarian/control-plane principal replaces the runtime access policy. Named people are resolved by Control
+  // to their durable groups before this call; relaygate persists/enforces only gids and never stores identity data.
+  app.options("/sessions/v1/sessions/:id/access", (c) =>
+    c.body(null, 204, {
+      "access-control-allow-methods": "GET, PATCH, OPTIONS",
+      "access-control-allow-headers": "authorization, content-type, x-relaygate-token",
+      "access-control-max-age": "600",
+    }),
+  );
+  app.get("/sessions/v1/sessions/:id/access", (c) => {
+    const id = c.req.param("id");
+    if (!SESSION_ID.test(id)) return deny(c, 400, "relaygate_bad_request", { detail: "invalid session id" });
+    const refused = accessRefusal(c, id);
+    if (refused) return refused;
+    const session = store.session(id);
+    if (!session) return deny(c, 404, "relaygate_not_found");
+    const runtime = store.sessionAccess(id);
+    if (runtime) return c.json({ runtime: true, access: accessCard(runtime) });
+    const resolved = resolveSession(id, session, deps.policy());
+    return c.json({
+      runtime: false,
+      access: { sessionId: id, gid: resolved.gid, mode: resolved.mode, acl: resolved.acl, label: groupLabel(deps.policy(), resolved.gid), version: 0 },
+    });
+  });
+
+  app.patch("/sessions/v1/sessions/:id/access", async (c) => {
+    const id = c.req.param("id");
+    if (!SESSION_ID.test(id)) return deny(c, 400, "relaygate_bad_request", { detail: "invalid session id" });
+    const refused = accessRefusal(c, id);
+    if (refused) return refused;
+    const session = store.session(id);
+    if (!session) return deny(c, 404, "relaygate_not_found");
+    const parsed = SessionAccessPatch.safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return deny(c, 400, "relaygate_bad_request", { detail: parsed.error.issues[0]?.message });
+    const policy = deps.policy();
+    const namedGids = [parsed.data.gid, ...(parsed.data.acl ?? []).map((e) => e.gid)].filter((gid): gid is number => gid !== undefined);
+    const unknown = namedGids.find((gid) => !policy.groups.some((g) => g.gid === gid));
+    if (unknown !== undefined) return deny(c, 400, "relaygate_bad_request", { detail: `unknown gid ${unknown}` });
+    const before = store.sessionAccess(id);
+    const current = resolveSession(id, session, policy, before);
+    const result = store.putSessionAccess(
+      {
+        sessionId: id,
+        gid: parsed.data.gid ?? current.gid,
+        mode: parsed.data.mode ?? current.mode,
+        acl: parsed.data.acl ?? [...(current.acl ?? [])],
+        label: parsed.data.label === undefined ? (before?.label ?? groupLabel(policy, current.gid) ?? null) : parsed.data.label,
+        updatedBy: c.get("agent").id,
+      },
+      parsed.data.expectedVersion,
+      parsed.data.reason,
+    );
+    if (!result.updated) return deny(c, 409, "relaygate_conflict", { currentVersion: result.currentVersion });
+    store.audit({
+      agentId: c.get("agent").id,
+      action: "session.access.update",
+      op: "w",
+      resourceKind: "session",
+      resourceId: id,
+      decision: "allow",
+      stage: "mode",
+      reason: `version:${result.row.version}`,
+    });
+    return c.json({ runtime: true, access: accessCard(result.row) });
+  });
+
+  app.get("/sessions/v1/sessions/:id/access/history", (c) => {
+    const id = c.req.param("id");
+    if (!SESSION_ID.test(id)) return deny(c, 400, "relaygate_bad_request", { detail: "invalid session id" });
+    const refused = accessRefusal(c, id);
+    if (refused) return refused;
+    if (!store.session(id)) return deny(c, 404, "relaygate_not_found");
+    const after = Number(c.req.query("after") ?? 0);
+    const limit = Math.min(Math.max(Number(c.req.query("limit") ?? 200), 1), 1000);
+    if (!Number.isInteger(after) || after < 0 || !Number.isInteger(limit)) return deny(c, 400, "relaygate_bad_request");
+    return c.json({ rows: store.sessionAccessAudit(id, after, limit) });
+  });
 
   // Append turns. Turns are attributed to the agent, whatever the client sent.
   app.post("/sessions/v1/sessions/:id/turns", async (c) => {

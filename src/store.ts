@@ -60,6 +60,18 @@ export interface StreamRow {
   acl: AclEntry[];
 }
 
+/** A runtime access policy for one session. It replaces policy defaults/overrides until changed again. */
+export interface SessionAccessRow {
+  sessionId: string;
+  gid: number;
+  mode: string;
+  acl: AclEntry[];
+  label: string | null;
+  version: number;
+  updatedBy: string;
+  updatedAt: string;
+}
+
 export interface AuditEntry {
   agentId: string | null;
   action: string;
@@ -134,6 +146,27 @@ export class Store {
         gid INTEGER NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS session_access (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+        gid INTEGER NOT NULL,
+        mode TEXT NOT NULL,
+        acl TEXT NOT NULL,
+        label TEXT,
+        version INTEGER NOT NULL,
+        updated_by TEXT NOT NULL REFERENCES agents(id),
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS session_access_audit (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        at TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        actor_id TEXT NOT NULL REFERENCES agents(id),
+        version INTEGER NOT NULL,
+        before_json TEXT,
+        after_json TEXT NOT NULL,
+        reason TEXT
+      );
+      CREATE INDEX IF NOT EXISTS session_access_audit_by_session ON session_access_audit (session_id, seq);
       CREATE TABLE IF NOT EXISTS control_read_tokens (
         hash TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
@@ -333,6 +366,73 @@ export class Store {
     return row ? { id: String(row.id), owner: String(row.owner), gid: Number(row.gid) } : undefined;
   }
 
+  sessionAccess(id: string): SessionAccessRow | undefined {
+    const row = this.db
+      .prepare("SELECT session_id, gid, mode, acl, label, version, updated_by, updated_at FROM session_access WHERE session_id = ?")
+      .get(id);
+    return row ? toSessionAccess(row) : undefined;
+  }
+
+  /**
+   * Replaces a session's runtime access policy and appends an immutable before/after audit row atomically.
+   * `expectedVersion` makes dashboard/MCP edits safe against lost updates; zero means no policy exists yet.
+   */
+  putSessionAccess(
+    access: Omit<SessionAccessRow, "version" | "updatedAt">,
+    expectedVersion: number | undefined,
+    reason?: string,
+  ): { updated: true; row: SessionAccessRow } | { updated: false; currentVersion: number } {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const before = this.sessionAccess(access.sessionId);
+      const currentVersion = before?.version ?? 0;
+      if (expectedVersion !== undefined && expectedVersion !== currentVersion) {
+        this.db.exec("ROLLBACK");
+        return { updated: false, currentVersion };
+      }
+      const version = currentVersion + 1;
+      const updatedAt = now();
+      this.db
+        .prepare(
+          `INSERT INTO session_access (session_id, gid, mode, acl, label, version, updated_by, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET gid = excluded.gid, mode = excluded.mode, acl = excluded.acl,
+             label = excluded.label, version = excluded.version, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+        )
+        .run(access.sessionId, access.gid, access.mode, JSON.stringify(access.acl), access.label, version, access.updatedBy, updatedAt);
+      const row: SessionAccessRow = { ...access, version, updatedAt };
+      this.db
+        .prepare(
+          "INSERT INTO session_access_audit (at, session_id, actor_id, version, before_json, after_json, reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(updatedAt, access.sessionId, access.updatedBy, version, before ? JSON.stringify(publicSessionAccess(before)) : null, JSON.stringify(publicSessionAccess(row)), reason ?? null);
+      this.db.exec("COMMIT");
+      return { updated: true, row };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  sessionAccessAudit(id: string, after: number, limit: number): Array<Record<string, unknown>> {
+    return this.db
+      .prepare(
+        `SELECT h.seq, h.at, h.session_id, h.actor_id, a.name AS actor_name, h.version,
+                h.before_json, h.after_json, h.reason
+           FROM session_access_audit h JOIN agents a ON a.id = h.actor_id
+          WHERE h.session_id = ? AND h.seq > ? ORDER BY h.seq ASC LIMIT ?`,
+      )
+      .all(id, after, limit)
+      .map((row) => {
+        const { before_json, after_json, ...rest } = row;
+        return {
+          ...rest,
+          before: before_json === null ? null : JSON.parse(String(before_json)),
+          after: JSON.parse(String(after_json)),
+        };
+      }) as Array<Record<string, unknown>>;
+  }
+
   /**
    * Claims every id for `owner` in one transaction, or none: if any is already owned by someone else, nothing is
    * written and the ids that were taken are returned.
@@ -522,4 +622,21 @@ function toAgent(row: Record<string, unknown>): Agent {
     guest: Number(row.guest) === 1,
     groups: row.groups === null || row.groups === undefined ? null : (JSON.parse(String(row.groups)) as number[]),
   };
+}
+
+function toSessionAccess(row: Record<string, unknown>): SessionAccessRow {
+  return {
+    sessionId: String(row.session_id),
+    gid: Number(row.gid),
+    mode: String(row.mode),
+    acl: JSON.parse(String(row.acl)) as AclEntry[],
+    label: row.label === null ? null : String(row.label),
+    version: Number(row.version),
+    updatedBy: String(row.updated_by),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function publicSessionAccess(row: SessionAccessRow): Record<string, unknown> {
+  return { gid: row.gid, mode: row.mode, acl: row.acl, label: row.label, version: row.version };
 }

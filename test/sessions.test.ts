@@ -59,6 +59,7 @@ function harness(pol = policy(), opts: { token?: string } = { token: SERVICE }) 
   upstream.get("/v1/sessions/:id/events", (c) => c.json({ events: [{ sessionId: c.req.param("id") }] }));
   upstream.get("/v1/sessions/:id/metadata", (c) => c.text(`{"sessionId":"${c.req.param("id")}",  "title":"t"}`, 200, { "content-type": "application/json" }));
   upstream.get("/v1/sessions/:id/catalog", (c) => c.json({ catalog: { title: "t" }, parents: [], children: [], relaygate: { gid: 33, label: "forged" } }));
+  upstream.get("/v1/sessions/:id/summary", (c) => c.json({ sessionId: c.req.param("id"), summary: "work" }));
   upstream.get("/v1/events", (c) =>
     c.json({ events: c.req.query("q") ? [{ sessionId: "s-local", text: "a" }, { sessionId: "s-pit", text: "b" }, { text: "no session" }] : [] }),
   );
@@ -220,6 +221,60 @@ describe("Sessions proxy: group labels", () => {
     }
     expect(() => parsePolicy({ ...base, groupLabels: { "022": { label: "pit" } } })).toThrow();
     expect(() => parsePolicy({ ...base, groupLabels: { "22": { label: "pit", color: "red" } } })).toThrow();
+  });
+});
+
+describe("Sessions proxy: runtime session access", () => {
+  const managed = () => policy([], [], [], { sessionAccessAdmins: { gids: [22] } });
+
+  it("lets only an authorized group replace access, then enforces it on every read shape", async () => {
+    const w = await world(managed());
+    expect((await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.local, { mode: "000", acl: [{ gid: 44, perm: "r" }] })).status).toBe(403);
+
+    const changed = await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, {
+      mode: "000",
+      acl: [{ gid: 44, perm: "r" }],
+      label: "restricted",
+      expectedVersion: 0,
+      reason: "sensitive",
+    });
+    expect(changed.status).toBe(200);
+    expect(changed.body.access).toMatchObject({ gid: 11, mode: "000", acl: [{ gid: 44, perm: "r" }], label: "restricted", version: 1 });
+
+    // The old owner and old cross-group reader both lose access; the named reader group gains it.
+    for (const view of ["events", "turns", "metadata", "thread", "catalog", "timing", "analysis", "brief", "summary"]) {
+      expect((await w.call("GET", `/sessions/v1/sessions/s-local/${view}`, w.local)).status, view).toBe(403);
+      expect((await w.call("GET", `/sessions/v1/sessions/s-local/${view}`, w.pit)).status, view).toBe(403);
+    }
+    expect((await w.call("GET", "/sessions/v1/sessions/s-local/summary", w.guest)).status).toBe(200);
+    expect((await w.call("GET", "/sessions/v1/events?session=s-local", w.local)).status).toBe(403);
+    expect((await w.call("GET", "/sessions/v1/events?q=hello", w.local)).body.events).toEqual([]);
+    expect((await w.call("GET", "/sessions/v1/events?q=hello", w.guest)).body.events.map((e: any) => e.sessionId)).toEqual(["s-local"]);
+    expect((await w.call("GET", "/sessions/v1/sessions", w.local)).body.sessions).toEqual([]);
+    expect((await w.call("GET", "/sessions/v1/sessions", w.guest)).body.sessions).toEqual([
+      { sessionId: "s-local", relaygate: { gid: 11, label: "restricted" } },
+    ]);
+  });
+
+  it("persists immutable versions, rejects lost updates and exposes a manager-only audit trail", async () => {
+    const w = await world(managed());
+    expect((await w.call("GET", "/sessions/v1/sessions/s-local/access", w.local)).status).toBe(403);
+    expect((await w.call("GET", "/sessions/v1/sessions/s-local/access", w.pit)).body).toMatchObject({ runtime: false, access: { version: 0 } });
+    expect((await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, { mode: "000", expectedVersion: 0 })).status).toBe(200);
+    const conflict = await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, { label: "legal", expectedVersion: 0 });
+    expect(conflict).toMatchObject({ status: 409, body: { currentVersion: 1 } });
+    expect((await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, { label: "legal", expectedVersion: 1 })).body.access.version).toBe(2);
+    const history = await w.call("GET", "/sessions/v1/sessions/s-local/access/history", w.pit);
+    expect(history.body.rows).toHaveLength(2);
+    expect(history.body.rows[0]).toMatchObject({ version: 1, before: null, after: { mode: "000", version: 1 } });
+    expect(history.body.rows[1]).toMatchObject({ version: 2, before: { version: 1 }, after: { label: "legal", version: 2 } });
+  });
+
+  it("validates configured managers and runtime gids and labels", async () => {
+    expect(() => parsePolicy({ groups: [{ gid: 1, name: "one" }], enrollmentKeys: [], sessionAccessAdmins: { gids: [2] } })).toThrow(/sessionAccessAdmins/);
+    const w = await world(managed());
+    expect((await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, { acl: [{ gid: 999, perm: "r" }] })).status).toBe(400);
+    expect((await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, { label: "<secret>" })).status).toBe(400);
   });
 });
 
