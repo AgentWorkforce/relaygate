@@ -87,6 +87,8 @@ export interface AuditEntry {
 
 export class Store {
   private db: DatabaseSync;
+  /** Older read-only snapshots predate runtime access; unlike writable stores they are intentionally not migrated. */
+  private hasSessionAccess = true;
   /** The agent columns this database has (all of them, once migrated). */
   private agentCols = "id, name, gid, key_id, recovery_hash, guest, groups";
 
@@ -97,6 +99,7 @@ export class Store {
       // A read-only database isn't migrated: read the agent columns it has (an older one lacks guest/groups).
       const cols = new Set(this.db.prepare("PRAGMA table_info(agents)").all().map((c) => String(c.name)));
       this.agentCols = `id, name, gid, key_id, recovery_hash, ${cols.has("guest") ? "guest" : "0 AS guest"}, ${cols.has("groups") ? "groups" : "NULL AS groups"}`;
+      this.hasSessionAccess = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_access'").get() !== undefined;
       return;
     }
     this.db.exec(`
@@ -169,6 +172,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS session_access_audit_by_session ON session_access_audit (session_id, seq);
       CREATE TABLE IF NOT EXISTS control_read_tokens (
         hash TEXT PRIMARY KEY,
+        refresh_hash TEXT,
+        session_id TEXT,
         user_id TEXT NOT NULL,
         org_id TEXT NOT NULL,
         workspace_id TEXT,
@@ -211,6 +216,8 @@ export class Store {
     this.addColumn("agents", "last_seen_at", "INTEGER");
     this.addColumn("tokens", "binding", "TEXT");
     this.addColumn("control_read_tokens", "reader_kind", "TEXT");
+    this.addColumn("control_read_tokens", "refresh_hash", "TEXT");
+    this.addColumn("control_read_tokens", "session_id", "TEXT");
   }
 
   private addColumn(table: string, column: string, decl: string): void {
@@ -367,6 +374,7 @@ export class Store {
   }
 
   sessionAccess(id: string): SessionAccessRow | undefined {
+    if (!this.hasSessionAccess) return undefined;
     const row = this.db
       .prepare("SELECT session_id, gid, mode, acl, label, version, updated_by, updated_at FROM session_access WHERE session_id = ?")
       .get(id);
@@ -474,13 +482,38 @@ export class Store {
     return this.createAgent(name, gid, "control", undefined);
   }
 
-  putControlReadToken(row: { hash: string; userId: string; orgId: string; workspaceId: string | null; role: string | null; email: string | null; readerKind: string | null; expiresAt: number }): void {
+  putControlReadToken(row: { hash: string; refreshHash: string | null; sessionId: string | null; userId: string; orgId: string; workspaceId: string | null; role: string | null; email: string | null; readerKind: string | null; expiresAt: number }): void {
+    // A refresh rotates the access token for this read session. Forget the predecessor locally at the same time.
+    if (row.sessionId) this.db.prepare("DELETE FROM control_read_tokens WHERE session_id = ? AND hash <> ?").run(row.sessionId, row.hash);
     this.db
       .prepare(
-        `INSERT INTO control_read_tokens (hash, user_id, org_id, workspace_id, role, email, reader_kind, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(hash) DO UPDATE SET user_id = excluded.user_id, org_id = excluded.org_id, workspace_id = excluded.workspace_id, role = excluded.role, email = excluded.email, reader_kind = excluded.reader_kind, expires_at = excluded.expires_at`,
+        `INSERT INTO control_read_tokens (hash, refresh_hash, session_id, user_id, org_id, workspace_id, role, email, reader_kind, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(hash) DO UPDATE SET refresh_hash = excluded.refresh_hash, session_id = excluded.session_id, user_id = excluded.user_id, org_id = excluded.org_id, workspace_id = excluded.workspace_id, role = excluded.role, email = excluded.email, reader_kind = excluded.reader_kind, expires_at = excluded.expires_at`,
       )
-      .run(row.hash, row.userId, row.orgId, row.workspaceId, row.role, row.email, row.readerKind, row.expiresAt);
+      .run(row.hash, row.refreshHash, row.sessionId, row.userId, row.orgId, row.workspaceId, row.role, row.email, row.readerKind, row.expiresAt);
+  }
+
+  revokeControlReadToken(token: string): number {
+    const hash = sha256(token);
+    return Number(this.db.prepare("DELETE FROM control_read_tokens WHERE hash = ? OR refresh_hash = ?").run(hash, hash).changes);
+  }
+
+  revokeControlReadSessions(filter: { orgId: string; sessionId?: string; userId?: string; workspaceId?: string }): number {
+    const clauses = ["org_id = ?"];
+    const params: string[] = [filter.orgId];
+    if (filter.sessionId) {
+      clauses.push("session_id = ?");
+      params.push(filter.sessionId);
+    }
+    if (filter.userId) {
+      clauses.push("user_id = ?");
+      params.push(filter.userId);
+    }
+    if (filter.workspaceId) {
+      clauses.push("workspace_id = ?");
+      params.push(filter.workspaceId);
+    }
+    return Number(this.db.prepare(`DELETE FROM control_read_tokens WHERE ${clauses.join(" AND ")}`).run(...params).changes);
   }
 
   /** A Control user's email, as relay-control last reported it (introspection, or a mint that carried it). */

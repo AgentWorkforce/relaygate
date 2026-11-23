@@ -31,6 +31,8 @@ export interface Guarded {
   mode: string;
   /** Extra group entries that only add access (POSIX-ACL style). */
   acl?: readonly AclEntry[];
+  /** Additional immutable resource groups whose ceilings still apply after a runtime relabel. */
+  ceilingGids?: readonly number[];
 }
 
 const BIT: Record<Op, number> = { r: 4, w: 2 };
@@ -102,10 +104,12 @@ export function check(p: Principal, x: Guarded, op: Op, ceilings: readonly Ceili
   }
   const reason = `mode:${x.mode}${acl.map((e) => `+acl:${e.gid}:${e.perm}`).join("")}`;
 
-  const ceiling = ceilingFor(p, x.gid, ceilings);
-  if (ceiling) {
-    steps.push({ step: "ceiling", detail: `gid ${ceiling.gid} may never touch gid ${x.gid}: refused` });
-    return { allowed: false, bits: 0, reason: `ceiling:${ceiling.gid}->${x.gid}`, steps };
+  for (const gid of [...new Set([x.gid, ...(x.ceilingGids ?? [])])]) {
+    const ceiling = ceilingFor(p, gid, ceilings);
+    if (ceiling) {
+      steps.push({ step: "ceiling", detail: `gid ${ceiling.gid} may never touch gid ${gid}: refused` });
+      return { allowed: false, bits: 0, reason: `ceiling:${ceiling.gid}->${gid}`, steps };
+    }
   }
   return { allowed: (bits & BIT[op]) !== 0, bits, reason, steps };
 }
