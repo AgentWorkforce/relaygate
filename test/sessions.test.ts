@@ -389,6 +389,36 @@ describe("Sessions proxy: signed upstream assertions", () => {
     }, at).access).toBe("passthrough");
   });
 
+  it("matches the verifier's strict event-query classification", async () => {
+    const h = harness(policy(), { token: SERVICE, assertion: { key: ASSERTION_PRIVATE_KEY, kid, now: () => at } });
+    const local = await h.token(KEYS.local, "event-query-signer");
+    await h.turns(local, "s-signed");
+
+    expect((await h.call("GET", "/sessions/v1/events?session=&q=work", local)).status).toBe(200);
+    let sent = h.calls.at(-1)!;
+    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, ASSERTION_PUBLIC_KEY]]), {
+      method: "GET", path: "/v1/events?session=&q=work", credential: `Bearer ${SERVICE}`, audience: "session-read-api", access: "filter", sessionIds: [],
+    }, at).access).toBe("filter");
+
+    expect((await h.call("GET", "/sessions/v1/events?session=s-signed&q=", local)).status).toBe(200);
+    sent = h.calls.at(-1)!;
+    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, ASSERTION_PUBLIC_KEY]]), {
+      method: "GET", path: "/v1/events?session=s-signed&q=", credential: `Bearer ${SERVICE}`, audience: "session-read-api", access: "read", sessionIds: ["s-signed"],
+    }, at).access).toBe("read");
+
+    const before = h.calls.length;
+    for (const path of [
+      "/sessions/v1/events?session=&q=",
+      "/sessions/v1/events?q=one&q=two",
+      "/sessions/v1/events?session=s-signed&q=one&q=two",
+      "/sessions/v1/events?session=%FF",
+      "/sessions/v1/events?q=%E0%A4%A",
+    ]) {
+      expect((await h.call("GET", path, local)).status, path).toBe(400);
+    }
+    expect(h.calls).toHaveLength(before);
+  });
+
   it("signs the resolved upstream path when the configured origin has a path prefix", async () => {
     const h = harness(policy(), { token: SERVICE, assertion: { key: ASSERTION_PRIVATE_KEY, kid, now: () => at }, readUrl: "http://read.test/history/" });
     const local = await h.token(KEYS.local, "local-prefixed");
