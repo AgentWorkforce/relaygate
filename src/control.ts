@@ -192,6 +192,8 @@ export class ControlAuth {
     const role = typeof b.role === "string" && ROLES.has(b.role) ? b.role : null;
     this.store.putControlReadToken({
       hash: sha256(token),
+      refreshHash: typeof b.refreshToken === "string" && b.refreshToken.startsWith("rth_rt_read_") ? sha256(b.refreshToken) : null,
+      sessionId: typeof b.sessionId === "string" ? b.sessionId : null,
       userId: b.userId,
       orgId: b.orgId,
       workspaceId: typeof b.workspaceId === "string" ? b.workspaceId : null,
@@ -202,6 +204,25 @@ export class ControlAuth {
     });
     this.store.pruneControlReadTokens(now);
     return true;
+  }
+
+  /** Mirrors a successful holder revoke so a locally handled management call cannot reuse the old access token. */
+  recordClientRevoke(body: unknown): boolean {
+    const token = (body as Record<string, unknown> | null)?.token;
+    return typeof token === "string" && this.store.revokeControlReadToken(token) > 0;
+  }
+
+  /** Mirrors relay-control's successful internal revoke by read-session identity. */
+  recordInternalRevoke(body: unknown): boolean {
+    const b = body as Record<string, unknown> | null;
+    if (typeof b?.orgId !== "string") return false;
+    const filter = {
+      orgId: b.orgId,
+      ...(typeof b.id === "string" ? { sessionId: b.id } : typeof b.sessionId === "string" ? { sessionId: b.sessionId } : {}),
+      ...(typeof b.userId === "string" ? { userId: b.userId } : {}),
+      ...(typeof b.workspaceId === "string" ? { workspaceId: b.workspaceId } : {}),
+    };
+    return this.store.revokeControlReadSessions(filter) > 0;
   }
 }
 

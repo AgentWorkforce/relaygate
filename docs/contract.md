@@ -876,6 +876,12 @@ session lists. Runtime gid/label values also drive the trustworthy
 `relaygate` badge. Writes are covered too; for a read-only restriction use
 `mode: "000"` and `r` ACL entries as above.
 
+A runtime `gid` changes the effective group but never erases the immutable
+first-uploader group: ceilings are checked against both. Write classification
+also snapshots the runtime version. If access changes while classification is
+in flight, relaygate re-decides the whole request and never forwards a write
+under the stale decision.
+
 `GET .../access` returns the effective policy and its version. Every successful
 change appends an immutable before/after row, including actor, timestamp,
 version and the optional content-free reason; managers read it at
@@ -904,7 +910,9 @@ On Sessions routes, a request with one of those in `Authorization` and no
   calls unchanged and records the hash of each minted token with the identity
   the mint named (and its role, when the mint carries one). The mint routes are
   never served on a public Sessions host, and are checked against
-  `SESSIONS_INTERNAL_SECRET` when it is set.
+  `SESSIONS_INTERNAL_SECRET` when it is set. Successful refresh and revoke
+  calls are mirrored into that local hash cache, so a rotated or revoked read
+  credential cannot continue using relaygate-local management routes.
 
 The policy maps them to groups; the first rule whose every given field matches
 wins, and a user no rule matches is refused:

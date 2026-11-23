@@ -140,6 +140,7 @@ export function resolveSession(id: string, row: { owner: string; gid: number }, 
       gid: runtime.gid,
       mode: runtime.mode,
       acl: runtime.acl,
+      ceilingGids: runtime.gid === row.gid ? [] : [row.gid],
       source: "session-runtime",
     };
   }
@@ -282,12 +283,26 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
    */
   const gateWrites = async (c: Ctx, writes: Map<string, string>, attempt = 0): Promise<Response | string[]> => {
     const fresh: string[] = [];
+    const versions = new Map<string, number>();
+    const allowed: Array<[string, Awaited<ReturnType<typeof decideWrite>>]> = [];
+    const retryChanged = () =>
+      attempt >= 2
+        ? deny(c, 409, "relaygate_conflict", { detail: "session access changed concurrently; retry" })
+        : gateWrites(c, writes, attempt + 1);
     for (const [id, content] of writes) {
       const isNew = !store.session(id);
-      const refused = refusal(c, id, await decideWrite(c, id, content));
-      if (refused) return refused;
+      const version = store.sessionAccess(id)?.version ?? 0;
+      const decision = await decideWrite(c, id, content);
+      if ((store.sessionAccess(id)?.version ?? 0) !== version) return retryChanged();
+      if (decision.status !== "allow") return refusal(c, id, decision)!;
+      versions.set(id, version);
+      allowed.push([id, decision]);
       if (isNew) fresh.push(id);
     }
+    // A policy for an earlier session can change while a later session is being classified. Recheck the whole
+    // batch synchronously before any fetch begins, then audit the stable allow decisions.
+    if ([...versions].some(([id, version]) => (store.sessionAccess(id)?.version ?? 0) !== version)) return retryChanged();
+    for (const [id, decision] of allowed) refusal(c, id, decision);
     if (fresh.length === 0) return [];
     const result = store.claimSessions(fresh, c.get("agent").id, c.get("principal").gid);
     if (result.claimed) return fresh;
@@ -380,7 +395,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
         gid: parsed.data.gid ?? current.gid,
         mode: parsed.data.mode ?? current.mode,
         acl: parsed.data.acl ?? [...(current.acl ?? [])],
-        label: parsed.data.label === undefined ? (before?.label ?? groupLabel(policy, current.gid) ?? null) : parsed.data.label,
+        label: parsed.data.label === undefined ? (before ? before.label : groupLabel(policy, current.gid) ?? null) : parsed.data.label,
         updatedBy: c.get("agent").id,
       },
       parsed.data.expectedVersion,
@@ -559,6 +574,13 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
           } catch {
             /* not JSON: nothing to record */
           }
+        } else if (res.ok && path === "/internal/v1/session-read/revoke") {
+          try {
+            const answer = JSON.parse(text) as { revoked?: unknown };
+            if (typeof answer.revoked === "number" && answer.revoked > 0) control.recordInternalRevoke(JSON.parse(body));
+          } catch {
+            /* not a confirmed revoke: keep the local token record */
+          }
         }
         return new Response(text, { status: res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } });
       });
@@ -572,10 +594,11 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   app.post("/sessions/v1/auth/token/revoke", async (c) => {
     try {
       const origin = c.req.header("origin");
+      const body = await c.req.text();
       const res = await doFetch(new URL("v1/auth/token/revoke", slash(cfg.readUrl)), {
         method: "POST",
         headers: { authorization: c.req.header("authorization") ?? "", "content-type": c.req.header("content-type") ?? "application/json", ...(origin ? { origin } : {}) },
-        body: await c.req.text(),
+        body,
       });
       // Browsers call this too: the read API's CORS headers come back unchanged.
       const headers = new Headers({ "content-type": res.headers.get("content-type") ?? "application/json" });
@@ -583,7 +606,15 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
         const v = res.headers.get(h);
         if (v) headers.set(h, v);
       }
-      return new Response(await res.text(), { status: res.status, headers });
+      const text = await res.text();
+      if (res.ok && deps.control) {
+        try {
+          if ((JSON.parse(text) as { revoked?: unknown }).revoked === true) deps.control.recordClientRevoke(JSON.parse(body));
+        } catch {
+          /* not a confirmed revoke: keep the local token record */
+        }
+      }
+      return new Response(text, { status: res.status, headers });
     } catch {
       return deny(c, 502, "relaygate_upstream_unavailable");
     }
