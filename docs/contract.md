@@ -817,6 +817,12 @@ strong as the network rule that Sessions accepts traffic from relaygate alone
 | `GET /sessions/v1/coordination/{overlaps,advisories}` | passed to the read API only when every owned session is readable |
 | `POST /sessions/v1/coordination/advisories/:id/ack` | read-plane acknowledgement; requires `rth:read` and every owned session readable, not upload scope |
 
+For `GET /sessions/v1/events`, `session` and `q` may each appear at most once.
+An empty value counts as absent: a non-empty `session` selects the single-session
+read, otherwise a non-empty `q` selects filtered search. Malformed percent-encoded
+UTF-8 is refused before relaygate signs or forwards the request, so the gateway,
+assertion verifier and read API cannot decode different session scopes.
+
 A write is decided before anything is recorded; the classifier sees every
 forwarded field, not only `content`. New sessions are claimed in one
 transaction only when the whole request is allowed, so a refused upload never

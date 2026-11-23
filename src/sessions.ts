@@ -267,6 +267,22 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     const u = new URL(c.req.url);
     return `${u.pathname.replace(/^\/sessions/, "")}${u.search}`;
   };
+  /**
+   * Query parameters whose decoded value participates in an assertion scope must have one
+   * unambiguous UTF-8 decoding. URLSearchParams replaces malformed UTF-8, which could make the
+   * signer, verifier and read API bind three different session ids.
+   */
+  const scopedQuery = (c: Ctx): URLSearchParams | undefined => {
+    const u = new URL(c.req.url);
+    try {
+      // `+` is a space in URLSearchParams. decodeURIComponent is used only to validate the raw
+      // percent-encoded bytes; URLSearchParams remains the single parser for names and values.
+      decodeURIComponent(u.search.slice(1).replace(/\+/g, " "));
+    } catch {
+      return undefined;
+    }
+    return u.searchParams;
+  };
 
   /**
    * The owning group's display label for a session, as `relaygate: {gid, label}` (docs/contract.md, "Group labels").
@@ -590,10 +606,16 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
 
   // Events inside one session (gated), or a workspace transcript search (`q`), filtered to readable sessions.
   app.get("/sessions/v1/events", async (c) => {
-    const ids = c.req.queries("session") ?? [];
-    if (ids.length > 1) return deny(c, 400, "relaygate_bad_request", { detail: "at most one session= through relaygate" });
-    if (ids.length === 1) return gateRead(c, ids[0]!) ?? pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c), undefined, undefined, { audience: "session-read-api", access: "read", sessionIds: [ids[0]!] }));
-    if (!c.req.query("q")) return deny(c, 400, "relaygate_bad_request", { detail: "session= or q= is required through relaygate" });
+    const query = scopedQuery(c);
+    if (!query) return deny(c, 400, "relaygate_bad_request", { detail: "query must use valid percent-encoded UTF-8" });
+    const ids = query.getAll("session");
+    const searches = query.getAll("q");
+    if (ids.length > 1 || searches.length > 1) {
+      return deny(c, 400, "relaygate_bad_request", { detail: "at most one session= and q= through relaygate" });
+    }
+    const id = ids[0] ?? "";
+    if (id) return gateRead(c, id) ?? pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c), undefined, undefined, { audience: "session-read-api", access: "read", sessionIds: [id] }));
+    if (!(searches[0] ?? "")) return deny(c, 400, "relaygate_bad_request", { detail: "a non-empty session= or q= is required through relaygate" });
     const res = await upstream(c, cfg.readUrl, "GET", upstreamPath(c), undefined, undefined, { audience: "session-read-api", access: "filter" });
     if (res instanceof Response || res.status !== 200) return pass(res);
     const page = json(res) ?? {};
