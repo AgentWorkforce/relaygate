@@ -807,16 +807,16 @@ Network reachability is defense in depth, not the Sessions authorization
 boundary. When `RELAYGATE_UPSTREAM_ASSERTION_KEY` and
 `RELAYGATE_UPSTREAM_ASSERTION_KID` are set, relaygate adds
 `X-Relaygate-Assertion` after it has allowed each proxied read or write. The
-read API and ingest edge must hold the same current/previous key map and reject
+read API and ingest edge must hold the corresponding current/previous public-key map and reject
 an unsigned or invalid assertion on every content route.
 
-The header is `v1.<base64url-json>.<base64url-hmac-sha256>`. The MAC input is
+The header is `v1.<base64url-json>.<base64url-ed25519-signature>`. The signed input is
 the ASCII prefix `relaygate-upstream-v1\n` followed by the payload segment
 exactly as sent. Its JSON claims are:
 
 ```json
 {
-  "v": 1, "iss": "relaygate", "aud": "session-read-api", "kid": "current-1",
+  "v": 1, "alg": "Ed25519", "iss": "relaygate", "aud": "session-read-api", "kid": "current-1",
   "iat": 1800000000, "exp": 1800000030, "jti": "<uuid>",
   "method": "GET", "path": "/v1/events?session=s-1",
   "body_sha256": "<hex>", "credential_sha256": "<hex>",
@@ -833,8 +833,11 @@ without exposing that credential. Session scope is sorted and de-duplicated;
 `session_count` and `session_ids_sha256` always bind its canonical JSON. At
 most 16 ids and 2 KiB are also carried inline in `session_ids`; larger batches
 use an empty inline array, keeping the assertion header bounded.
-`aud` is `session-read-api` or `ingest-edge`, preventing cross-service replay
-even when both services share the rotation key.
+`aud` is `session-read-api` or `ingest-edge`, preventing cross-service replay.
+Relaygate alone holds the Ed25519 private key (canonical base64 of PKCS#8 DER);
+each verifier gets only the public key (canonical base64 of SPKI DER). This is
+deliberately asymmetric: compromising either upstream verifier must not grant
+authority to mint relaygate assertions for itself or the other audience.
 Single-session reads and writes name their sessions. Lists and transcript
 search carry `access: "filter"` and an empty list because relaygate filters the
 upstream page; permitted whole-workspace aggregates carry `aggregate`. The
@@ -842,13 +845,19 @@ administrative adoption scan signs every direct session-list page as a
 `filter` read too, leaving no unsigned read-API path when verification is on.
 
 The default lifetime is 30 seconds and the configurable range is 5 through
-60. A verifier checks the MAC in constant time, selects the key by `kid`,
+60. A verifier checks the Ed25519 signature, selects the public key by `kid`,
 allows at most five seconds of future clock skew, checks expiry and maximum
 lifetime, then recomputes every request binding. During rotation it accepts
-the current and previous kid/key but relaygate signs only with the current
-one. Assertions and credentials must not be logged. The assertion proves the
+the current and previous kid/public-key but relaygate signs only with the current
+private key. Assertions and credentials must not be logged. The assertion proves the
 gate's decision; the upstream still validates the caller's ordinary Sessions
 credential.
+
+Control-plane erasure is not a read bypass and does not traverse relaygate.
+An upstream may omit the assertion only for the exact
+`/internal/v1/session-erase/*` family after its existing internal erase secret
+has authenticated the call; this is an explicit alternative authorization
+path, not an unauthenticated or prefix-wide exemption.
 
 ### Relayfacts and coordination
 

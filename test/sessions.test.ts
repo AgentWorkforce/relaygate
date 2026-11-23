@@ -7,6 +7,7 @@ import { ChainClassifier, RuleClassifier, type Classifier } from "../src/classif
 import { parsePolicy } from "../src/policy.js";
 import { sha256, Store } from "../src/store.js";
 import { UPSTREAM_ASSERTION_HEADER, verifyUpstreamAssertion, type UpstreamAssertionConfig } from "../src/upstream-assertion.js";
+import { ASSERTION_PRIVATE_KEY, ASSERTION_PUBLIC_KEY } from "./assertion-fixture.js";
 
 const KEYS = { local: "enroll-local-0000000000000000", pit: "enroll-pit-00000000000000000000", guest: "enroll-guest-0000000000000000000" };
 const SERVICE = "rth_st_service";
@@ -313,18 +314,17 @@ describe("Sessions proxy: runtime session access", () => {
 });
 
 describe("Sessions proxy: signed upstream assertions", () => {
-  const key = "upstream-assertion-test-key-000000000000000000";
   const kid = "test-current";
   const at = 1_800_000_000_000;
 
   it("signs exact write bytes and session scope after the write is allowed", async () => {
-    const h = harness(policy(), { token: SERVICE, assertion: { key, kid, now: () => at } });
+    const h = harness(policy(), { token: SERVICE, assertion: { key: ASSERTION_PRIVATE_KEY, kid, now: () => at } });
     const local = await h.token(KEYS.local, "local-signer");
     expect((await h.turns(local, "s-signed")).status).toBe(200);
     const sent = h.calls.at(-1)!;
     const claims = verifyUpstreamAssertion(
       sent.headers.get(UPSTREAM_ASSERTION_HEADER)!,
-      new Map([[kid, key]]),
+      new Map([[kid, ASSERTION_PUBLIC_KEY]]),
       {
         method: "POST",
         path: "/v1/sessions/s-signed/turns",
@@ -340,18 +340,18 @@ describe("Sessions proxy: signed upstream assertions", () => {
   });
 
   it("distinguishes a gated single-session read from a relaygate-filtered list/search", async () => {
-    const h = harness(policy(), { token: SERVICE, assertion: { key, kid, now: () => at } });
+    const h = harness(policy(), { token: SERVICE, assertion: { key: ASSERTION_PRIVATE_KEY, kid, now: () => at } });
     const local = await h.token(KEYS.local, "local-reader");
     await h.turns(local, "s-signed");
     await h.call("GET", "/sessions/v1/sessions/s-signed/events?limit=5", local);
     let sent = h.calls.at(-1)!;
-    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, key]]), {
+    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, ASSERTION_PUBLIC_KEY]]), {
       method: "GET", path: "/v1/sessions/s-signed/events?limit=5", credential: `Bearer ${SERVICE}`, audience: "session-read-api", access: "read", sessionIds: ["s-signed"],
     }, at).session_ids).toEqual(["s-signed"]);
 
     await h.call("GET", "/sessions/v1/events?q=work&limit=10", local);
     sent = h.calls.at(-1)!;
-    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, key]]), {
+    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, ASSERTION_PUBLIC_KEY]]), {
       method: "GET", path: "/v1/events?q=work&limit=10", credential: `Bearer ${SERVICE}`, audience: "session-read-api", access: "filter", sessionIds: [],
     }, at).access).toBe("filter");
 
@@ -363,13 +363,13 @@ describe("Sessions proxy: signed upstream assertions", () => {
   });
 
   it("signs the resolved upstream path when the configured origin has a path prefix", async () => {
-    const h = harness(policy(), { token: SERVICE, assertion: { key, kid, now: () => at }, readUrl: "http://read.test/history/" });
+    const h = harness(policy(), { token: SERVICE, assertion: { key: ASSERTION_PRIVATE_KEY, kid, now: () => at }, readUrl: "http://read.test/history/" });
     const local = await h.token(KEYS.local, "local-prefixed");
     await h.turns(local, "s-prefixed");
     expect((await h.call("GET", "/sessions/v1/sessions/s-prefixed/events?limit=5", local)).status).toBe(200);
     const sent = h.calls.at(-1)!;
     expect(sent.path).toBe("/history/v1/sessions/s-prefixed/events?limit=5");
-    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, key]]), {
+    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, ASSERTION_PUBLIC_KEY]]), {
       method: "GET", path: sent.path, credential: `Bearer ${SERVICE}`, audience: "session-read-api", access: "read", sessionIds: ["s-prefixed"],
     }, at).path).toBe(sent.path);
   });

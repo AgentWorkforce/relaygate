@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, randomUUID, sign, verify, type KeyObject } from "node:crypto";
 import type { Principal } from "./mode.js";
 
 export const UPSTREAM_ASSERTION_HEADER = "x-relaygate-assertion";
@@ -8,7 +8,7 @@ export type AssertionAccess = "read" | "write" | "filter" | "aggregate" | "passt
 export type AssertionAudience = "session-read-api" | "ingest-edge";
 
 export interface UpstreamAssertionConfig {
-  /** HMAC-SHA256 key shared only with the Sessions read and ingest services. */
+  /** Base64 PKCS#8 DER Ed25519 private key. Only relaygate holds it; upstreams receive the public key. */
   key: string;
   /** Rotation identifier; verifiers select the current/previous key by this value. */
   kid: string;
@@ -19,6 +19,7 @@ export interface UpstreamAssertionConfig {
 
 export interface UpstreamAssertionClaims {
   v: typeof UPSTREAM_ASSERTION_VERSION;
+  alg: "Ed25519";
   iss: "relaygate";
   aud: AssertionAudience;
   kid: string;
@@ -51,6 +52,35 @@ export interface AssertionRequest {
 
 const sha256 = (value: string | Uint8Array): string => createHash("sha256").update(value).digest("hex");
 const input = (payload: string): string => `relaygate-upstream-v1\n${payload}`;
+const privateKeys = new Map<string, KeyObject>();
+const publicKeys = new Map<string, KeyObject>();
+const canonicalBase64 = (encoded: string): Buffer => {
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) throw new Error("upstream assertion key is not canonical base64");
+  const bytes = Buffer.from(encoded, "base64");
+  if (bytes.toString("base64") !== encoded) throw new Error("upstream assertion key is not canonical base64");
+  return bytes;
+};
+const privateKey = (encoded: string): KeyObject => {
+  const cached = privateKeys.get(encoded);
+  if (cached) return cached;
+  const key = createPrivateKey({ key: canonicalBase64(encoded), format: "der", type: "pkcs8" });
+  if (key.asymmetricKeyType !== "ed25519") throw new Error("upstream assertion private key must be Ed25519 PKCS#8 DER");
+  privateKeys.set(encoded, key);
+  return key;
+};
+const publicKey = (encoded: string): KeyObject => {
+  const cached = publicKeys.get(encoded);
+  if (cached) return cached;
+  const key = createPublicKey({ key: canonicalBase64(encoded), format: "der", type: "spki" });
+  if (key.asymmetricKeyType !== "ed25519") throw new Error("upstream assertion public key must be Ed25519 SPKI DER");
+  publicKeys.set(encoded, key);
+  return key;
+};
+
+/** Validates the signer key at startup instead of waiting for the first proxied request. */
+export function validateUpstreamAssertionKey(encoded: string): void {
+  privateKey(encoded);
+}
 const sessionScope = (ids: string[] | undefined) => {
   const sorted = [...new Set(ids ?? [])].sort();
   const canonical = JSON.stringify(sorted);
@@ -63,7 +93,7 @@ const sessionScope = (ids: string[] | undefined) => {
 };
 
 export function signUpstreamAssertion(config: UpstreamAssertionConfig, request: AssertionRequest): string {
-  if (config.key.length < 32) throw new Error("upstream assertion key must be at least 32 characters");
+  const signingKey = privateKey(config.key);
   if (!/^[A-Za-z0-9._-]{1,64}$/.test(config.kid)) throw new Error("upstream assertion kid is invalid");
   const ttl = config.ttlSeconds ?? 30;
   if (!Number.isInteger(ttl) || ttl < 5 || ttl > 60) throw new Error("upstream assertion ttl must be 5..60 seconds");
@@ -72,6 +102,7 @@ export function signUpstreamAssertion(config: UpstreamAssertionConfig, request: 
   const sessions = sessionScope(request.sessionIds);
   const claims: UpstreamAssertionClaims = {
     v: UPSTREAM_ASSERTION_VERSION,
+    alg: "Ed25519",
     iss: "relaygate",
     aud: request.audience,
     kid: config.kid,
@@ -93,18 +124,18 @@ export function signUpstreamAssertion(config: UpstreamAssertionConfig, request: 
     session_ids_sha256: sessions.digest,
   };
   const payload = Buffer.from(JSON.stringify(claims), "utf8").toString("base64url");
-  const mac = createHmac("sha256", config.key).update(input(payload)).digest("base64url");
-  return `v1.${payload}.${mac}`;
+  const signature = sign(null, Buffer.from(input(payload), "utf8"), signingKey).toString("base64url");
+  return `v1.${payload}.${signature}`;
 }
 
-/** Test/upstream-contract helper: verify the MAC and return claims. Request binding is checked by the verifier. */
+/** Test/upstream-contract helper: verify the Ed25519 signature and return request-bound claims. */
 export function verifyUpstreamAssertion(
   token: string,
   keys: ReadonlyMap<string, string>,
   request: Pick<AssertionRequest, "method" | "path" | "body" | "credential" | "audience"> & { access?: AssertionAccess; sessionIds?: string[] },
   now = Date.now(),
 ): UpstreamAssertionClaims {
-  const match = /^v1\.([A-Za-z0-9_-]{1,16384})\.([A-Za-z0-9_-]{43})$/.exec(token);
+  const match = /^v1\.([A-Za-z0-9_-]{1,16384})\.([A-Za-z0-9_-]{86})$/.exec(token);
   if (!match) throw new Error("invalid upstream assertion");
   let claims: UpstreamAssertionClaims;
   try {
@@ -112,16 +143,22 @@ export function verifyUpstreamAssertion(
   } catch {
     throw new Error("invalid upstream assertion");
   }
-  const key = claims?.v === 1 && typeof claims.kid === "string" ? keys.get(claims.kid) : undefined;
-  if (!key) throw new Error("invalid upstream assertion");
-  const expected = createHmac("sha256", key).update(input(match[1]!)).digest();
+  const encodedKey = claims?.v === 1 && typeof claims.kid === "string" ? keys.get(claims.kid) : undefined;
+  if (!encodedKey) throw new Error("invalid upstream assertion");
+  let key: KeyObject;
+  try {
+    key = publicKey(encodedKey);
+  } catch {
+    throw new Error("invalid upstream assertion");
+  }
   const given = Buffer.from(match[2]!, "base64url");
-  if (given.toString("base64url") !== match[2] || expected.length !== given.length || !timingSafeEqual(expected, given)) {
+  if (given.toString("base64url") !== match[2] || !verify(null, Buffer.from(input(match[1]!), "utf8"), key, given)) {
     throw new Error("invalid upstream assertion");
   }
   const at = Math.floor(now / 1000);
   const validShape =
     claims.iss === "relaygate" &&
+    claims.alg === "Ed25519" &&
     (claims.aud === "session-read-api" || claims.aud === "ingest-edge") &&
     Number.isInteger(claims.iat) &&
     Number.isInteger(claims.exp) &&
