@@ -251,6 +251,26 @@ describe("relay-control principals: dashboard read tokens", () => {
     expect((await h.call("POST", "/sessions/v1/coordination/advisories/abc123/ack", token, "x".repeat(9_000))).status).toBe(413);
     expect(h.calls).toHaveLength(afterAck);
 
+    let pulls = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls++;
+        controller.enqueue(new Uint8Array(1024));
+        if (pulls === 100) controller.close();
+      },
+    });
+    const streamed = await h.app.fetch(
+      new Request("http://relaygate.test/sessions/v1/coordination/advisories/abc123/ack", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/octet-stream" },
+        body: stream,
+        duplex: "half",
+      } as RequestInit),
+    );
+    expect(streamed.status).toBe(413);
+    expect(pulls).toBeLessThan(20);
+    expect(h.calls).toHaveLength(afterAck);
+
     const before = h.calls.length;
     for (const path of ["/sessions/v1/relayfacts/a/b", "/sessions/v1/coordination/unknown", "/sessions/v1/coordination/advisories/abc123/delete"]) {
       expect((await h.call("GET", path, token)).status, path).toBe(404);

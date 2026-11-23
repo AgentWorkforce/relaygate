@@ -865,7 +865,8 @@ The allowlist is deliberately exact:
 They use the caller's forwarded Sessions credential, the same Control
 principal mapping and `rth:read` check as session reads, and a read-API upstream
 assertion when assertions are enabled. The acknowledgement is a read-plane
-state change and therefore does not require `rth:sync`. Feature flags,
+state change and therefore does not require `rth:sync`; relaygate applies an
+8 KiB streaming body cap before buffering it. Feature flags,
 workspace scoping, response status and request-body validation remain owned by
 the read API. Every other path under either prefix gets
 `404 relaygate_route_not_proxied` without reaching upstream.

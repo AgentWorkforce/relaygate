@@ -347,7 +347,13 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   const upload = async (c: Ctx, path: string, body: unknown, sessionIds: string[]) =>
     pass(await upstream(c, cfg.uploadUrl, "POST", path, JSON.stringify(body), "application/json", { audience: "ingest-edge", access: "write", sessionIds }));
 
-  // No request body is buffered past the cap (Sessions' own limit is 2 MiB).
+  // Register the tighter acknowledgement cap first: middleware order matters, otherwise the general upload cap
+  // would buffer up to 4 MiB before this route could apply its 8 KiB limit.
+  app.use(
+    "/sessions/v1/coordination/advisories/:advisoryId/ack",
+    bodyLimit({ maxSize: MAX_COORDINATION_ACK, onError: (c) => deny(c, 413, "relaygate_bad_request", { detail: "acknowledgement body too large" }) }),
+  );
+  // No other request body is buffered past the cap (Sessions' own limit is 2 MiB).
   app.use(
     "/sessions/*",
     bodyLimit({ maxSize: MAX_UPLOAD, onError: (c) => deny(c, 413, "relaygate_bad_request", { detail: "request body too large" }) }),
@@ -683,7 +689,6 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   readFeature("/v1/coordination/advisories");
   app.post("/sessions/v1/coordination/advisories/:advisoryId/ack", async (c) => {
     const body = Buffer.from(await c.req.arrayBuffer());
-    if (body.byteLength > MAX_COORDINATION_ACK) return deny(c, 413, "relaygate_bad_request", { detail: "acknowledgement body too large" });
     return pass(await upstream(c, cfg.readUrl, "POST", upstreamPath(c), body, undefined, { audience: "session-read-api", access: "passthrough" }));
   });
 
