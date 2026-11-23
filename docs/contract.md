@@ -821,19 +821,25 @@ exactly as sent. Its JSON claims are:
   "method": "GET", "path": "/v1/events?session=s-1",
   "body_sha256": "<hex>", "credential_sha256": "<hex>",
   "principal": {"agent_id": "ag_...", "gid": 11, "groups": [22]},
-  "access": "read", "session_ids": ["s-1"]
+  "access": "read", "session_ids": ["s-1"], "session_count": 1,
+  "session_ids_sha256": "<hex>"
 }
 ```
 
 The path is the exact upstream pathname and query; the body hash covers the
 exact forwarded bytes, including compressed delivery batches; and the
 credential hash binds the proof to the forwarded `Authorization` value
-without exposing that credential. `session_ids` is sorted and de-duplicated.
+without exposing that credential. Session scope is sorted and de-duplicated;
+`session_count` and `session_ids_sha256` always bind its canonical JSON. At
+most 16 ids and 2 KiB are also carried inline in `session_ids`; larger batches
+use an empty inline array, keeping the assertion header bounded.
 `aud` is `session-read-api` or `ingest-edge`, preventing cross-service replay
 even when both services share the rotation key.
 Single-session reads and writes name their sessions. Lists and transcript
 search carry `access: "filter"` and an empty list because relaygate filters the
-upstream page; permitted whole-workspace aggregates carry `aggregate`.
+upstream page; permitted whole-workspace aggregates carry `aggregate`. The
+administrative adoption scan signs every direct session-list page as a
+`filter` read too, leaving no unsigned read-API path when verification is on.
 
 The default lifetime is 30 seconds and the configurable range is 5 through
 60. A verifier checks the MAC in constant time, selects the key by `kid`,
@@ -942,6 +948,12 @@ session lists. Runtime gid/label values also drive the trustworthy
 `relaygate` badge. Writes are covered too; for a read-only restriction use
 `mode: "000"` and `r` ACL entries as above.
 
+A runtime `gid` changes the effective group but never erases the immutable
+first-uploader group: ceilings are checked against both. Write classification
+also snapshots the runtime version. If access changes while classification is
+in flight, relaygate re-decides the whole request and never forwards a write
+under the stale decision.
+
 `GET .../access` returns the effective policy and its version. Every successful
 change appends an immutable before/after row, including actor, timestamp,
 version and the optional content-free reason; managers read it at
@@ -970,7 +982,9 @@ On Sessions routes, a request with one of those in `Authorization` and no
   calls unchanged and records the hash of each minted token with the identity
   the mint named (and its role, when the mint carries one). The mint routes are
   never served on a public Sessions host, and are checked against
-  `SESSIONS_INTERNAL_SECRET` when it is set.
+  `SESSIONS_INTERNAL_SECRET` when it is set. Successful refresh and revoke
+  calls are mirrored into that local hash cache, so a rotated or revoked read
+  credential cannot continue using relaygate-local management routes.
 
 The policy maps them to groups; the first rule whose every given field matches
 wins, and a user no rule matches is refused:

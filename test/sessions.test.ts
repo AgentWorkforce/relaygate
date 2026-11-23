@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import { routeSessionsHosts } from "../src/sessions.js";
-import { ChainClassifier, RuleClassifier } from "../src/classifier.js";
+import { ChainClassifier, RuleClassifier, type Classifier } from "../src/classifier.js";
 import { parsePolicy } from "../src/policy.js";
 import { sha256, Store } from "../src/store.js";
 import { UPSTREAM_ASSERTION_HEADER, verifyUpstreamAssertion, type UpstreamAssertionConfig } from "../src/upstream-assertion.js";
@@ -38,7 +38,7 @@ function policy(shared: string[] = [], mistaken: string[] = [], writable: string
   });
 }
 
-function harness(pol = policy(), opts: { token?: string; assertion?: UpstreamAssertionConfig } = { token: SERVICE }) {
+function harness(pol = policy(), opts: { token?: string; assertion?: UpstreamAssertionConfig; classifier?: Classifier; uploadUrl?: string; readUrl?: string } = { token: SERVICE }) {
   const calls: Array<{ method: string; host: string; path: string; auth: string; body: unknown; raw?: Buffer; headers: Headers }> = [];
   const upstream = new Hono();
   upstream.use("*", async (c, next) => {
@@ -58,6 +58,7 @@ function harness(pol = policy(), opts: { token?: string; assertion?: UpstreamAss
   upstream.post("/v1/ingest", (c) => c.json({ received: 1 }));
   upstream.get("/v1/sessions", (c) => c.json({ sessions: [{ sessionId: "s-local" }, { sessionId: "s-pit" }, { sessionId: "s-elsewhere" }], nextCursor: "c2" }));
   upstream.get("/v1/sessions/:id/events", (c) => c.json({ events: [{ sessionId: c.req.param("id") }] }));
+  upstream.get("/history/v1/sessions/:id/events", (c) => c.json({ events: [{ sessionId: c.req.param("id") }] }));
   upstream.get("/v1/sessions/:id/metadata", (c) => c.text(`{"sessionId":"${c.req.param("id")}",  "title":"t"}`, 200, { "content-type": "application/json" }));
   upstream.get("/v1/sessions/:id/catalog", (c) => c.json({ catalog: { title: "t" }, parents: [], children: [], relaygate: { gid: 33, label: "forged" } }));
   upstream.get("/v1/sessions/:id/summary", (c) => c.json({ sessionId: c.req.param("id"), summary: "work" }));
@@ -68,8 +69,8 @@ function harness(pol = policy(), opts: { token?: string; assertion?: UpstreamAss
   const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => upstream.fetch(new Request(input, init))) as typeof fetch;
 
   const store = new Store(":memory:");
-  const classifier = new ChainClassifier([new RuleClassifier(pol.classifier.rules)]);
-  const app = createApp({ store, policy: () => pol, classifier: () => classifier, sessions: { uploadUrl: "http://ingest.test", readUrl: "http://read.test", token: opts.token, assertion: opts.assertion, fetch: fetchFn } });
+  const classifier = opts.classifier ?? new ChainClassifier([new RuleClassifier(pol.classifier.rules)]);
+  const app = createApp({ store, policy: () => pol, classifier: () => classifier, sessions: { uploadUrl: opts.uploadUrl ?? "http://ingest.test", readUrl: opts.readUrl ?? "http://read.test", token: opts.token, assertion: opts.assertion, fetch: fetchFn } });
   const call = async (method: string, path: string, token: string, body?: unknown, headers: Record<string, string> = {}) => {
     const res = await app.request(path, {
       method,
@@ -91,8 +92,8 @@ function harness(pol = policy(), opts: { token?: string; assertion?: UpstreamAss
   return { store, call, token, turns, calls, app };
 }
 
-async function world(pol = policy()) {
-  const h = harness(pol);
+async function world(pol = policy(), opts?: { token?: string; assertion?: UpstreamAssertionConfig; classifier?: Classifier; uploadUrl?: string; readUrl?: string }) {
+  const h = opts ? harness(pol, { token: SERVICE, ...opts }) : harness(pol);
   const local = await h.token(KEYS.local, "local-a");
   const pit = await h.token(KEYS.pit, "pit-a");
   const guest = await h.token(KEYS.guest, "guest-a");
@@ -266,8 +267,11 @@ describe("Sessions proxy: runtime session access", () => {
     const conflict = await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, { label: "legal", expectedVersion: 0 });
     expect(conflict).toMatchObject({ status: 409, body: { currentVersion: 1 } });
     expect((await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, { label: "legal", expectedVersion: 1 })).body.access.version).toBe(2);
+    expect((await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, { label: null, expectedVersion: 2 })).body.access.label).toBeNull();
+    const afterModeOnly = await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, { mode: "600", expectedVersion: 3 });
+    expect(afterModeOnly.body.access).toMatchObject({ version: 4, label: null });
     const history = await w.call("GET", "/sessions/v1/sessions/s-local/access/history", w.pit);
-    expect(history.body.rows).toHaveLength(2);
+    expect(history.body.rows).toHaveLength(4);
     expect(history.body.rows[0]).toMatchObject({ version: 1, before: null, after: { mode: "000", version: 1 } });
     expect(history.body.rows[1]).toMatchObject({ version: 2, before: { version: 1 }, after: { label: "legal", version: 2 } });
   });
@@ -277,6 +281,34 @@ describe("Sessions proxy: runtime session access", () => {
     const w = await world(managed());
     expect((await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, { acl: [{ gid: 999, perm: "r" }] })).status).toBe(400);
     expect((await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, { label: "<secret>" })).status).toBe(400);
+  });
+
+  it("keeps the immutable first-uploader group under its original ceiling after a relabel", async () => {
+    const w = await world(policy([], [], [], { sessionAccessAdmins: { gids: [22] } }));
+    expect((await w.call("PATCH", "/sessions/v1/sessions/s-pit/access", w.pit, { gid: 11, mode: "000", acl: [{ gid: 44, perm: "r" }], expectedVersion: 0 })).status).toBe(200);
+    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/events", w.guest)).status).toBe(403);
+  });
+
+  it("re-decides a write if runtime access changes while its classifier is running", async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const waitForRelease = new Promise<void>((resolve) => (release = resolve));
+    const didStart = new Promise<void>((resolve) => (started = resolve));
+    const classifier: Classifier = {
+      async classify() {
+        started();
+        await waitForRelease;
+        return { decision: "allow", reason: "test:allow" };
+      },
+    };
+    const w = await world(policy([], [], ["s-local"], { sessionAccessAdmins: { gids: [22] } }), { classifier });
+    const before = w.calls.length;
+    const pending = w.turns(w.guest, "s-local");
+    await didStart;
+    expect((await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, { mode: "000", acl: [], expectedVersion: 0 })).status).toBe(200);
+    release();
+    expect((await pending).status).toBe(403);
+    expect(w.calls).toHaveLength(before);
   });
 });
 
@@ -328,6 +360,18 @@ describe("Sessions proxy: signed upstream assertions", () => {
     expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, key]]), {
       method: "GET", path: "/v1/relayfacts?limit=5", credential: `Bearer ${SERVICE}`, audience: "session-read-api", access: "passthrough", sessionIds: [],
     }, at).access).toBe("passthrough");
+  });
+
+  it("signs the resolved upstream path when the configured origin has a path prefix", async () => {
+    const h = harness(policy(), { token: SERVICE, assertion: { key, kid, now: () => at }, readUrl: "http://read.test/history/" });
+    const local = await h.token(KEYS.local, "local-prefixed");
+    await h.turns(local, "s-prefixed");
+    expect((await h.call("GET", "/sessions/v1/sessions/s-prefixed/events?limit=5", local)).status).toBe(200);
+    const sent = h.calls.at(-1)!;
+    expect(sent.path).toBe("/history/v1/sessions/s-prefixed/events?limit=5");
+    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, key]]), {
+      method: "GET", path: sent.path, credential: `Bearer ${SERVICE}`, audience: "session-read-api", access: "read", sessionIds: ["s-prefixed"],
+    }, at).path).toBe(sent.path);
   });
 });
 

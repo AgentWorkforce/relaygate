@@ -5,6 +5,7 @@ import { RuleClassifier } from "../src/classifier.js";
 import { ControlAuth } from "../src/control.js";
 import { parsePolicy } from "../src/policy.js";
 import { sha256, Store } from "../src/store.js";
+import { UPSTREAM_ASSERTION_HEADER, verifyUpstreamAssertion, type UpstreamAssertionConfig } from "../src/upstream-assertion.js";
 
 const ADMIN = "admin-token-0123456789abcdef";
 const INTERNAL = "read-api-internal-secret";
@@ -13,13 +14,13 @@ const DEVICES: Record<string, Record<string, unknown>> = {
   sh_at_inside: { active: true, principal_type: "desktop-user", sub: "u-inside", org: "org-1", workspace: "ws-1", role: "member", scopes: ["rth:sync", "rth:read"] },
 };
 
-function harness() {
+function harness(assertion?: UpstreamAssertionConfig) {
   const control = new Hono();
   control.post("/introspect", async (c) => c.json(DEVICES[(await c.req.json()).token] ?? { active: false }));
-  const calls: Array<{ method: string; path: string; auth: string }> = [];
+  const calls: Array<{ method: string; path: string; auth: string; headers: Headers }> = [];
   const read = new Hono();
   read.use("*", async (c, next) => {
-    calls.push({ method: c.req.method, path: c.req.path + new URL(c.req.url).search, auth: c.req.header("authorization") ?? "" });
+    calls.push({ method: c.req.method, path: c.req.path + new URL(c.req.url).search, auth: c.req.header("authorization") ?? "", headers: c.req.raw.headers });
     await next();
   });
   read.get("/v1/sessions", (c) => {
@@ -46,7 +47,7 @@ function harness() {
   read.get("/v1/delivery/records", (c) => c.json({ records: [] }));
   const ingest = new Hono();
   ingest.use("*", async (c, next) => {
-    calls.push({ method: c.req.method, path: c.req.path, auth: c.req.header("authorization") ?? "" });
+    calls.push({ method: c.req.method, path: c.req.path, auth: c.req.header("authorization") ?? "", headers: c.req.raw.headers });
     await next();
   });
   ingest.get("/v1/delivery/admission", (c) => c.json({ state: "open" }));
@@ -85,7 +86,7 @@ function harness() {
     classifier: () => new RuleClassifier([]),
     adminToken: ADMIN,
     control: new ControlAuth({ introspectUrl: "http://control.test/introspect", introspectSecret: "s", audience: "https://history.test", fetch: fetchFn }, store),
-    sessions: { uploadUrl: "http://ingest.test", readUrl: "http://read.test", fetch: fetchFn },
+    sessions: { uploadUrl: "http://ingest.test", readUrl: "http://read.test", assertion, fetch: fetchFn },
   });
   const call = async (method: string, path: string, token?: string, body?: unknown) => {
     const res = await app.request(path, {
@@ -153,6 +154,27 @@ describe("POST /admin/v1/sessions/adopt", () => {
     expect((await h.call("POST", "/admin/v1/sessions/adopt", "rg_nope", adoptBody)).status).toBe(401);
     const bad = await h.call("POST", "/admin/v1/sessions/adopt", ADMIN, { ...adoptBody, readToken: "rth_st_read_wrong" });
     expect(bad.body).toMatchObject({ error: "session list answered 401", adopted: [] });
+  });
+
+  it("signs each direct read-API page used for adoption", async () => {
+    const key = "adoption-assertion-test-key-0000000000000000";
+    const kid = "adoption-current";
+    const at = 1_800_000_000_000;
+    const h = harness({ key, kid, now: () => at });
+    expect((await h.call("POST", "/admin/v1/sessions/adopt", ADMIN, adoptBody)).status).toBe(200);
+    const pages = h.calls.filter((x) => x.path.startsWith("/v1/sessions?"));
+    expect(pages).toHaveLength(2);
+    for (const page of pages) {
+      const claims = verifyUpstreamAssertion(page.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, key]]), {
+        method: "GET",
+        path: page.path,
+        credential: "Bearer rth_st_read_svc",
+        audience: "session-read-api",
+        access: "filter",
+        sessionIds: [],
+      }, at);
+      expect(claims.principal.agent_id).toBe("relaygate:session-adopt");
+    }
   });
 });
 
