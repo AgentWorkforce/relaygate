@@ -6,6 +6,7 @@ import { ControlAuth } from "../src/control.js";
 import { parsePolicy } from "../src/policy.js";
 import { sha256, Store } from "../src/store.js";
 import { UPSTREAM_ASSERTION_HEADER, verifyUpstreamAssertion, type UpstreamAssertionConfig } from "../src/upstream-assertion.js";
+import { ASSERTION_PRIVATE_KEY, ASSERTION_PUBLIC_KEY } from "./assertion-fixture.js";
 
 const ADMIN = "admin-token-0123456789abcdef";
 const INTERNAL = "read-api-internal-secret";
@@ -157,15 +158,14 @@ describe("POST /admin/v1/sessions/adopt", () => {
   });
 
   it("signs each direct read-API page used for adoption", async () => {
-    const key = "adoption-assertion-test-key-0000000000000000";
     const kid = "adoption-current";
     const at = 1_800_000_000_000;
-    const h = harness({ key, kid, now: () => at });
+    const h = harness({ key: ASSERTION_PRIVATE_KEY, kid, now: () => at });
     expect((await h.call("POST", "/admin/v1/sessions/adopt", ADMIN, adoptBody)).status).toBe(200);
     const pages = h.calls.filter((x) => x.path.startsWith("/v1/sessions?"));
     expect(pages).toHaveLength(2);
     for (const page of pages) {
-      const claims = verifyUpstreamAssertion(page.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, key]]), {
+      const claims = verifyUpstreamAssertion(page.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, ASSERTION_PUBLIC_KEY]]), {
         method: "GET",
         path: page.path,
         credential: "Bearer rth_st_read_svc",

@@ -8,6 +8,7 @@ import { RelaycastUpstream } from "./relaycast.js";
 import { routeSessionsHosts, sessionsAtRoot } from "./sessions.js";
 import { ControlAuth } from "./control.js";
 import { SecretBox, Store } from "./store.js";
+import { validateUpstreamAssertionKey } from "./upstream-assertion.js";
 
 const policyPath = process.env.RELAYGATE_POLICY;
 const policyUrl = process.env.RELAYCONTROL_POLICY_URL;
@@ -105,8 +106,16 @@ if (uploadUrl || readUrl) {
   const assertionKey = process.env.RELAYGATE_UPSTREAM_ASSERTION_KEY;
   const assertionKid = process.env.RELAYGATE_UPSTREAM_ASSERTION_KID;
   const assertionTtl = Number(process.env.RELAYGATE_UPSTREAM_ASSERTION_TTL_SECONDS ?? 30);
-  if (!assertionKey !== !assertionKid || (assertionKey && assertionKey.length < 32) || (assertionKid && !/^[A-Za-z0-9._-]{1,64}$/.test(assertionKid)) || !Number.isInteger(assertionTtl) || assertionTtl < 5 || assertionTtl > 60) {
-    console.error("upstream assertions need RELAYGATE_UPSTREAM_ASSERTION_KEY (at least 32 characters), RELAYGATE_UPSTREAM_ASSERTION_KID, and TTL 5..60 seconds");
+  let assertionError = !assertionKey !== !assertionKid || (assertionKid !== undefined && !/^[A-Za-z0-9._-]{1,64}$/.test(assertionKid)) || !Number.isInteger(assertionTtl) || assertionTtl < 5 || assertionTtl > 60;
+  if (assertionKey) {
+    try {
+      validateUpstreamAssertionKey(assertionKey);
+    } catch {
+      assertionError = true;
+    }
+  }
+  if (assertionError) {
+    console.error("upstream assertions need RELAYGATE_UPSTREAM_ASSERTION_KEY (base64 PKCS#8 DER Ed25519 private key), RELAYGATE_UPSTREAM_ASSERTION_KID, and TTL 5..60 seconds");
     process.exit(1);
   }
   sessions = {
