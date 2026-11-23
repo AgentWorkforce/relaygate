@@ -100,7 +100,7 @@ export function verifyUpstreamAssertion(
   if (!key) throw new Error("invalid upstream assertion");
   const expected = createHmac("sha256", key).update(input(match[1]!)).digest();
   const given = Buffer.from(match[2]!, "base64url");
-  if (expected.length !== given.length || !timingSafeEqual(expected, given)) {
+  if (given.toString("base64url") !== match[2] || expected.length !== given.length || !timingSafeEqual(expected, given)) {
     throw new Error("invalid upstream assertion");
   }
   const at = Math.floor(now / 1000);
