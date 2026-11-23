@@ -144,7 +144,7 @@ export class Gate {
     for (;;) {
       const res = await this.call("GET", `/sessions/v1/sessions/${sessionId}/events`);
       const found = res.status >= 200 && res.status < 300 && JSON.stringify(res.body ?? "").includes(needle);
-      if (found || res.status === 403 || res.status === 401 || Date.now() - start > ms) return { res, found };
+      if (found || res.status === 404 || res.status === 403 || res.status === 401 || Date.now() - start > ms) return { res, found };
       await sleep(3000);
     }
   }

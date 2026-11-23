@@ -62,7 +62,7 @@ export function deny(c: Context, status: 400 | 401 | 403 | 404 | 409 | 503, erro
 
 export function principalFor(agent: Agent, policy: Policy): Principal {
   const key = policy.enrollmentKeys.find((k) => k.id === agent.keyId);
-  return { agentId: agent.id, gid: agent.gid, groups: key?.groups ?? agent.groups ?? [] };
+  return { agentId: agent.id, userId: controlUserId(agent), gid: agent.gid, groups: key?.groups ?? agent.groups ?? [] };
 }
 
 /** A guest agent, by the key it enrolled with now or the flag recorded when it registered. */
@@ -592,7 +592,7 @@ export function createApp(deps: Deps) {
     // Uploads need a device token that may sync; a read token (or a device token without rth:sync) only reads.
     // These are read-plane actions, not uploads: a librarian may manage access with an agent-behalf/browser read
     // credential, and the coordination acknowledgement uses the read API's ordinary rth:read authorization.
-    const managesSessionAccess = /^\/sessions\/v1\/sessions\/[^/]+\/access(?:\/history)?$/.test(c.req.path);
+    const managesSessionAccess = /^\/sessions\/v1\/sessions\/[^/]+\/access(?:\/(?:history|reset))?$/.test(c.req.path);
     const acknowledgesAdvisory = /^\/sessions\/v1\/coordination\/advisories\/[A-Za-z0-9_-]+\/ack$/.test(c.req.path);
     const writes = !checkOnly && !managesSessionAccess && !acknowledgesAdvisory && c.req.method !== "GET" && c.req.method !== "HEAD";
     if (writes && (identity.kind !== "device" || !identity.scopes.includes("rth:sync"))) {

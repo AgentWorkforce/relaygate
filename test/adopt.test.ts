@@ -137,7 +137,7 @@ describe("POST /admin/v1/sessions/adopt", () => {
     expect(again.body).toMatchObject({ adopted: [], alreadyOwned: 2 });
     // The adopted session now follows the policy: its uploader reads it, an outside member can't.
     expect((await h.call("GET", "/sessions/v1/sessions/old-4/events", await h.mint("u-inside"))).status).toBe(200);
-    expect((await h.call("GET", "/sessions/v1/sessions/old-4/events", await h.mint("u-member"))).status).toBe(403);
+    expect((await h.call("GET", "/sessions/v1/sessions/old-4/events", await h.mint("u-member"))).status).toBe(404);
   });
 
   it("reports truncation at maxPages and continues from the returned cursor", async () => {

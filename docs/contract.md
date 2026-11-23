@@ -807,14 +807,15 @@ strong as the network rule that Sessions accepts traffic from relaygate alone
 | `POST /sessions/v1/auth/token/revoke`, `GET /sessions/healthz` | no principal needed (revoking is always safe) |
 | `POST /sessions/v1/ingest` | `w` on every session the batch names; all or nothing. Each record gets a `relaygate:agent:<name>` tag (client `relaygate:` tags are dropped) and, where it names one, `sessionOwner` set to the agent |
 | `GET /sessions/v1/sessions` | filtered to sessions the caller may read; the cursor passes through; labeled sessions carry `relaygate` (see "Group labels") |
-| `GET /sessions/v1/sessions/:id/{events,turns,metadata,thread,catalog,timing,analysis,brief,summary}` | `r` on the session; `metadata` and `catalog` of a labeled session carry `relaygate` |
-| `GET /sessions/v1/events?session=<id>` | one `session`, `r` on it |
+| `GET /sessions/v1/sessions/:id/{events,turns,metadata,thread,catalog,timing,analysis,brief,summary}` | `r` on the session; denied and unknown sessions both answer `404`; `metadata` and `catalog` of a labeled session carry `relaygate` |
+| `GET /sessions/v1/events?session=<id>` | one `session`, `r` on it; denied and unknown sessions both answer `404` |
 | `GET /sessions/v1/events?q=<text>` | transcript search, filtered to events of sessions the caller may read |
 | `GET/PATCH /sessions/v1/sessions/:id/access` | runtime access policy, restricted to `sessionAccessAdmins` groups |
+| `POST /sessions/v1/sessions/:id/access/reset` | versioned, audited reset to live policy defaults/overrides; restricted to `sessionAccessAdmins` groups |
 | `GET /sessions/v1/sessions/:id/access/history` | immutable runtime-policy history, restricted to `sessionAccessAdmins` groups |
-| `GET /sessions/v1/relayfacts[/:topic]` | passed to the read API after normal relaygate/Control authentication |
-| `GET /sessions/v1/coordination/{overlaps,advisories}` | passed to the read API after normal relaygate/Control authentication |
-| `POST /sessions/v1/coordination/advisories/:id/ack` | read-plane acknowledgement passed to the read API; requires `rth:read`, not upload scope |
+| `GET /sessions/v1/relayfacts[/:topic]` | passed to the read API after normal relaygate/Control authentication only when every owned session is readable |
+| `GET /sessions/v1/coordination/{overlaps,advisories}` | passed to the read API only when every owned session is readable |
+| `POST /sessions/v1/coordination/advisories/:id/ack` | read-plane acknowledgement; requires `rth:read` and every owned session readable, not upload scope |
 
 A write is decided before anything is recorded; the classifier sees every
 forwarded field, not only `content`. New sessions are claimed in one
@@ -956,9 +957,10 @@ authorization is itself operator policy:
 Any principal whose primary or supplementary group is listed may manage a
 session's runtime access. This is intended for a Control-mapped librarian
 principal; a read token minted for a browser or agent-behalf MCP call may use
-the endpoint, and the group check still applies. Named people are resolved by
-Control into durable per-person groups before the call, so relaygate stores no
-email, display name or other member identity.
+the endpoint, and the group check still applies. Per-person grants store only
+Control's durable opaque `userId`, never email or display name. The same grant
+applies to that person and to device-, launch- or hosted-enrolled agents acting
+for them.
 
 ```http
 PATCH /sessions/v1/sessions/<id>/access
@@ -968,17 +970,32 @@ Content-Type: application/json
 {
   "mode": "000",
   "acl": [{"gid": 101, "perm": "r"}, {"gid": 102, "perm": "r"}],
+  "users": [{"userId": "<opaque-control-user-id>", "perm": "r"}],
   "label": "restricted",
   "expectedVersion": 0,
   "reason": "sensitive"
 }
 ```
 
-`gid`, `mode`, `acl` and `label` are patch fields. The resulting complete
+`gid`, `mode`, `acl`, `users` and `label` are patch fields. The resulting complete
 policy is stored in relaygate's database with a monotonically increasing
 version. `expectedVersion` is optional; when present a stale edit gets `409`
 with `currentVersion`. `label: null` removes the badge. Labels and gids use the
 same validation as policy labels and ACLs.
+
+To remove the runtime override without losing concurrency or audit history:
+
+```http
+POST /sessions/v1/sessions/<id>/access/reset
+Authorization: Bearer <Control read token or rg_ token>
+Content-Type: application/json
+
+{"expectedVersion": 3, "reason": "classification cleared"}
+```
+
+The reset is a new monotonic version and an immutable history entry. It leaves
+a versioned reset marker so stale edits still conflict, while authorization
+immediately follows the current policy defaults and `sessionOverrides` again.
 
 Once present, the runtime policy replaces the session default and static
 `sessionOverrides` entry. `resolveSession` therefore makes one decision for
@@ -986,6 +1003,9 @@ single-session views (including `summary`), events, transcript search and
 session lists. Runtime gid/label values also drive the trustworthy
 `relaygate` badge. Writes are covered too; for a read-only restriction use
 `mode: "000"` and `r` ACL entries as above.
+Cross-session views that cannot be safely filtered (aggregates, relayfacts and
+coordination) are refused unless the caller may read every relaygate-owned
+session; they cannot bypass a per-session group or person grant.
 
 A runtime `gid` changes the effective group but never erases the immutable
 first-uploader group: ceilings are checked against both. Write classification

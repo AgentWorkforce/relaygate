@@ -5,6 +5,8 @@ export type Perm = "r" | "w" | "rw";
 
 export interface Principal {
   agentId: string;
+  /** Relay-control person behind this principal, including an agent enrolled/hosted for that person. */
+  userId?: string;
   /** Primary group, set at registration. */
   gid: number;
   /** Supplementary groups, from the operator's policy. */
@@ -13,6 +15,11 @@ export interface Principal {
 
 export interface AclEntry {
   gid: number;
+  perm: Perm;
+}
+
+export interface UserAclEntry {
+  userId: string;
   perm: Perm;
 }
 
@@ -31,6 +38,8 @@ export interface Guarded {
   mode: string;
   /** Extra group entries that only add access (POSIX-ACL style). */
   acl?: readonly AclEntry[];
+  /** Per-person grants. Agents enrolled or hosted for the named Control user inherit the grant. */
+  users?: readonly UserAclEntry[];
   /** Additional immutable resource groups whose ceilings still apply after a runtime relabel. */
   ceilingGids?: readonly number[];
 }
@@ -61,8 +70,13 @@ export function matchingAcl(p: Principal, x: Guarded): AclEntry[] {
   return (x.acl ?? []).filter((e) => inGroup(p, e.gid));
 }
 
+export function matchingUsers(p: Principal, x: Guarded): UserAclEntry[] {
+  if (isOwner(p, x) || !p.userId) return [];
+  return (x.users ?? []).filter((e) => e.userId === p.userId);
+}
+
 export function modeAllows(p: Principal, x: Guarded, op: Op): boolean {
-  const bits = matchingAcl(p, x).reduce((acc, e) => acc | PERM_BITS[e.perm], digitFor(p, x));
+  const bits = [...matchingAcl(p, x), ...matchingUsers(p, x)].reduce((acc, e) => acc | PERM_BITS[e.perm], digitFor(p, x));
   return (bits & BIT[op]) !== 0;
 }
 
@@ -72,7 +86,7 @@ export function ceilingFor(p: Principal, gid: number, ceilings: readonly Ceiling
 }
 
 export interface CheckStep {
-  step: "owner" | "group" | "other" | "acl" | "ceiling";
+  step: "owner" | "group" | "other" | "acl" | "user_acl" | "ceiling";
   detail: string;
 }
 
@@ -102,7 +116,12 @@ export function check(p: Principal, x: Guarded, op: Op, ceilings: readonly Ceili
     bits |= PERM_BITS[e.perm];
     steps.push({ step: "acl", detail: `acl ${e.gid}:${e.perm} adds ${bitsText(PERM_BITS[e.perm])}` });
   }
-  const reason = `mode:${x.mode}${acl.map((e) => `+acl:${e.gid}:${e.perm}`).join("")}`;
+  const users = matchingUsers(p, x);
+  for (const e of users) {
+    bits |= PERM_BITS[e.perm];
+    steps.push({ step: "user_acl", detail: `user acl ${e.userId}:${e.perm} adds ${bitsText(PERM_BITS[e.perm])}` });
+  }
+  const reason = `mode:${x.mode}${acl.map((e) => `+acl:${e.gid}:${e.perm}`).join("")}${users.map((e) => `+user:${e.perm}`).join("")}`;
 
   for (const gid of [...new Set([x.gid, ...(x.ceilingGids ?? [])])]) {
     const ceiling = ceilingFor(p, gid, ceilings);

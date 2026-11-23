@@ -127,16 +127,27 @@ const SessionAccessPatch = z
     gid: z.number().int().nonnegative().optional(),
     mode: z.string().regex(/^[0246]{3}$/).optional(),
     acl: z.array(z.object({ gid: z.number().int().nonnegative(), perm: z.enum(["r", "w", "rw"]) }).strict()).max(64).optional(),
+    users: z
+      .array(z.object({ userId: z.string().min(1).max(256).regex(/^[^\u0000-\u001f\u007f]+$/u), perm: z.enum(["r", "w", "rw"]) }).strict())
+      .max(64)
+      .refine((rows) => new Set(rows.map((row) => row.userId)).size === rows.length, "userId grants must be unique")
+      .optional(),
     label: GroupLabelSchema.nullable().optional(),
     expectedVersion: z.number().int().nonnegative().optional(),
     reason: z.string().min(1).max(200).regex(/^[^\u0000-\u001f\u007f]+$/u).optional(),
   })
   .strict()
-  .refine((b) => b.gid !== undefined || b.mode !== undefined || b.acl !== undefined || b.label !== undefined, "one access field is required");
+  .refine((b) => b.gid !== undefined || b.mode !== undefined || b.acl !== undefined || b.users !== undefined || b.label !== undefined, "one access field is required");
+const SessionAccessReset = z
+  .object({
+    expectedVersion: z.number().int().nonnegative().optional(),
+    reason: z.string().min(1).max(200).regex(/^[^\u0000-\u001f\u007f]+$/u).optional(),
+  })
+  .strict();
 
 /** A session's effective owner, group, mode and ACL. */
 export function resolveSession(id: string, row: { owner: string; gid: number }, policy: Policy, runtime?: SessionAccessRow): ResolvedResource {
-  if (runtime) {
+  if (runtime && !runtime.reset) {
     return {
       kind: "session",
       id,
@@ -144,6 +155,7 @@ export function resolveSession(id: string, row: { owner: string; gid: number }, 
       gid: runtime.gid,
       mode: runtime.mode,
       acl: runtime.acl,
+      users: runtime.users,
       ceilingGids: runtime.gid === row.gid ? [] : [row.gid],
       source: "session-runtime",
     };
@@ -263,8 +275,8 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   const annotation = (id: string, policy: Policy): { gid: number; label: string } | undefined => {
     const row = store.session(id);
     const runtime = row && store.sessionAccess(id);
-    const gid = runtime?.gid ?? row?.gid;
-    const label = runtime ? runtime.label : gid === undefined ? undefined : groupLabel(policy, gid);
+    const gid = runtime && !runtime.reset ? runtime.gid : row?.gid;
+    const label = runtime && !runtime.reset ? runtime.label : gid === undefined ? undefined : groupLabel(policy, gid);
     return gid !== undefined && label ? { gid, label } : undefined;
   };
   /** A session object with relaygate's annotation set, and any upstream `relaygate` key dropped (only relaygate says it). */
@@ -280,6 +292,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     const policy = deps.policy();
     return check(c.get("principal"), resolveSession(id, row, policy, store.sessionAccess(id)), "r", policy.ceilings).allowed;
   };
+  const canReadEverySession = (c: Ctx): boolean => store.sessionIds().every((id) => canRead(c, id));
 
   /** The write decision for one session; a new session is decided as if the caller owned it (it will). */
   const decideWrite = (c: Ctx, id: string, content: string, row = store.session(id)) => {
@@ -362,7 +375,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   const gateRead = (c: Ctx, id: string) => {
     const ok = SESSION_ID.test(id) && canRead(c, id);
     audit(c, "session.read", "r", id, ok ? "allow" : "deny", "mode", ok ? "read" : "read_denied");
-    return ok ? undefined : deny(c, 403, "relaygate_denied", { op: "r", resource: `session:${id}` });
+    return ok ? undefined : deny(c, 404, "relaygate_not_found");
   };
 
   const canManageAccess = (c: Ctx): boolean => {
@@ -379,20 +392,24 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     gid: row.gid,
     mode: row.mode,
     acl: row.acl,
+    users: row.users,
     label: row.label,
+    reset: row.reset,
     version: row.version,
     updatedAt: row.updatedAt,
   });
 
-  // A librarian/control-plane principal replaces the runtime access policy. Named people are resolved by Control
-  // to their durable groups before this call; relaygate persists/enforces only gids and never stores identity data.
-  app.options("/sessions/v1/sessions/:id/access", (c) =>
+  // A librarian/control-plane principal replaces the runtime access policy. Per-person grants use only Control's
+  // durable opaque user id; relaygate never stores an email or display name with the session policy.
+  const accessPreflight = (c: Ctx) =>
     c.body(null, 204, {
-      "access-control-allow-methods": "GET, PATCH, OPTIONS",
+      "access-control-allow-methods": "GET, PATCH, POST, OPTIONS",
       "access-control-allow-headers": "authorization, content-type, x-relaygate-token",
       "access-control-max-age": "600",
-    }),
-  );
+    });
+  app.options("/sessions/v1/sessions/:id/access", accessPreflight);
+  app.options("/sessions/v1/sessions/:id/access/history", accessPreflight);
+  app.options("/sessions/v1/sessions/:id/access/reset", accessPreflight);
   app.get("/sessions/v1/sessions/:id/access", (c) => {
     const id = c.req.param("id");
     if (!SESSION_ID.test(id)) return deny(c, 400, "relaygate_bad_request", { detail: "invalid session id" });
@@ -401,11 +418,12 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
     const session = store.session(id);
     if (!session) return deny(c, 404, "relaygate_not_found");
     const runtime = store.sessionAccess(id);
-    if (runtime) return c.json({ runtime: true, access: accessCard(runtime) });
-    const resolved = resolveSession(id, session, deps.policy());
+    if (runtime && !runtime.reset) return c.json({ runtime: true, access: accessCard(runtime) });
+    const resolved = resolveSession(id, session, deps.policy(), runtime);
     return c.json({
       runtime: false,
-      access: { sessionId: id, gid: resolved.gid, mode: resolved.mode, acl: resolved.acl, label: groupLabel(deps.policy(), resolved.gid), version: 0 },
+      reset: runtime?.reset ?? false,
+      access: { sessionId: id, gid: resolved.gid, mode: resolved.mode, acl: resolved.acl, users: [], label: groupLabel(deps.policy(), resolved.gid), version: runtime?.version ?? 0 },
     });
   });
 
@@ -430,7 +448,9 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
         gid: parsed.data.gid ?? current.gid,
         mode: parsed.data.mode ?? current.mode,
         acl: parsed.data.acl ?? [...(current.acl ?? [])],
-        label: parsed.data.label === undefined ? (before ? before.label : groupLabel(policy, current.gid) ?? null) : parsed.data.label,
+        users: parsed.data.users ?? (before && !before.reset ? [...before.users] : []),
+        label: parsed.data.label === undefined ? (before && !before.reset ? before.label : groupLabel(policy, current.gid) ?? null) : parsed.data.label,
+        reset: false,
         updatedBy: c.get("agent").id,
       },
       parsed.data.expectedVersion,
@@ -448,6 +468,44 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
       reason: `version:${result.row.version}`,
     });
     return c.json({ runtime: true, access: accessCard(result.row) });
+  });
+
+  app.post("/sessions/v1/sessions/:id/access/reset", async (c) => {
+    const id = c.req.param("id");
+    if (!SESSION_ID.test(id)) return deny(c, 400, "relaygate_bad_request", { detail: "invalid session id" });
+    const refused = accessRefusal(c, id);
+    if (refused) return refused;
+    const session = store.session(id);
+    if (!session) return deny(c, 404, "relaygate_not_found");
+    const parsed = SessionAccessReset.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsed.success) return deny(c, 400, "relaygate_bad_request", { detail: parsed.error.issues[0]?.message });
+    const effective = resolveSession(id, session, deps.policy());
+    const result = store.putSessionAccess(
+      {
+        sessionId: id,
+        gid: effective.gid,
+        mode: effective.mode,
+        acl: [...(effective.acl ?? [])],
+        users: [],
+        label: groupLabel(deps.policy(), effective.gid) ?? null,
+        reset: true,
+        updatedBy: c.get("agent").id,
+      },
+      parsed.data.expectedVersion,
+      parsed.data.reason,
+    );
+    if (!result.updated) return deny(c, 409, "relaygate_conflict", { currentVersion: result.currentVersion });
+    store.audit({
+      agentId: c.get("agent").id,
+      action: "session.access.reset",
+      op: "w",
+      resourceKind: "session",
+      resourceId: id,
+      decision: "allow",
+      stage: "mode",
+      reason: `version:${result.row.version}`,
+    });
+    return c.json({ runtime: false, reset: true, access: accessCard(result.row) });
   });
 
   app.get("/sessions/v1/sessions/:id/access/history", (c) => {
@@ -680,14 +738,22 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
   // Read-API features that live beside Sessions. Keep this an exact allowlist: unknown relayfacts/coordination
   // paths fall through to relaygate_route_not_proxied instead of turning relaygate into an open reverse proxy.
   const readFeature = (path: string) =>
-    app.get(`/sessions${path}`, async (c) =>
-      pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c), undefined, undefined, { audience: "session-read-api", access: "passthrough" })),
-    );
+    app.get(`/sessions${path}`, async (c) => {
+      const allowed = canReadEverySession(c);
+      audit(c, "session.cross_view", "r", c.req.path.replace(/^\/sessions/, ""), allowed ? "allow" : "deny", "mode", allowed ? "all_sessions_readable" : "per_session_acl");
+      return allowed
+        ? pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c), undefined, undefined, { audience: "session-read-api", access: "passthrough" }))
+        : deny(c, 403, "relaygate_denied", { op: "r", resource: c.req.path.replace(/^\/sessions/, "") });
+    });
   readFeature("/v1/relayfacts");
   readFeature("/v1/relayfacts/:topic");
   readFeature("/v1/coordination/overlaps");
   readFeature("/v1/coordination/advisories");
   app.post("/sessions/v1/coordination/advisories/:advisoryId/ack", async (c) => {
+    if (!canReadEverySession(c)) {
+      audit(c, "session.cross_view", "r", c.req.path.replace(/^\/sessions/, ""), "deny", "mode", "per_session_acl");
+      return deny(c, 403, "relaygate_denied", { op: "r", resource: c.req.path.replace(/^\/sessions/, "") });
+    }
     const body = Buffer.from(await c.req.arrayBuffer());
     return pass(await upstream(c, cfg.readUrl, "POST", upstreamPath(c), body, undefined, { audience: "session-read-api", access: "passthrough" }));
   });
@@ -700,8 +766,11 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
       const policy = deps.policy();
       // An aggregate spans every session, so a principal under any ceiling never gets one (it may not see all groups).
       const ceilinged = policy.ceilings.some((cl) => cl.gid === principal.gid || principal.groups.includes(cl.gid));
-      const allowed = !ceilinged && policy.sessionAggregates.gids.some((g) => principal.gid === g || principal.groups.includes(g));
-      audit(c, "session.aggregate", "r", c.req.path.replace(/^\/sessions/, ""), allowed ? "allow" : "deny", "mode", allowed ? "sessionAggregates" : "not_in_sessionAggregates");
+      const aggregateGroup = policy.sessionAggregates.gids.some((g) => principal.gid === g || principal.groups.includes(g));
+      const allReadable = aggregateGroup && canReadEverySession(c);
+      const allowed = !ceilinged && aggregateGroup && allReadable;
+      const reason = allowed ? "sessionAggregates" : !aggregateGroup ? "not_in_sessionAggregates" : !allReadable ? "per_session_acl" : "ceiling";
+      audit(c, "session.aggregate", "r", c.req.path.replace(/^\/sessions/, ""), allowed ? "allow" : "deny", "mode", reason);
       return allowed ? pass(await upstream(c, cfg.readUrl, "GET", upstreamPath(c), undefined, undefined, { audience: "session-read-api", access: "aggregate" })) : deny(c, 403, "relaygate_denied", { op: "r", resource: `sessions${path}` });
     });
   for (const path of ["/v1/sessions/users", "/v1/sessions/activity", "/v1/sessions/summaries/activity", "/v1/sessions/output", "/v1/sessions/titles", "/v1/delivery/records", "/v1/digest/*"]) aggregate(path);

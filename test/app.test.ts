@@ -112,6 +112,16 @@ describe("access lists and ceilings", () => {
     const x = { owner: "g", gid: 44, mode: "460", acl: [{ gid: 44, perm: "rw" as const }] };
     expect(modeAllows(guest, x, "w")).toBe(false);
   });
+  it("per-person grants apply to the person and their agents but still lose to ceilings", () => {
+    const person = { agentId: "person", userId: "u-1", gid: 11, groups: [] };
+    const agent = { agentId: "agent", userId: "u-1", gid: 44, groups: [] };
+    const stranger = { agentId: "other", userId: "u-2", gid: 11, groups: [] };
+    const x = { owner: "owner", gid: 22, mode: "000", users: [{ userId: "u-1", perm: "r" as const }] };
+    expect(modeAllows(person, x, "r")).toBe(true);
+    expect(modeAllows(agent, x, "r")).toBe(true);
+    expect(modeAllows(stranger, x, "r")).toBe(false);
+    expect(checkMode(agent, x, "r", [{ gid: 44, never: [22] }]).allowed).toBe(false);
+  });
   it("a ceiling is the last step and refuses whatever mode and ACL allowed", () => {
     const x = { owner: null, gid: 22, mode: "666", acl: [{ gid: 44, perm: "rw" as const }] };
     const res = checkMode(guest, x, "r", [{ gid: 44, never: [22] }]);
