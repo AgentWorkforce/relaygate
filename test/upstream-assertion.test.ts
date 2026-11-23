@@ -30,7 +30,9 @@ describe("relaygate upstream assertions", () => {
       principal: { agent_id: "ag_1", gid: 11, groups: [22, 33] },
       access: "read",
       session_ids: ["s-1"],
+      session_count: 1,
     });
+    expect(claims.session_ids_sha256).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("rejects tampering, replay on another request or credential, wrong scope, expiry and unknown rotation keys", () => {
@@ -55,5 +57,16 @@ describe("relaygate upstream assertions", () => {
     const token = signUpstreamAssertion({ key: KEY, kid: KID, now: () => NOW }, write);
     expect(verifyUpstreamAssertion(token, new Map([[KID, KEY]]), write, NOW).body_sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(() => verifyUpstreamAssertion(token, new Map([[KID, KEY]]), { ...write, body: Buffer.from("different") }, NOW)).toThrow();
+  });
+
+  it("keeps large multi-session scopes bounded and binds them by count and digest", () => {
+    const sessionIds = Array.from({ length: 500 }, (_, i) => `session-${i.toString().padStart(4, "0")}-${"x".repeat(200)}`);
+    const large = { ...request, method: "POST", audience: "ingest-edge" as const, access: "write" as const, sessionIds };
+    const token = signUpstreamAssertion({ key: KEY, kid: KID, now: () => NOW }, large);
+    expect(token.length).toBeLessThan(8_000);
+    const claims = verifyUpstreamAssertion(token, new Map([[KID, KEY]]), large, NOW);
+    expect(claims).toMatchObject({ session_ids: [], session_count: 500 });
+    expect(claims.session_ids_sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(() => verifyUpstreamAssertion(token, new Map([[KID, KEY]]), { ...large, sessionIds: [...sessionIds.slice(0, -1), "different"] }, NOW)).toThrow();
   });
 });

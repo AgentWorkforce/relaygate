@@ -818,19 +818,25 @@ exactly as sent. Its JSON claims are:
   "method": "GET", "path": "/v1/events?session=s-1",
   "body_sha256": "<hex>", "credential_sha256": "<hex>",
   "principal": {"agent_id": "ag_...", "gid": 11, "groups": [22]},
-  "access": "read", "session_ids": ["s-1"]
+  "access": "read", "session_ids": ["s-1"], "session_count": 1,
+  "session_ids_sha256": "<hex>"
 }
 ```
 
 The path is the exact upstream pathname and query; the body hash covers the
 exact forwarded bytes, including compressed delivery batches; and the
 credential hash binds the proof to the forwarded `Authorization` value
-without exposing that credential. `session_ids` is sorted and de-duplicated.
+without exposing that credential. Session scope is sorted and de-duplicated;
+`session_count` and `session_ids_sha256` always bind its canonical JSON. At
+most 16 ids and 2 KiB are also carried inline in `session_ids`; larger batches
+use an empty inline array, keeping the assertion header bounded.
 `aud` is `session-read-api` or `ingest-edge`, preventing cross-service replay
 even when both services share the rotation key.
 Single-session reads and writes name their sessions. Lists and transcript
 search carry `access: "filter"` and an empty list because relaygate filters the
-upstream page; permitted whole-workspace aggregates carry `aggregate`.
+upstream page; permitted whole-workspace aggregates carry `aggregate`. The
+administrative adoption scan signs every direct session-list page as a
+`filter` read too, leaving no unsigned read-API path when verification is on.
 
 The default lifetime is 30 seconds and the configurable range is 5 through
 60. A verifier checks the MAC in constant time, selects the key by `kid`,

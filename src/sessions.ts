@@ -206,6 +206,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
       headers["content-type"] = contentType;
       delete headers["content-encoding"];
     }
+    const target = new URL(path.replace(/^\//, ""), slash(base));
     if (cfg.assertion) {
       if (body !== undefined && typeof body !== "string" && !(body instanceof Uint8Array)) {
         console.error(JSON.stringify({ msg: "sessions assertion cannot hash body type" }));
@@ -213,7 +214,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
       }
       headers[UPSTREAM_ASSERTION_HEADER] = signUpstreamAssertion(cfg.assertion, {
         method,
-        path,
+        path: `${target.pathname}${target.search}`,
         body: body as string | Uint8Array | undefined,
         credential: auth,
         audience: scope.audience,
@@ -223,7 +224,7 @@ export function mountSessions(app: Hono<Env>, deps: Deps, cfg: SessionsConfig): 
       });
     }
     try {
-      const res = await doFetch(new URL(path.replace(/^\//, ""), slash(base)), { method, headers, body });
+      const res = await doFetch(target, { method, headers, body });
       return { status: res.status, headers: res.headers, text: await res.text() };
     } catch (error) {
       console.error(JSON.stringify({ msg: "sessions upstream error", error: (error as Error).name }));
@@ -756,7 +757,21 @@ export async function adoptSessions(
     const q = new URLSearchParams({ workspace: opts.workspaceId, limit: "200", ...(cursor ? { cursor } : {}) });
     let body: any;
     try {
-      const res = await doFetch(new URL(`v1/sessions?${q}`, base), { headers: { authorization: `Bearer ${opts.readToken}` } });
+      const target = new URL(`v1/sessions?${q}`, base);
+      const authorization = `Bearer ${opts.readToken}`;
+      const headers: Record<string, string> = { authorization };
+      if (cfg.assertion) {
+        headers[UPSTREAM_ASSERTION_HEADER] = signUpstreamAssertion(cfg.assertion, {
+          method: "GET",
+          path: `${target.pathname}${target.search}`,
+          credential: authorization,
+          audience: "session-read-api",
+          principal: { agentId: "relaygate:session-adopt", gid: 0, groups: [] },
+          access: "filter",
+          sessionIds: [],
+        });
+      }
+      const res = await doFetch(target, { headers });
       if (!res.ok) {
         report.error = `session list answered ${res.status}`;
         break;
