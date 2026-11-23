@@ -132,7 +132,7 @@ function resolveSubject(subject: Subject, policy: Policy, store: Pick<Store, "ag
   return { ok: true, principal: { agentId: `explain:${name}`, gid: s.gid, groups: s.groups }, name, guest: s.guest, notes: ["a hypothetical agent"] };
 }
 
-export function explain(policy: Policy, store: Pick<Store, "agentByName" | "stream"> & Partial<Pick<Store, "session">> | undefined, query: Query, now = Date.now()): Explanation {
+export function explain(policy: Policy, store: Pick<Store, "agentByName" | "stream"> & Partial<Pick<Store, "session" | "sessionAccess">> | undefined, query: Query, now = Date.now()): Explanation {
   const q = QuerySchema.parse(query);
   const op = q.op as Op;
   const id = q.resource.id;
@@ -166,7 +166,7 @@ export function explain(policy: Policy, store: Pick<Store, "agentByName" | "stre
       steps.push({ step: "resource", detail: `session ${id} isn't recorded; give its first uploader's gid to explain a hypothetical one` });
       return { decision: "deny", reason: "unknown_session", classified: false, subject: card, resource: null, steps, summary: `${name} may not ${verb} session ${id}: unknown session` };
     }
-    stream = resolveSession(id, row, policy);
+    stream = resolveSession(id, row, policy, store?.sessionAccess?.(id));
   } else {
     const found = resolveStream(id, store, policy);
     if (!found) {
@@ -214,7 +214,7 @@ export interface CaseResult {
 }
 
 /** Runs a list of expected decisions against a policy, for testing a drafted policy before it is applied. */
-export function runCases(policy: Policy, store: Pick<Store, "agentByName" | "stream"> & Partial<Pick<Store, "session">> | undefined, cases: Case[], now = Date.now()): CaseResult[] {
+export function runCases(policy: Policy, store: Pick<Store, "agentByName" | "stream"> & Partial<Pick<Store, "session" | "sessionAccess">> | undefined, cases: Case[], now = Date.now()): CaseResult[] {
   return cases.map((raw) => {
     const c = CaseSchema.parse(raw);
     const got = explain(policy, store, c, now);

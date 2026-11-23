@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -100,6 +100,26 @@ describe("explain for sessions", () => {
     expect(q({ key: "pit" }, "w", { kind: "session", id: "s1" }).decision).toBe("deny");
     expect(q({ key: "local" }, "r", { kind: "session", id: "s-unknown" }).reason).toBe("unknown_session");
     expect(q({ key: "pit" }, "r", { kind: "session", id: "s-new", gid: 22 }).decision).toBe("allow");
+  });
+
+  it("explains sessions from an older read-only database without the runtime-access table", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const dir = mkdtempSync(join(tmpdir(), "rg-explain-old-"));
+    const path = join(dir, "old.db");
+    const old = new DatabaseSync(path);
+    old.exec(`CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, key_id TEXT NOT NULL, recovery_hash TEXT, created_at TEXT NOT NULL);
+      CREATE TABLE sessions (id TEXT PRIMARY KEY, owner TEXT NOT NULL, gid INTEGER NOT NULL, created_at TEXT NOT NULL);
+      INSERT INTO agents VALUES ('ag_1', 'local-a', 11, 'local', NULL, 'x');
+      INSERT INTO sessions VALUES ('s-old', 'ag_1', 11, 'x');`);
+    old.close();
+    const store = new Store(path, { readOnly: true });
+    try {
+      expect(store.sessionAccess("s-old")).toBeUndefined();
+      expect(explain(examplePolicy(), store, { as: { key: "pit" }, op: "r", resource: { kind: "session", id: "s-old" } }, NOW).decision).toBe("allow");
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

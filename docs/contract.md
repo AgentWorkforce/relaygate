@@ -807,9 +807,11 @@ strong as the network rule that Sessions accepts traffic from relaygate alone
 | `POST /sessions/v1/auth/token/revoke`, `GET /sessions/healthz` | no principal needed (revoking is always safe) |
 | `POST /sessions/v1/ingest` | `w` on every session the batch names; all or nothing. Each record gets a `relaygate:agent:<name>` tag (client `relaygate:` tags are dropped) and, where it names one, `sessionOwner` set to the agent |
 | `GET /sessions/v1/sessions` | filtered to sessions the caller may read; the cursor passes through; labeled sessions carry `relaygate` (see "Group labels") |
-| `GET /sessions/v1/sessions/:id/{events,turns,metadata,thread,catalog,timing,analysis,brief}` | `r` on the session; `metadata` and `catalog` of a labeled session carry `relaygate` |
+| `GET /sessions/v1/sessions/:id/{events,turns,metadata,thread,catalog,timing,analysis,brief,summary}` | `r` on the session; `metadata` and `catalog` of a labeled session carry `relaygate` |
 | `GET /sessions/v1/events?session=<id>` | one `session`, `r` on it |
 | `GET /sessions/v1/events?q=<text>` | transcript search, filtered to events of sessions the caller may read |
+| `GET/PATCH /sessions/v1/sessions/:id/access` | runtime access policy, restricted to `sessionAccessAdmins` groups |
+| `GET /sessions/v1/sessions/:id/access/history` | immutable runtime-policy history, restricted to `sessionAccessAdmins` groups |
 
 A write is decided before anything is recorded; the classifier sees every
 forwarded field, not only `content`. New sessions are claimed in one
@@ -859,6 +861,63 @@ from Sessions itself is dropped, so a reader can trust that only relaygate
 wrote it. A caller only ever sees the label of a session it may read, and a
 session that never came through relaygate has no owning group, so no label.
 
+### Runtime session access
+
+An explicitly authorized group can restrict or relabel an already-owned
+session without editing and republishing the whole operator policy. The
+authorization is itself operator policy:
+
+```json
+"sessionAccessAdmins": {"gids": [33]}
+```
+
+Any principal whose primary or supplementary group is listed may manage a
+session's runtime access. This is intended for a Control-mapped librarian
+principal; a read token minted for a browser or agent-behalf MCP call may use
+the endpoint, and the group check still applies. Named people are resolved by
+Control into durable per-person groups before the call, so relaygate stores no
+email, display name or other member identity.
+
+```http
+PATCH /sessions/v1/sessions/<id>/access
+Authorization: Bearer <Control read token or rg_ token>
+Content-Type: application/json
+
+{
+  "mode": "000",
+  "acl": [{"gid": 101, "perm": "r"}, {"gid": 102, "perm": "r"}],
+  "label": "restricted",
+  "expectedVersion": 0,
+  "reason": "sensitive"
+}
+```
+
+`gid`, `mode`, `acl` and `label` are patch fields. The resulting complete
+policy is stored in relaygate's database with a monotonically increasing
+version. `expectedVersion` is optional; when present a stale edit gets `409`
+with `currentVersion`. `label: null` removes the badge. Labels and gids use the
+same validation as policy labels and ACLs.
+
+Once present, the runtime policy replaces the session default and static
+`sessionOverrides` entry. `resolveSession` therefore makes one decision for
+single-session views (including `summary`), events, transcript search and
+session lists. Runtime gid/label values also drive the trustworthy
+`relaygate` badge. Writes are covered too; for a read-only restriction use
+`mode: "000"` and `r` ACL entries as above.
+
+A runtime `gid` changes the effective group but never erases the immutable
+first-uploader group: ceilings are checked against both. Write classification
+also snapshots the runtime version. If access changes while classification is
+in flight, relaygate re-decides the whole request and never forwards a write
+under the stale decision.
+
+`GET .../access` returns the effective policy and its version. Every successful
+change appends an immutable before/after row, including actor, timestamp,
+version and the optional content-free reason; managers read it at
+`GET .../access/history?after=<seq>&limit=<n>`. The ordinary operator audit log
+also records the authorization decision and successful version change. Neither
+log contains trace content.
+
 ## Control principals
 
 Some callers hold only relay-control credentials: the desktop app uploads
@@ -880,7 +939,9 @@ On Sessions routes, a request with one of those in `Authorization` and no
   calls unchanged and records the hash of each minted token with the identity
   the mint named (and its role, when the mint carries one). The mint routes are
   never served on a public Sessions host, and are checked against
-  `SESSIONS_INTERNAL_SECRET` when it is set.
+  `SESSIONS_INTERNAL_SECRET` when it is set. Successful refresh and revoke
+  calls are mirrored into that local hash cache, so a rotated or revoked read
+  credential cannot continue using relaygate-local management routes.
 
 The policy maps them to groups; the first rule whose every given field matches
 wins, and a user no rule matches is refused:

@@ -44,6 +44,7 @@ function policy() {
       { match: { orgIds: ["org-1"] }, gid: 11 },
     ],
     sessionAggregates: { gids: [33] },
+    sessionAccessAdmins: { gids: [33] },
     reservedNamePrefixes: ["control-"],
     // Spawn targets: launching onto an inside node is a cross-group write (classified); the inside group owns it.
     streamDefaults: [{ prefix: "node:", gid: 22, mode: "660", acl: [{ gid: 11, perm: "w" }] }],
@@ -74,8 +75,22 @@ function harness(opts: { controlDown?: boolean; internalSecret?: string; garbled
     if (c.req.header("authorization") !== `Bearer ${INTERNAL}`) return c.json({ error: "unauthorized" }, 401);
     const b = await c.req.json();
     mintBodies.push(b);
-    return c.json({ userId: b.userId, orgId: b.orgId, workspaceId: b.workspaceId, role: b.role, accessToken: `rth_at_read_${b.userId}_${++minted}`, accessTokenExpiresAt: new Date(Date.now() + 300_000).toISOString() });
+    const n = ++minted;
+    return c.json({
+      userId: b.userId,
+      orgId: b.orgId,
+      workspaceId: b.workspaceId,
+      role: b.role,
+      sessionId: `read-session-${n}`,
+      accessToken: `rth_at_read_${b.userId}_${n}`,
+      refreshToken: `rth_rt_read_${b.userId}_${n}`,
+      accessTokenExpiresAt: new Date(Date.now() + 300_000).toISOString(),
+    });
   });
+  sessions.post("/internal/v1/session-read/revoke", async (c) =>
+    c.req.header("authorization") === `Bearer ${INTERNAL}` ? c.json({ revoked: 1 }) : c.json({ error: "unauthorized" }, 401),
+  );
+  sessions.post("/v1/auth/token/revoke", (c) => c.json({ revoked: true }));
   sessions.post("/v1/delivery/batches", (c) => c.json({ protocolVersion: 1, receiptId: "rhr_1" }));
   sessions.get("/v1/sessions/:id/events", (c) => c.json({ sessionId: c.req.param("id"), events: [] }, 200, { "x-relayhistory-workspace-id": "ws-1", "access-control-allow-origin": "https://app.example.test" }));
   sessions.get("/v1/sessions/users", (c) => c.json({ users: [{ userId: "u-member" }] }));
@@ -187,6 +202,37 @@ describe("relay-control principals: dashboard read tokens", () => {
     expect((await h.call("GET", "/sessions/v1/sessions/s-pit/events", admin)).status).toBe(200);
     expect((await h.call("GET", "/sessions/v1/sessions/users?workspace=ws-1", admin)).status).toBe(200);
     expect((await h.call("GET", "/sessions/v1/sessions/users?workspace=ws-1", member)).status).toBe(403);
+  });
+
+  it("lets a mapped librarian group manage runtime access with an agent-behalf/read credential", async () => {
+    const h = harness();
+    await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", h.batch("s-sensitive"));
+    const member = (await h.mint("u-member")).body.accessToken;
+    const admin = (await h.mint("u-admin", "admin")).body.accessToken;
+    expect((await h.call("PATCH", "/sessions/v1/sessions/s-sensitive/access", member, { mode: "000" })).status).toBe(403);
+    const changed = await h.call("PATCH", "/sessions/v1/sessions/s-sensitive/access", admin, {
+      mode: "000",
+      acl: [{ gid: 33, perm: "r" }],
+      label: "restricted",
+      expectedVersion: 0,
+    });
+    expect(changed).toMatchObject({ status: 200, body: { access: { version: 1, label: "restricted" } } });
+    expect((await h.call("GET", "/sessions/v1/sessions/s-sensitive/events", member)).status).toBe(403);
+    expect((await h.call("GET", "/sessions/v1/sessions/s-sensitive/events", admin)).status).toBe(200);
+  });
+
+  it("forgets a read credential after a successful holder or internal revoke", async () => {
+    const h = harness({ internalSecret: INTERNAL });
+    await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", h.batch("s-sensitive"));
+
+    const first = await h.mint("u-admin", "admin");
+    expect((await h.call("PATCH", "/sessions/v1/sessions/s-sensitive/access", first.body.accessToken, { mode: "000", expectedVersion: 0 })).status).toBe(200);
+    expect((await h.call("POST", "/sessions/v1/auth/token/revoke", undefined, { token: first.body.refreshToken })).status).toBe(200);
+    expect((await h.call("PATCH", "/sessions/v1/sessions/s-sensitive/access", first.body.accessToken, { mode: "660", expectedVersion: 1 })).status).toBe(401);
+
+    const second = await h.mint("u-admin", "admin");
+    expect((await h.call("POST", "/sessions/internal/v1/session-read/revoke", INTERNAL, { orgId: "org-1", sessionId: second.body.sessionId })).status).toBe(200);
+    expect((await h.call("PATCH", "/sessions/v1/sessions/s-sensitive/access", second.body.accessToken, { mode: "660", expectedVersion: 1 })).status).toBe(401);
   });
 
   it("mints only off the internal path: never through a public Sessions host, and with the internal secret when configured", async () => {
