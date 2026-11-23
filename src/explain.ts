@@ -124,7 +124,7 @@ function resolveSubject(subject: Subject, policy: Policy, store: Pick<Store, "ag
     // A person who already uploaded owns their sessions as the stored ctl: agent, as a real request would.
     const stored = as === "person" ? store?.agentByName(name) : undefined;
     const agentId = stored && stored.keyId === "control" ? stored.id : `explain:${name}`;
-    return { ok: true, principal: { agentId, gid: rule.gid, groups: rule.groups }, name, guest: false, notes: [`${who}, by controlPrincipals rule ${index}`] };
+    return { ok: true, principal: { agentId, userId: p.userId, gid: rule.gid, groups: rule.groups }, name, guest: false, notes: [`${who}, by controlPrincipals rule ${index}`] };
   }
   const unknown = [s.gid, ...s.groups].find((g) => !policy.groups.some((x) => x.gid === g));
   if (unknown !== undefined) return { ok: false, reason: "unknown_gid", detail: `the policy defines no gid ${unknown}` };

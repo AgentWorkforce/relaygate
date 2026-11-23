@@ -253,5 +253,5 @@ export function matchControlRule(identity: ControlIdentity, policy: Policy, as: 
 /** The relaygate agent standing for a Control user (audited, owns what it uploads), and its principal now. */
 export function controlPrincipal(store: Store, identity: ControlIdentity, rule: ControlRule): { agent: Agent; principal: Principal } {
   const agent = store.ensureControlAgent(identity.userId, rule.gid);
-  return { agent, principal: { agentId: agent.id, gid: rule.gid, groups: rule.groups } };
+  return { agent, principal: { agentId: agent.id, userId: identity.userId, gid: rule.gid, groups: rule.groups } };
 }

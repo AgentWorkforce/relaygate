@@ -1,6 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import type { AclEntry } from "./mode.js";
+import type { AclEntry, UserAclEntry } from "./mode.js";
 
 export const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
 
@@ -66,7 +66,10 @@ export interface SessionAccessRow {
   gid: number;
   mode: string;
   acl: AclEntry[];
+  users: UserAclEntry[];
   label: string | null;
+  /** A versioned tombstone: policy defaults/overrides are effective while the reset marker is current. */
+  reset: boolean;
   version: number;
   updatedBy: string;
   updatedAt: string;
@@ -89,6 +92,8 @@ export class Store {
   private db: DatabaseSync;
   /** Older read-only snapshots predate runtime access; unlike writable stores they are intentionally not migrated. */
   private hasSessionAccess = true;
+  private sessionAccessHasUsers = true;
+  private sessionAccessHasReset = true;
   /** The agent columns this database has (all of them, once migrated). */
   private agentCols = "id, name, gid, key_id, recovery_hash, guest, groups";
 
@@ -100,6 +105,11 @@ export class Store {
       const cols = new Set(this.db.prepare("PRAGMA table_info(agents)").all().map((c) => String(c.name)));
       this.agentCols = `id, name, gid, key_id, recovery_hash, ${cols.has("guest") ? "guest" : "0 AS guest"}, ${cols.has("groups") ? "groups" : "NULL AS groups"}`;
       this.hasSessionAccess = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_access'").get() !== undefined;
+      if (this.hasSessionAccess) {
+        const accessCols = new Set(this.db.prepare("PRAGMA table_info(session_access)").all().map((c) => String(c.name)));
+        this.sessionAccessHasUsers = accessCols.has("users");
+        this.sessionAccessHasReset = accessCols.has("reset");
+      }
       return;
     }
     this.db.exec(`
@@ -154,7 +164,9 @@ export class Store {
         gid INTEGER NOT NULL,
         mode TEXT NOT NULL,
         acl TEXT NOT NULL,
+        users TEXT NOT NULL DEFAULT '[]',
         label TEXT,
+        reset INTEGER NOT NULL DEFAULT 0,
         version INTEGER NOT NULL,
         updated_by TEXT NOT NULL REFERENCES agents(id),
         updated_at TEXT NOT NULL
@@ -218,6 +230,8 @@ export class Store {
     this.addColumn("control_read_tokens", "reader_kind", "TEXT");
     this.addColumn("control_read_tokens", "refresh_hash", "TEXT");
     this.addColumn("control_read_tokens", "session_id", "TEXT");
+    this.addColumn("session_access", "users", "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumn("session_access", "reset", "INTEGER NOT NULL DEFAULT 0");
   }
 
   private addColumn(table: string, column: string, decl: string): void {
@@ -373,10 +387,16 @@ export class Store {
     return row ? { id: String(row.id), owner: String(row.owner), gid: Number(row.gid) } : undefined;
   }
 
+  sessionIds(): string[] {
+    return this.db.prepare("SELECT id FROM sessions ORDER BY id").all().map((row) => String(row.id));
+  }
+
   sessionAccess(id: string): SessionAccessRow | undefined {
     if (!this.hasSessionAccess) return undefined;
+    const users = this.sessionAccessHasUsers ? "users" : "'[]' AS users";
+    const reset = this.sessionAccessHasReset ? "reset" : "0 AS reset";
     const row = this.db
-      .prepare("SELECT session_id, gid, mode, acl, label, version, updated_by, updated_at FROM session_access WHERE session_id = ?")
+      .prepare(`SELECT session_id, gid, mode, acl, ${users}, label, ${reset}, version, updated_by, updated_at FROM session_access WHERE session_id = ?`)
       .get(id);
     return row ? toSessionAccess(row) : undefined;
   }
@@ -402,12 +422,13 @@ export class Store {
       const updatedAt = now();
       this.db
         .prepare(
-          `INSERT INTO session_access (session_id, gid, mode, acl, label, version, updated_by, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO session_access (session_id, gid, mode, acl, users, label, reset, version, updated_by, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(session_id) DO UPDATE SET gid = excluded.gid, mode = excluded.mode, acl = excluded.acl,
-             label = excluded.label, version = excluded.version, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+             users = excluded.users, label = excluded.label, reset = excluded.reset, version = excluded.version,
+             updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
         )
-        .run(access.sessionId, access.gid, access.mode, JSON.stringify(access.acl), access.label, version, access.updatedBy, updatedAt);
+        .run(access.sessionId, access.gid, access.mode, JSON.stringify(access.acl), JSON.stringify(access.users), access.label, access.reset ? 1 : 0, version, access.updatedBy, updatedAt);
       const row: SessionAccessRow = { ...access, version, updatedAt };
       this.db
         .prepare(
@@ -663,7 +684,9 @@ function toSessionAccess(row: Record<string, unknown>): SessionAccessRow {
     gid: Number(row.gid),
     mode: String(row.mode),
     acl: JSON.parse(String(row.acl)) as AclEntry[],
+    users: JSON.parse(String(row.users)) as UserAclEntry[],
     label: row.label === null ? null : String(row.label),
+    reset: Number(row.reset) === 1,
     version: Number(row.version),
     updatedBy: String(row.updated_by),
     updatedAt: String(row.updated_at),
@@ -671,5 +694,5 @@ function toSessionAccess(row: Record<string, unknown>): SessionAccessRow {
 }
 
 function publicSessionAccess(row: SessionAccessRow): Record<string, unknown> {
-  return { gid: row.gid, mode: row.mode, acl: row.acl, label: row.label, version: row.version };
+  return { gid: row.gid, mode: row.mode, acl: row.acl, users: row.users, label: row.label, reset: row.reset, version: row.version };
 }

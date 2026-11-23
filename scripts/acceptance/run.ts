@@ -403,7 +403,7 @@ async function main() {
       record(
         7,
         "outside agent appends to an inside session: accepted and classified; can't read it back",
-        ok(app.status) && write?.stage === "classifier" && back.status === 403 ? "PASS" : "FAIL",
+        ok(app.status) && write?.stage === "classifier" && back.status === 404 ? "PASS" : "FAIL",
         [`append ${app.status} (stage ${write?.stage ?? "?"}); read back ${back.status}`],
         rows.map(fmt),
       );
@@ -441,7 +441,7 @@ async function main() {
     record(
       8,
       "inside session upload is stored, and outside agents can't read or list it",
-      r1.status === 404 ? "SKIP" : r1.status === 403 && r2.status === 403 && !inList && stored ? "PASS" : "FAIL",
+      up.status === 404 ? "SKIP" : r1.status === 404 && r2.status === 404 && !inList && stored ? "PASS" : "FAIL",
       [
         canSee
           ? `inside upload ${seedUp?.status ?? "not seen"}; inside read-back ${verify?.status ?? "not seen"}, canary present: ${verify?.hasCanary ?? false}`
@@ -470,7 +470,7 @@ async function main() {
     record(15, "a person (Control read token, no rg_) reads the inside session through relaygate: allowed", found ? "PASS" : "FAIL", [
       `person read ${person.status}; inside content present: ${found}`,
       ...(person.status === 401 ? ["401: relaygate doesn't know this read token; mint it through relaygate (relay-control's SESSION_READ_API_URL at the gate)"] : []),
-      ...(person.status === 403 ? ["403: if the policy gives people the pit only for readerKinds [\"browser\"], mint the read token with a cookie session, not a bearer (relay-control labels bearer mints device)"] : []),
+      ...(person.status === 404 ? ["404: the session is hidden from this principal; if the policy grants browser readers, mint the read token with a cookie session, not a bearer (relay-control labels bearer mints device)"] : []),
     ]);
     if (found) {
       // The same person's read token, carried by their local agent: the agent's rg_ decides, and it is refused.
@@ -479,7 +479,7 @@ async function main() {
       const row = (await audit(h, localA.name)).find((r) => r.action === "session.read" && r.resource_id === docSession(RUN));
       // relaygate's own shape ({error: "<code>"}) or the Relaycast-shaped one ({error: {code}}).
       const code = typeof asAgent.body?.error === "string" ? asAgent.body.error : asAgent.body?.error?.code;
-      const refused = asAgent.status === 403 && code === "relaygate_denied" && row?.decision === "deny";
+      const refused = asAgent.status === 404 && code === "relaygate_not_found" && row?.decision === "deny";
       record(16, "a local agent (rg_, with the same person's read token) reads the inside session: refused", refused ? "PASS" : "FAIL", [
         `agent read ${asAgent.status} ${code ?? ""}; gate ${row?.decision ?? "no audit row"}`,
         "This proves relaygate's decision for the agent's rg_. An agent that holds a person credential can present it as the person: keep person-only grants on dashboard read tokens.",

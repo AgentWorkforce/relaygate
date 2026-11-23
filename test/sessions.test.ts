@@ -145,19 +145,19 @@ describe("Sessions proxy: reads", () => {
   it("pit agents read local sessions; local agents never read pit sessions", async () => {
     const w = await world();
     expect((await w.call("GET", "/sessions/v1/sessions/s-local/events", w.pit)).status).toBe(200);
-    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/turns", w.local)).status).toBe(403);
-    expect((await w.call("GET", "/sessions/v1/sessions/s-elsewhere/events", w.pit)).status).toBe(403);
+    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/turns", w.local)).status).toBe(404);
+    expect((await w.call("GET", "/sessions/v1/sessions/s-elsewhere/events", w.pit)).status).toBe(404);
   });
 
   it("a guest reads only the sessions shared with it, and never a pit session even with a mistaken override", async () => {
     const w = await world(policy(["s-local"], ["s-pit"]));
     expect((await w.call("GET", "/sessions/v1/sessions/s-local/events", w.guest)).status).toBe(200);
     expect((await w.turns(w.guest, "s-local")).status).toBe(403);
-    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/events", w.guest)).status).toBe(403);
+    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/events", w.guest)).status).toBe(404);
     expect((await w.turns(w.guest, "s-pit")).status).toBe(403);
     // Without the share, the guest sees nothing.
     const plain = await world();
-    expect((await plain.call("GET", "/sessions/v1/sessions/s-local/events", plain.guest)).status).toBe(403);
+    expect((await plain.call("GET", "/sessions/v1/sessions/s-local/events", plain.guest)).status).toBe(404);
   });
 
   it("filters lists to readable sessions and keeps the cursor", async () => {
@@ -174,7 +174,7 @@ describe("Sessions proxy: reads", () => {
     const w = await world();
     expect((await w.call("GET", "/sessions/v1/events", w.local)).status).toBe(400);
     expect((await w.call("GET", "/sessions/v1/events?session=s-local&session=s-pit", w.local)).status).toBe(400);
-    expect((await w.call("GET", "/sessions/v1/events?session=s-pit", w.local)).status).toBe(403);
+    expect((await w.call("GET", "/sessions/v1/events?session=s-pit", w.local)).status).toBe(404);
     expect((await w.call("GET", "/sessions/v1/events?session=s-local", w.local)).status).toBe(200);
   });
 
@@ -206,7 +206,7 @@ describe("Sessions proxy: group labels", () => {
     expect((await w.call("GET", "/sessions/v1/sessions/s-pit/catalog", w.pit)).body.relaygate).toEqual({ gid: 22, label: "pit" });
     expect((await w.call("GET", "/sessions/v1/sessions/s-local/catalog", w.pit)).body).not.toHaveProperty("relaygate");
     expect((await w.call("GET", "/sessions/v1/sessions/s-pit/events", w.pit)).body).toEqual({ events: [{ sessionId: "s-pit" }] });
-    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/metadata", w.local)).status).toBe(403);
+    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/metadata", w.local)).status).toBe(404);
   });
 
   it("without groupLabels nothing is labeled", async () => {
@@ -247,11 +247,11 @@ describe("Sessions proxy: runtime session access", () => {
 
     // The old owner and old cross-group reader both lose access; the named reader group gains it.
     for (const view of ["events", "turns", "metadata", "thread", "catalog", "timing", "analysis", "brief", "summary"]) {
-      expect((await w.call("GET", `/sessions/v1/sessions/s-local/${view}`, w.local)).status, view).toBe(403);
-      expect((await w.call("GET", `/sessions/v1/sessions/s-local/${view}`, w.pit)).status, view).toBe(403);
+      expect((await w.call("GET", `/sessions/v1/sessions/s-local/${view}`, w.local)).status, view).toBe(404);
+      expect((await w.call("GET", `/sessions/v1/sessions/s-local/${view}`, w.pit)).status, view).toBe(404);
     }
     expect((await w.call("GET", "/sessions/v1/sessions/s-local/summary", w.guest)).status).toBe(200);
-    expect((await w.call("GET", "/sessions/v1/events?session=s-local", w.local)).status).toBe(403);
+    expect((await w.call("GET", "/sessions/v1/events?session=s-local", w.local)).status).toBe(404);
     expect((await w.call("GET", "/sessions/v1/events?q=hello", w.local)).body.events).toEqual([]);
     expect((await w.call("GET", "/sessions/v1/events?q=hello", w.guest)).body.events.map((e: any) => e.sessionId)).toEqual(["s-local"]);
     expect((await w.call("GET", "/sessions/v1/sessions", w.local)).body.sessions).toEqual([]);
@@ -277,6 +277,33 @@ describe("Sessions proxy: runtime session access", () => {
     expect(history.body.rows[1]).toMatchObject({ version: 2, before: { version: 1 }, after: { label: "legal", version: 2 } });
   });
 
+  it("audits a versioned reset and immediately restores live policy defaults", async () => {
+    const w = await world(managed());
+    expect(
+      (
+        await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, {
+          mode: "000",
+          acl: [{ gid: 44, perm: "r" }],
+          label: "restricted",
+          expectedVersion: 0,
+        })
+      ).status,
+    ).toBe(200);
+    expect((await w.call("GET", "/sessions/v1/sessions/s-local/events", w.local)).status).toBe(404);
+    expect((await w.call("GET", "/sessions/v1/sessions/s-local/events", w.guest)).status).toBe(200);
+
+    const reset = await w.call("POST", "/sessions/v1/sessions/s-local/access/reset", w.pit, { expectedVersion: 1, reason: "classification cleared" });
+    expect(reset).toMatchObject({ status: 200, body: { runtime: false, reset: true, access: { version: 2, reset: true } } });
+    expect((await w.call("GET", "/sessions/v1/sessions/s-local/events", w.local)).status).toBe(200);
+    expect((await w.call("GET", "/sessions/v1/sessions/s-local/events", w.guest)).status).toBe(404);
+    const history = await w.call("GET", "/sessions/v1/sessions/s-local/access/history", w.pit);
+    expect(history.body.rows.at(-1)).toMatchObject({ version: 2, reason: "classification cleared", after: { reset: true, version: 2 } });
+
+    // A stale reset or edit cannot reuse version zero, and the next override continues monotonically.
+    expect((await w.call("POST", "/sessions/v1/sessions/s-local/access/reset", w.pit, { expectedVersion: 1 })).status).toBe(409);
+    expect((await w.call("PATCH", "/sessions/v1/sessions/s-local/access", w.pit, { mode: "600", expectedVersion: 2 })).body.access.version).toBe(3);
+  });
+
   it("validates configured managers and runtime gids and labels", async () => {
     expect(() => parsePolicy({ groups: [{ gid: 1, name: "one" }], enrollmentKeys: [], sessionAccessAdmins: { gids: [2] } })).toThrow(/sessionAccessAdmins/);
     const w = await world(managed());
@@ -287,7 +314,7 @@ describe("Sessions proxy: runtime session access", () => {
   it("keeps the immutable first-uploader group under its original ceiling after a relabel", async () => {
     const w = await world(policy([], [], [], { sessionAccessAdmins: { gids: [22] } }));
     expect((await w.call("PATCH", "/sessions/v1/sessions/s-pit/access", w.pit, { gid: 11, mode: "000", acl: [{ gid: 44, perm: "r" }], expectedVersion: 0 })).status).toBe(200);
-    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/events", w.guest)).status).toBe(403);
+    expect((await w.call("GET", "/sessions/v1/sessions/s-pit/events", w.guest)).status).toBe(404);
   });
 
   it("re-decides a write if runtime access changes while its classifier is running", async () => {

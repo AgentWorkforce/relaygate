@@ -209,7 +209,7 @@ describe("relay-control principals: dashboard read tokens", () => {
     await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_inside", h.batch("s-pit"));
     const member = (await h.mint("u-member")).body.accessToken;
     const admin = (await h.mint("u-admin", "admin")).body.accessToken;
-    expect((await h.call("GET", "/sessions/v1/sessions/s-pit/events", member)).status).toBe(403);
+    expect((await h.call("GET", "/sessions/v1/sessions/s-pit/events", member)).status).toBe(404);
     expect((await h.call("GET", "/sessions/v1/sessions/s-pit/events", admin)).status).toBe(200);
     expect((await h.call("GET", "/sessions/v1/sessions/users?workspace=ws-1", admin)).status).toBe(200);
     expect((await h.call("GET", "/sessions/v1/sessions/users?workspace=ws-1", member)).status).toBe(403);
@@ -228,8 +228,39 @@ describe("relay-control principals: dashboard read tokens", () => {
       expectedVersion: 0,
     });
     expect(changed).toMatchObject({ status: 200, body: { access: { version: 1, label: "restricted" } } });
-    expect((await h.call("GET", "/sessions/v1/sessions/s-sensitive/events", member)).status).toBe(403);
+    expect((await h.call("GET", "/sessions/v1/sessions/s-sensitive/events", member)).status).toBe(404);
     expect((await h.call("GET", "/sessions/v1/sessions/s-sensitive/events", admin)).status).toBe(200);
+  });
+
+  it("grants one Control user and every agent acting for that user, while hiding denied sessions", async () => {
+    const h = harness();
+    await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", h.batch("s-personal"));
+    const member = (await h.mint("u-member")).body.accessToken;
+    const named = (await h.mint("u-member2")).body.accessToken;
+    const admin = (await h.mint("u-admin", "admin")).body.accessToken;
+    const changed = await h.call("PATCH", "/sessions/v1/sessions/s-personal/access", admin, {
+      mode: "000",
+      acl: [],
+      users: [{ userId: "u-member2", perm: "r" }],
+      expectedVersion: 0,
+    });
+    expect(changed).toMatchObject({ status: 200, body: { access: { users: [{ userId: "u-member2", perm: "r" }] } } });
+    expect((await h.call("GET", "/sessions/v1/sessions/s-personal/events", member)).status).toBe(404);
+    expect((await h.call("GET", "/sessions/v1/sessions/s-personal/events", named)).status).toBe(200);
+
+    const registered = await h.call("POST", "/v1/register", "sh_at_member2", { name: "member2-agent" });
+    expect(registered.status).toBe(200);
+    expect(
+      (
+        await h.call("GET", "/sessions/v1/sessions/s-personal/events", "rth_at_read_upstream", undefined, {
+          "x-relaygate-token": registered.body.token,
+        })
+      ).status,
+    ).toBe(200);
+
+    // An aggregate cannot bypass one session's per-person restriction, even for an aggregate-enabled group.
+    expect((await h.call("GET", "/sessions/v1/sessions/users", admin)).status).toBe(403);
+    expect((await h.call("GET", "/sessions/v1/relayfacts", admin)).status).toBe(403);
   });
 
   it("proxies only the read API's relayfacts and coordination allowlist, including read-scoped acknowledgements", async () => {
@@ -447,7 +478,7 @@ describe("person vs agent: match.as", () => {
     const read = (await h.mint("u-member")).body.accessToken;
     expect((await h.call("GET", "/sessions/v1/sessions/pit-1/events", read)).status).toBe(200);
     // The device token sits where the person's agents can reach it: it gets no more than an agent.
-    expect((await h.call("GET", "/sessions/v1/sessions/pit-1/events", "sh_at_member")).status).toBe(403);
+    expect((await h.call("GET", "/sessions/v1/sessions/pit-1/events", "sh_at_member")).status).toBe(404);
     // The person's own uploads still land in the local group.
     expect((await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_member", h.batch("mine-1"))).status).toBe(200);
     expect(h.store.session("mine-1")).toMatchObject({ gid: 11 });
@@ -455,7 +486,7 @@ describe("person vs agent: match.as", () => {
     expect(agent.body).toMatchObject({ gid: 11 });
     expect((await h.call("GET", "/v1/whoami", agent.body.token)).body.group_names).toEqual(["local"]);
     const asAgent = await h.call("GET", "/sessions/v1/sessions/pit-1/events", undefined, undefined, { "x-relaygate-token": agent.body.token, authorization: `Bearer ${read}` });
-    expect(asAgent.status).toBe(403);
+    expect(asAgent.status).toBe(404);
   });
 
   it("a rule limited to agents never maps a person, and the reverse", async () => {
@@ -491,10 +522,10 @@ describe("reader_kind: how the reader authenticated to relay-control", () => {
     const read = async (extra: Record<string, unknown>) =>
       (await h.call("GET", "/sessions/v1/sessions/pit-2/events", (await h.mint("u-member", undefined, extra)).body.accessToken)).status;
     expect(await read({ reader_kind: "browser" })).toBe(200);
-    expect(await read({ reader_kind: "mcp" })).toBe(403);
-    expect(await read({ reader_kind: "device" })).toBe(403);
-    expect(await read({})).toBe(403);
-    expect(await read({ reader_kind: "Browser" })).toBe(403);
+    expect(await read({ reader_kind: "mcp" })).toBe(404);
+    expect(await read({ reader_kind: "device" })).toBe(404);
+    expect(await read({})).toBe(404);
+    expect(await read({ reader_kind: "Browser" })).toBe(404);
     expect(h.mintBodies.length).toBe(5);
     for (const b of h.mintBodies) expect(b).not.toHaveProperty("reader_kind");
     expect(h.mintBodies[0]).toMatchObject({ userId: "u-member", orgId: "org-1", scopes: ["rth:read"] });
@@ -503,7 +534,7 @@ describe("reader_kind: how the reader authenticated to relay-control", () => {
   it("a device token never matches a readerKinds rule", async () => {
     const h = harness({ policy: readerPolicy() });
     expect((await h.call("POST", "/sessions/v1/delivery/batches", "sh_at_inside", h.batch("pit-3"))).status).toBe(200);
-    expect((await h.call("GET", "/sessions/v1/sessions/pit-3/events", "sh_at_member")).status).toBe(403);
+    expect((await h.call("GET", "/sessions/v1/sessions/pit-3/events", "sh_at_member")).status).toBe(404);
   });
 });
 
