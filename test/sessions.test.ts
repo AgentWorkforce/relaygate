@@ -357,7 +357,7 @@ describe("Sessions proxy: signed upstream assertions", () => {
 
     await h.call("GET", "/sessions/v1/relayfacts?limit=5", local);
     sent = h.calls.at(-1)!;
-    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, key]]), {
+    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, ASSERTION_PUBLIC_KEY]]), {
       method: "GET", path: "/v1/relayfacts?limit=5", credential: `Bearer ${SERVICE}`, audience: "session-read-api", access: "passthrough", sessionIds: [],
     }, at).access).toBe("passthrough");
   });
