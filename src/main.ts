@@ -8,6 +8,7 @@ import { RelaycastUpstream } from "./relaycast.js";
 import { routeSessionsHosts, sessionsAtRoot } from "./sessions.js";
 import { ControlAuth } from "./control.js";
 import { SecretBox, Store } from "./store.js";
+import { validateUpstreamAssertionKey } from "./upstream-assertion.js";
 
 const policyPath = process.env.RELAYGATE_POLICY;
 const policyUrl = process.env.RELAYCONTROL_POLICY_URL;
@@ -102,7 +103,30 @@ if (uploadUrl || readUrl) {
     process.exit(1);
   }
   const hosts = (process.env.SESSIONS_HOSTS ?? "").split(",").map((h) => h.trim()).filter(Boolean);
-  sessions = { uploadUrl, readUrl, token: process.env.SESSIONS_TOKEN || undefined, hosts, internalSecret: process.env.SESSIONS_INTERNAL_SECRET || undefined, corsOrigins: (process.env.SESSIONS_CORS_ORIGINS ?? "").split(",").map((o) => o.trim()).filter(Boolean) };
+  const assertionKey = process.env.RELAYGATE_UPSTREAM_ASSERTION_KEY;
+  const assertionKid = process.env.RELAYGATE_UPSTREAM_ASSERTION_KID;
+  const assertionTtl = Number(process.env.RELAYGATE_UPSTREAM_ASSERTION_TTL_SECONDS ?? 30);
+  let assertionError = !assertionKey !== !assertionKid || (assertionKid !== undefined && !/^[A-Za-z0-9._-]{1,64}$/.test(assertionKid)) || !Number.isInteger(assertionTtl) || assertionTtl < 5 || assertionTtl > 60;
+  if (assertionKey) {
+    try {
+      validateUpstreamAssertionKey(assertionKey);
+    } catch {
+      assertionError = true;
+    }
+  }
+  if (assertionError) {
+    console.error("upstream assertions need RELAYGATE_UPSTREAM_ASSERTION_KEY (base64 PKCS#8 DER Ed25519 private key), RELAYGATE_UPSTREAM_ASSERTION_KID, and TTL 5..60 seconds");
+    process.exit(1);
+  }
+  sessions = {
+    uploadUrl,
+    readUrl,
+    token: process.env.SESSIONS_TOKEN || undefined,
+    hosts,
+    internalSecret: process.env.SESSIONS_INTERNAL_SECRET || undefined,
+    corsOrigins: (process.env.SESSIONS_CORS_ORIGINS ?? "").split(",").map((o) => o.trim()).filter(Boolean),
+    assertion: assertionKey && assertionKid ? { key: assertionKey, kid: assertionKid, ttlSeconds: assertionTtl } : undefined,
+  };
 }
 // relay-control principals (desktop device tokens, dashboard read tokens) are on when the introspection URL is set.
 let control: ControlAuth | undefined;

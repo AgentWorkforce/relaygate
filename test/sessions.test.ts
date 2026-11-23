@@ -6,6 +6,8 @@ import { routeSessionsHosts } from "../src/sessions.js";
 import { ChainClassifier, RuleClassifier, type Classifier } from "../src/classifier.js";
 import { parsePolicy } from "../src/policy.js";
 import { sha256, Store } from "../src/store.js";
+import { UPSTREAM_ASSERTION_HEADER, verifyUpstreamAssertion, type UpstreamAssertionConfig } from "../src/upstream-assertion.js";
+import { ASSERTION_PRIVATE_KEY, ASSERTION_PUBLIC_KEY } from "./assertion-fixture.js";
 
 const KEYS = { local: "enroll-local-0000000000000000", pit: "enroll-pit-00000000000000000000", guest: "enroll-guest-0000000000000000000" };
 const SERVICE = "rth_st_service";
@@ -37,7 +39,7 @@ function policy(shared: string[] = [], mistaken: string[] = [], writable: string
   });
 }
 
-function harness(pol = policy(), opts: { token?: string; classifier?: Classifier } = { token: SERVICE }) {
+function harness(pol = policy(), opts: { token?: string; assertion?: UpstreamAssertionConfig; classifier?: Classifier; uploadUrl?: string; readUrl?: string } = { token: SERVICE }) {
   const calls: Array<{ method: string; host: string; path: string; auth: string; body: unknown; raw?: Buffer; headers: Headers }> = [];
   const upstream = new Hono();
   upstream.use("*", async (c, next) => {
@@ -57,6 +59,7 @@ function harness(pol = policy(), opts: { token?: string; classifier?: Classifier
   upstream.post("/v1/ingest", (c) => c.json({ received: 1 }));
   upstream.get("/v1/sessions", (c) => c.json({ sessions: [{ sessionId: "s-local" }, { sessionId: "s-pit" }, { sessionId: "s-elsewhere" }], nextCursor: "c2" }));
   upstream.get("/v1/sessions/:id/events", (c) => c.json({ events: [{ sessionId: c.req.param("id") }] }));
+  upstream.get("/history/v1/sessions/:id/events", (c) => c.json({ events: [{ sessionId: c.req.param("id") }] }));
   upstream.get("/v1/sessions/:id/metadata", (c) => c.text(`{"sessionId":"${c.req.param("id")}",  "title":"t"}`, 200, { "content-type": "application/json" }));
   upstream.get("/v1/sessions/:id/catalog", (c) => c.json({ catalog: { title: "t" }, parents: [], children: [], relaygate: { gid: 33, label: "forged" } }));
   upstream.get("/v1/sessions/:id/summary", (c) => c.json({ sessionId: c.req.param("id"), summary: "work" }));
@@ -67,7 +70,7 @@ function harness(pol = policy(), opts: { token?: string; classifier?: Classifier
 
   const store = new Store(":memory:");
   const classifier = opts.classifier ?? new ChainClassifier([new RuleClassifier(pol.classifier.rules)]);
-  const app = createApp({ store, policy: () => pol, classifier: () => classifier, sessions: { uploadUrl: "http://ingest.test", readUrl: "http://read.test", token: opts.token, fetch: fetchFn } });
+  const app = createApp({ store, policy: () => pol, classifier: () => classifier, sessions: { uploadUrl: opts.uploadUrl ?? "http://ingest.test", readUrl: opts.readUrl ?? "http://read.test", token: opts.token, assertion: opts.assertion, fetch: fetchFn } });
   const call = async (method: string, path: string, token: string, body?: unknown, headers: Record<string, string> = {}) => {
     const res = await app.request(path, {
       method,
@@ -89,7 +92,7 @@ function harness(pol = policy(), opts: { token?: string; classifier?: Classifier
   return { store, call, token, turns, calls, app };
 }
 
-async function world(pol = policy(), opts?: { token?: string; classifier?: Classifier }) {
+async function world(pol = policy(), opts?: { token?: string; assertion?: UpstreamAssertionConfig; classifier?: Classifier; uploadUrl?: string; readUrl?: string }) {
   const h = opts ? harness(pol, { token: SERVICE, ...opts }) : harness(pol);
   const local = await h.token(KEYS.local, "local-a");
   const pit = await h.token(KEYS.pit, "pit-a");
@@ -306,6 +309,62 @@ describe("Sessions proxy: runtime session access", () => {
     release();
     expect((await pending).status).toBe(403);
     expect(w.calls).toHaveLength(before);
+  });
+});
+
+describe("Sessions proxy: signed upstream assertions", () => {
+  const kid = "test-current";
+  const at = 1_800_000_000_000;
+
+  it("signs exact write bytes and session scope after the write is allowed", async () => {
+    const h = harness(policy(), { token: SERVICE, assertion: { key: ASSERTION_PRIVATE_KEY, kid, now: () => at } });
+    const local = await h.token(KEYS.local, "local-signer");
+    expect((await h.turns(local, "s-signed")).status).toBe(200);
+    const sent = h.calls.at(-1)!;
+    const claims = verifyUpstreamAssertion(
+      sent.headers.get(UPSTREAM_ASSERTION_HEADER)!,
+      new Map([[kid, ASSERTION_PUBLIC_KEY]]),
+      {
+        method: "POST",
+        path: "/v1/sessions/s-signed/turns",
+        body: sent.raw!,
+        credential: `Bearer ${SERVICE}`,
+        audience: "ingest-edge",
+        access: "write",
+        sessionIds: ["s-signed"],
+      },
+      at,
+    );
+    expect(claims.principal).toMatchObject({ agent_id: h.store.agentByName("local-signer")!.id, gid: 11 });
+  });
+
+  it("distinguishes a gated single-session read from a relaygate-filtered list/search", async () => {
+    const h = harness(policy(), { token: SERVICE, assertion: { key: ASSERTION_PRIVATE_KEY, kid, now: () => at } });
+    const local = await h.token(KEYS.local, "local-reader");
+    await h.turns(local, "s-signed");
+    await h.call("GET", "/sessions/v1/sessions/s-signed/events?limit=5", local);
+    let sent = h.calls.at(-1)!;
+    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, ASSERTION_PUBLIC_KEY]]), {
+      method: "GET", path: "/v1/sessions/s-signed/events?limit=5", credential: `Bearer ${SERVICE}`, audience: "session-read-api", access: "read", sessionIds: ["s-signed"],
+    }, at).session_ids).toEqual(["s-signed"]);
+
+    await h.call("GET", "/sessions/v1/events?q=work&limit=10", local);
+    sent = h.calls.at(-1)!;
+    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, ASSERTION_PUBLIC_KEY]]), {
+      method: "GET", path: "/v1/events?q=work&limit=10", credential: `Bearer ${SERVICE}`, audience: "session-read-api", access: "filter", sessionIds: [],
+    }, at).access).toBe("filter");
+  });
+
+  it("signs the resolved upstream path when the configured origin has a path prefix", async () => {
+    const h = harness(policy(), { token: SERVICE, assertion: { key: ASSERTION_PRIVATE_KEY, kid, now: () => at }, readUrl: "http://read.test/history/" });
+    const local = await h.token(KEYS.local, "local-prefixed");
+    await h.turns(local, "s-prefixed");
+    expect((await h.call("GET", "/sessions/v1/sessions/s-prefixed/events?limit=5", local)).status).toBe(200);
+    const sent = h.calls.at(-1)!;
+    expect(sent.path).toBe("/history/v1/sessions/s-prefixed/events?limit=5");
+    expect(verifyUpstreamAssertion(sent.headers.get(UPSTREAM_ASSERTION_HEADER)!, new Map([[kid, ASSERTION_PUBLIC_KEY]]), {
+      method: "GET", path: sent.path, credential: `Bearer ${SERVICE}`, audience: "session-read-api", access: "read", sessionIds: ["s-prefixed"],
+    }, at).path).toBe(sent.path);
   });
 });
 
