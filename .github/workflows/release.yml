@@ -33,6 +33,7 @@ jobs:
       image: ${{ steps.identity.outputs.image }}
       release_tag: ${{ steps.identity.outputs.release_tag }}
       source_sha: ${{ steps.identity.outputs.source_sha }}
+      staging_tag: ${{ steps.identity.outputs.staging_tag }}
     steps:
       - name: Validate dispatch identity
         id: identity
@@ -43,6 +44,8 @@ jobs:
           DISPATCH_SHA: ${{ github.sha }}
           OWNER: ${{ github.repository_owner }}
           RELEASE_TAG: ${{ inputs.release_tag }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
@@ -69,10 +72,12 @@ jobs:
           }
 
           image="ghcr.io/${OWNER,,}/relaygate"
+          staging_tag="staging-$SOURCE_SHA-$RUN_ID-$RUN_ATTEMPT"
           {
             echo "image=$image"
             echo "release_tag=$RELEASE_TAG"
             echo "source_sha=$SOURCE_SHA"
+            echo "staging_tag=$staging_tag"
           } >> "$GITHUB_OUTPUT"
 
   test:
@@ -129,7 +134,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Refuse an existing release tag
+      - name: Refuse an existing release tag before building
         shell: bash
         env:
           IMAGE: ${{ needs.validate.outputs.image }}
@@ -155,7 +160,7 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.release_tag }}
+          tags: ${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.staging_tag }}
           labels: |
             org.opencontainers.image.licenses=FSL-1.1-ALv2
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -177,13 +182,75 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE: ${{ needs.validate.outputs.image }}
-          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          STAGING_TAG: ${{ needs.validate.outputs.staging_tag }}
         run: |
           set -euo pipefail
           [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || {
             echo "::error::Build did not return a valid OCI digest."
             exit 1
           }
+
+          resolved="$(
+            docker buildx imagetools inspect "$IMAGE:$STAGING_TAG" \
+              --format '{{json .Manifest.Digest}}' | tr -d '"'
+          )"
+          [[ "$resolved" == "$DIGEST" ]] || {
+            echo "::error::$IMAGE:$STAGING_TAG resolved to $resolved, expected $DIGEST."
+            exit 1
+          }
+
+          docker buildx imagetools inspect "$IMAGE@$DIGEST" \
+            --format '{{json .SBOM}}' > "$RUNNER_TEMP/sbom.json"
+          if ! jq -e '
+              (keys | sort) == ["linux/amd64", "linux/arm64"] and
+              .["linux/amd64"].SPDX.spdxVersion == "SPDX-2.3" and
+              (.["linux/amd64"].SPDX.packages | type == "array" and length > 0)
+            ' "$RUNNER_TEMP/sbom.json" >/dev/null ||
+            ! jq -e '
+              .["linux/arm64"].SPDX.spdxVersion == "SPDX-2.3" and
+              (.["linux/arm64"].SPDX.packages | type == "array" and length > 0)
+            ' "$RUNNER_TEMP/sbom.json" >/dev/null; then
+            echo "::error::Published image does not have an SPDX SBOM for both target platforms."
+            exit 1
+          fi
+
+          docker buildx imagetools inspect "$IMAGE@$DIGEST" \
+            --format '{{json .Provenance}}' > "$RUNNER_TEMP/provenance.json"
+          jq -e '
+            (keys | sort) == ["linux/amd64", "linux/arm64"] and
+            (.["linux/amd64"].SLSA.buildDefinition.internalParameters | type == "object" and length > 0) and
+            (.["linux/amd64"].SLSA.buildDefinition.externalParameters | type == "object" and length > 0) and
+            (.["linux/arm64"].SLSA.buildDefinition.internalParameters | type == "object" and length > 0) and
+            (.["linux/arm64"].SLSA.buildDefinition.externalParameters | type == "object" and length > 0)
+          ' "$RUNNER_TEMP/provenance.json" >/dev/null || {
+            echo "::error::Published image does not have max-mode provenance for both target platforms."
+            exit 1
+          }
+
+          gh attestation verify "oci://$IMAGE@$DIGEST" --repo "$GITHUB_REPOSITORY"
+
+      - name: Promote the verified index to the release tag
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ needs.validate.outputs.image }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          output_file="$RUNNER_TEMP/imagetools-promote-$RELEASE_TAG.txt"
+          if docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" >"$output_file" 2>&1; then
+            echo "::error::$IMAGE:$RELEASE_TAG appeared during the build; refusing to overwrite it."
+            exit 1
+          fi
+          if ! grep -Eqi 'manifest unknown|name unknown|not found' "$output_file"; then
+            cat "$output_file" >&2
+            echo "::error::Could not prove $IMAGE:$RELEASE_TAG is absent; failing closed."
+            exit 1
+          fi
+
+          docker buildx imagetools create \
+            --tag "$IMAGE:$RELEASE_TAG" \
+            "$IMAGE@$DIGEST"
 
           resolved="$(
             docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" \
@@ -193,22 +260,6 @@ jobs:
             echo "::error::$IMAGE:$RELEASE_TAG resolved to $resolved, expected $DIGEST."
             exit 1
           }
-
-          docker buildx imagetools inspect "$IMAGE@$DIGEST" \
-            --format '{{json .SBOM}}' > "$RUNNER_TEMP/sbom.json"
-          jq -e 'type == "object" and length > 0' "$RUNNER_TEMP/sbom.json" >/dev/null || {
-            echo "::error::Published image has no embedded SBOM attestation."
-            exit 1
-          }
-
-          docker buildx imagetools inspect "$IMAGE@$DIGEST" \
-            --format '{{json .Provenance}}' > "$RUNNER_TEMP/provenance.json"
-          jq -e 'type == "object" and length > 0' "$RUNNER_TEMP/provenance.json" >/dev/null || {
-            echo "::error::Published image has no BuildKit provenance attestation."
-            exit 1
-          }
-
-          gh attestation verify "oci://$IMAGE@$DIGEST" --repo "$GITHUB_REPOSITORY"
 
       - name: Report immutable release
         shell: bash

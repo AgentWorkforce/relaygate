@@ -12,7 +12,10 @@ does not deploy relaygate or call a cloud-provider workflow.
 The workflow fails closed unless the dispatch names its own `main` commit and
 the release tag is absent. It tests that exact commit, publishes Linux amd64
 and arm64 images, embeds an SBOM and max-mode BuildKit provenance, creates a
-GitHub build-provenance attestation, and verifies all three forms of evidence.
+GitHub build-provenance attestation, and verifies all three forms of evidence
+for both platforms. The build first uses a unique staging tag. Only after every
+verification passes does the workflow promote that exact OCI index digest to
+the requested release tag, so a failed evidence check cannot publish a release.
 
 Verify the GitHub attestation independently with:
 
