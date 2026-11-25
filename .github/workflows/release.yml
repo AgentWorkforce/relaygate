@@ -33,7 +33,6 @@ jobs:
       image: ${{ steps.identity.outputs.image }}
       release_tag: ${{ steps.identity.outputs.release_tag }}
       source_sha: ${{ steps.identity.outputs.source_sha }}
-      staging_tag: ${{ steps.identity.outputs.staging_tag }}
     steps:
       - name: Validate dispatch identity
         id: identity
@@ -44,8 +43,6 @@ jobs:
           DISPATCH_SHA: ${{ github.sha }}
           OWNER: ${{ github.repository_owner }}
           RELEASE_TAG: ${{ inputs.release_tag }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          RUN_ID: ${{ github.run_id }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
@@ -72,12 +69,10 @@ jobs:
           }
 
           image="ghcr.io/${OWNER,,}/relaygate"
-          staging_tag="staging-$SOURCE_SHA-$RUN_ID-$RUN_ATTEMPT"
           {
             echo "image=$image"
             echo "release_tag=$RELEASE_TAG"
             echo "source_sha=$SOURCE_SHA"
-            echo "staging_tag=$staging_tag"
           } >> "$GITHUB_OUTPUT"
 
   test:
@@ -101,19 +96,18 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
-  publish:
-    name: Build, attest and publish multi-arch image
+  build:
+    name: Build and stage multi-arch image
     needs: [validate, test]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       image: ${{ needs.validate.outputs.image }}
+      staging_tag: ${{ steps.staging.outputs.tag }}
     steps:
       - name: Checkout exact source commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -152,6 +146,15 @@ jobs:
             exit 1
           fi
 
+      - name: Select a unique staging tag
+        id: staging
+        shell: bash
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+        run: echo "tag=staging-$SOURCE_SHA-$RUN_ID-$RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
       - name: Build and publish
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -160,7 +163,7 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.staging_tag }}
+          tags: ${{ needs.validate.outputs.image }}:${{ steps.staging.outputs.tag }}
           labels: |
             org.opencontainers.image.licenses=FSL-1.1-ALv2
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -169,20 +172,41 @@ jobs:
           provenance: mode=max
           sbom: true
 
+  verify-and-promote:
+    name: Attest, verify and promote image
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Attest GitHub build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ needs.validate.outputs.image }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ needs.build.outputs.digest }}
           push-to-registry: true
 
       - name: Verify published evidence
         shell: bash
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ needs.build.outputs.digest }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE: ${{ needs.validate.outputs.image }}
-          STAGING_TAG: ${{ needs.validate.outputs.staging_tag }}
+          STAGING_TAG: ${{ needs.build.outputs.staging_tag }}
         run: |
           set -euo pipefail
           [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || {
@@ -232,25 +256,31 @@ jobs:
       - name: Promote the verified index to the release tag
         shell: bash
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ needs.build.outputs.digest }}
           IMAGE: ${{ needs.validate.outputs.image }}
           RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
         run: |
           set -euo pipefail
           output_file="$RUNNER_TEMP/imagetools-promote-$RELEASE_TAG.txt"
           if docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" >"$output_file" 2>&1; then
-            echo "::error::$IMAGE:$RELEASE_TAG appeared during the build; refusing to overwrite it."
-            exit 1
+            existing="$(
+              docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" \
+                --format '{{json .Manifest.Digest}}' | tr -d '"'
+            )"
+            [[ "$existing" == "$DIGEST" ]] || {
+              echo "::error::$IMAGE:$RELEASE_TAG already exists at $existing; refusing to overwrite it."
+              exit 1
+            }
+          else
+            if ! grep -Eqi 'manifest unknown|name unknown|not found' "$output_file"; then
+              cat "$output_file" >&2
+              echo "::error::Could not prove $IMAGE:$RELEASE_TAG is absent; failing closed."
+              exit 1
+            fi
+            docker buildx imagetools create \
+              --tag "$IMAGE:$RELEASE_TAG" \
+              "$IMAGE@$DIGEST"
           fi
-          if ! grep -Eqi 'manifest unknown|name unknown|not found' "$output_file"; then
-            cat "$output_file" >&2
-            echo "::error::Could not prove $IMAGE:$RELEASE_TAG is absent; failing closed."
-            exit 1
-          fi
-
-          docker buildx imagetools create \
-            --tag "$IMAGE:$RELEASE_TAG" \
-            "$IMAGE@$DIGEST"
 
           resolved="$(
             docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" \
@@ -264,7 +294,7 @@ jobs:
       - name: Report immutable release
         shell: bash
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ needs.build.outputs.digest }}
           IMAGE: ${{ needs.validate.outputs.image }}
           RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
           SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
