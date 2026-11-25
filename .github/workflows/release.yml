@@ -1,0 +1,313 @@
+# Publish only the standalone relaygate image. This workflow never deploys it.
+name: Release relaygate image
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Immutable OCI tag to publish (for example, v0.1.1).
+        required: true
+        type: string
+      source_sha:
+        description: Exact 40-character commit SHA selected for this dispatch.
+        required: true
+        type: string
+      confirmation:
+        description: Type "publish-relaygate" to authorize registry publication.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-relaygate-image
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate immutable release request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      image: ${{ steps.identity.outputs.image }}
+      release_tag: ${{ steps.identity.outputs.release_tag }}
+      source_sha: ${{ steps.identity.outputs.source_sha }}
+    steps:
+      - name: Validate dispatch identity
+        id: identity
+        shell: bash
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          OWNER: ${{ github.repository_owner }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+
+          [[ "$DISPATCH_REF" == "refs/heads/main" ]] || {
+            echo "::error::Release dispatches must select the main branch."
+            exit 1
+          }
+          [[ "$CONFIRMATION" == "publish-relaygate" ]] || {
+            echo "::error::confirmation must be exactly publish-relaygate"
+            exit 1
+          }
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]] || {
+            echo "::error::source_sha must be exactly 40 lowercase hexadecimal characters."
+            exit 1
+          }
+          [[ "$SOURCE_SHA" == "$DISPATCH_SHA" ]] || {
+            echo "::error::source_sha must equal the main commit selected for this dispatch ($DISPATCH_SHA)."
+            exit 1
+          }
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::release_tag must be a lowercase v-prefixed semantic version."
+            exit 1
+          }
+
+          image="ghcr.io/${OWNER,,}/relaygate"
+          {
+            echo "image=$image"
+            echo "release_tag=$RELEASE_TAG"
+            echo "source_sha=$SOURCE_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test exact release source
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  build:
+    name: Build and stage multi-arch image
+    needs: [validate, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image: ${{ needs.validate.outputs.image }}
+      staging_tag: ${{ steps.staging.outputs.tag }}
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse an existing release tag before building
+        shell: bash
+        env:
+          IMAGE: ${{ needs.validate.outputs.image }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          output_file="$RUNNER_TEMP/imagetools-$RELEASE_TAG.txt"
+          if docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" >"$output_file" 2>&1; then
+            echo "::error::$IMAGE:$RELEASE_TAG already exists; release tags are never overwritten."
+            exit 1
+          fi
+          if ! grep -Eqi 'manifest unknown|name unknown|not found' "$output_file"; then
+            cat "$output_file" >&2
+            echo "::error::Could not prove $IMAGE:$RELEASE_TAG is absent; failing closed."
+            exit 1
+          fi
+
+      - name: Select a unique staging tag
+        id: staging
+        shell: bash
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+        run: echo "tag=staging-$SOURCE_SHA-$RUN_ID-$RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ needs.validate.outputs.image }}:${{ steps.staging.outputs.tag }}
+          labels: |
+            org.opencontainers.image.licenses=FSL-1.1-ALv2
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.source_sha }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.release_tag }}
+          provenance: mode=max,version=v1
+          sbom: true
+
+  verify-and-promote:
+    name: Attest, verify and promote image
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest GitHub build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ needs.validate.outputs.image }}
+          subject-digest: ${{ needs.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify published evidence
+        shell: bash
+        env:
+          DIGEST: ${{ needs.build.outputs.digest }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ needs.validate.outputs.image }}
+          STAGING_TAG: ${{ needs.build.outputs.staging_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || {
+            echo "::error::Build did not return a valid OCI digest."
+            exit 1
+          }
+
+          resolved="$(
+            docker buildx imagetools inspect "$IMAGE:$STAGING_TAG" \
+              --format '{{json .Manifest.Digest}}' | tr -d '"'
+          )"
+          [[ "$resolved" == "$DIGEST" ]] || {
+            echo "::error::$IMAGE:$STAGING_TAG resolved to $resolved, expected $DIGEST."
+            exit 1
+          }
+
+          docker buildx imagetools inspect "$IMAGE@$DIGEST" \
+            --format '{{json .SBOM}}' > "$RUNNER_TEMP/sbom.json"
+          if ! jq -e '
+              (keys | sort) == ["linux/amd64", "linux/arm64"] and
+              .["linux/amd64"].SPDX.spdxVersion == "SPDX-2.3" and
+              (.["linux/amd64"].SPDX.packages | type == "array" and length > 0)
+            ' "$RUNNER_TEMP/sbom.json" >/dev/null ||
+            ! jq -e '
+              .["linux/arm64"].SPDX.spdxVersion == "SPDX-2.3" and
+              (.["linux/arm64"].SPDX.packages | type == "array" and length > 0)
+            ' "$RUNNER_TEMP/sbom.json" >/dev/null; then
+            echo "::error::Published image does not have an SPDX SBOM for both target platforms."
+            exit 1
+          fi
+
+          docker buildx imagetools inspect "$IMAGE@$DIGEST" \
+            --format '{{json .Provenance}}' > "$RUNNER_TEMP/provenance.json"
+          jq -e '
+            (keys | sort) == ["linux/amd64", "linux/arm64"] and
+            (.["linux/amd64"].SLSA.buildDefinition.internalParameters | type == "object" and length > 0) and
+            (.["linux/amd64"].SLSA.buildDefinition.externalParameters | type == "object" and length > 0) and
+            (.["linux/arm64"].SLSA.buildDefinition.internalParameters | type == "object" and length > 0) and
+            (.["linux/arm64"].SLSA.buildDefinition.externalParameters | type == "object" and length > 0)
+          ' "$RUNNER_TEMP/provenance.json" >/dev/null || {
+            echo "::error::Published image does not have max-mode provenance for both target platforms."
+            exit 1
+          }
+
+          gh attestation verify "oci://$IMAGE@$DIGEST" --repo "$GITHUB_REPOSITORY"
+
+      - name: Promote the verified index to the release tag
+        shell: bash
+        env:
+          DIGEST: ${{ needs.build.outputs.digest }}
+          IMAGE: ${{ needs.validate.outputs.image }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          output_file="$RUNNER_TEMP/imagetools-promote-$RELEASE_TAG.txt"
+          if docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" >"$output_file" 2>&1; then
+            existing="$(
+              docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" \
+                --format '{{json .Manifest.Digest}}' | tr -d '"'
+            )"
+            [[ "$existing" == "$DIGEST" ]] || {
+              echo "::error::$IMAGE:$RELEASE_TAG already exists at $existing; refusing to overwrite it."
+              exit 1
+            }
+          else
+            if ! grep -Eqi 'manifest unknown|name unknown|not found' "$output_file"; then
+              cat "$output_file" >&2
+              echo "::error::Could not prove $IMAGE:$RELEASE_TAG is absent; failing closed."
+              exit 1
+            fi
+            docker buildx imagetools create \
+              --tag "$IMAGE:$RELEASE_TAG" \
+              "$IMAGE@$DIGEST"
+          fi
+
+          resolved="$(
+            docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" \
+              --format '{{json .Manifest.Digest}}' | tr -d '"'
+          )"
+          [[ "$resolved" == "$DIGEST" ]] || {
+            echo "::error::$IMAGE:$RELEASE_TAG resolved to $resolved, expected $DIGEST."
+            exit 1
+          }
+
+      - name: Report immutable release
+        shell: bash
+        env:
+          DIGEST: ${{ needs.build.outputs.digest }}
+          IMAGE: ${{ needs.validate.outputs.image }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+        run: |
+          {
+            echo "### relaygate image released"
+            echo
+            echo "Image: \`$IMAGE@$DIGEST\`"
+            echo "Release tag: \`$IMAGE:$RELEASE_TAG\`"
+            echo "Source commit: \`$SOURCE_SHA\`"
+            echo "Platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo
+            echo "Embedded SBOM and max-mode provenance: verified."
+            echo "GitHub build-provenance attestation: verified."
+            echo "No deployment was performed."
+          } >> "$GITHUB_STEP_SUMMARY"
