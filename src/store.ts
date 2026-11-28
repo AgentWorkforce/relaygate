@@ -705,7 +705,8 @@ export class Store {
    */
   pruneAudit(batch = 1000): number {
     const { retentionDays, maxRows } = this.auditOpts;
-    const bounds = this.db.prepare("SELECT MIN(seq) AS lo, MAX(seq) AS hi FROM audit").get() as { lo: number | null; hi: number | null };
+    // Two scalar subqueries, so each is a primary-key endpoint lookup (one MIN, MAX pair would scan the table).
+    const bounds = this.db.prepare("SELECT (SELECT MIN(seq) FROM audit) AS lo, (SELECT MAX(seq) FROM audit) AS hi").get() as { lo: number | null; hi: number | null };
     if (bounds.lo === null || bounds.hi === null) return 0;
     // Rows beyond the cap: everything below capBelow, whatever its age.
     const capBelow = maxRows > 0 ? Number(bounds.hi) - maxRows + 1 : 0;
