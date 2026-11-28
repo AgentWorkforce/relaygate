@@ -473,7 +473,7 @@ export function createApp(deps: Deps) {
     const limit = Math.min(Math.max(Number(c.req.query("limit") ?? 200), 1), 1000);
     if (!Number.isInteger(after) || after < 0 || !Number.isInteger(limit)) return deny(c, 400, "relaygate_bad_request");
     const rows = store.auditSince(after, limit, c.req.query("agent") || undefined);
-    return c.json({ policy_version: policyVersion(deps.policy()), rows });
+    return c.json({ policy_version: policyVersion(deps.policy()), audit_write_failures: store.auditWriteFailures, rows });
   });
 
   app.get("/admin/v1/policy/status", (c) => {
