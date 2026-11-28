@@ -38,6 +38,10 @@ prefixes is proxied.
 | `RELAYCONTROL_POLICY_URL` | one of these two | Pull the policy from relay-control instead (`GET`, signed, versioned; see docs/contract.md, "Who decides, who enforces"). Polled every `RELAYGATE_POLICY_RELOAD_MS`; the last applied version is cached in the database. With no version applied or cached, every route but `/healthz` answers 503. |
 | `RELAYCONTROL_POLICY_SECRET` | with `RELAYCONTROL_POLICY_URL` | Bearer secret for the pull, and the HMAC key of the answer's signature. At least 32 characters; not the introspection secret. |
 | `RELAYGATE_DB` | `/data/relaygate.db` | SQLite file for agents, tokens, streams and the audit log. |
+| `RELAYGATE_AUDIT_RETENTION_DAYS` | `30` | Audit rows older than this are pruned (at most 36500). `0` keeps them. |
+| `RELAYGATE_AUDIT_MAX_ROWS` | `1000000` | Keep about this many of the newest audit rows (at most 1000000000). `0` is no cap. |
+| `RELAYGATE_AUDIT_COALESCE_SECONDS` | `60` | An agent's repeated allowed reads of one resource within this window add to one audit row (`count`, `last_at`; at most 86400). `0` writes a row per read. |
+| `RELAYGATE_AUDIT_PRUNE_INTERVAL_SECONDS` | `600` | How often retention runs (in batches, from 5 seconds after start; at most 86400). `0` turns pruning off. |
 | `PORT` | `8080` | HTTP port. |
 | `RELAYGATE_ADMIN_TOKEN` | none | Enables the operator endpoints: `POST /admin/v1/explain` ("may X do op on Y, and why") and `GET /admin/v1/audit` (content-free audit rows with the policy version). |
 | `RELAYCAST_URL` | none | Turns on the Relaycast proxy (REST allowlist and `/v1/node/ws`). |

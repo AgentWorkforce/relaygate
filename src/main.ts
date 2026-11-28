@@ -25,7 +25,26 @@ const dbPath = process.env.RELAYGATE_DB ?? "/data/relaygate.db";
 const port = Number(process.env.PORT ?? 8080);
 const reloadMs = Number(process.env.RELAYGATE_POLICY_RELOAD_MS ?? 5000);
 
+/** An integer from 0 to `max` from the environment, or the default; anything else stops startup. */
+function envCount(name: string, fallback: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > max) {
+    console.error(`${name} must be an integer from 0 (off) to ${max}`);
+    process.exit(1);
+  }
+  return n;
+}
+const audit = {
+  coalesceSeconds: envCount("RELAYGATE_AUDIT_COALESCE_SECONDS", 60, 86_400),
+  retentionDays: envCount("RELAYGATE_AUDIT_RETENTION_DAYS", 30, 36_500),
+  maxRows: envCount("RELAYGATE_AUDIT_MAX_ROWS", 1_000_000, 1_000_000_000),
+};
+const auditPruneSeconds = envCount("RELAYGATE_AUDIT_PRUNE_INTERVAL_SECONDS", 600, 86_400);
+
 const store = new Store(dbPath);
+store.configureAudit(audit);
 // A file must parse at startup. relay-control may be down: relaygate starts from its cached copy, or refuses
 // everything (503) until the first good pull.
 const source: PolicySource = policyUrl ? new ControlPolicySource({ url: policyUrl, secret: policySecret }, store) : new FilePolicySource(policyPath!);
@@ -161,8 +180,33 @@ if (relaycast) {
   sockets.attach(server as unknown as import("node:http").Server);
 }
 
+// Audit retention: prune in small batches, yielding between them, so a large backlog never stalls requests.
+let pruning = false;
+async function pruneAudit(): Promise<void> {
+  if (pruning) return;
+  pruning = true;
+  let deleted = 0;
+  try {
+    for (let n = store.pruneAudit(); n > 0; n = store.pruneAudit()) {
+      deleted += n;
+      await new Promise((r) => setImmediate(r));
+    }
+  } catch (err) {
+    console.error(JSON.stringify({ msg: "audit prune failed", error: String((err as Error)?.message ?? err), deleted }));
+  } finally {
+    pruning = false;
+  }
+  if (deleted) console.log(JSON.stringify({ msg: "audit pruned", deleted, ...audit }));
+}
+const auditPruneTimer =
+  auditPruneSeconds > 0 && (audit.retentionDays > 0 || audit.maxRows > 0)
+    ? setInterval(() => void pruneAudit(), auditPruneSeconds * 1000).unref()
+    : undefined;
+if (auditPruneTimer) setTimeout(() => void pruneAudit(), 5000).unref();
+
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
+    if (auditPruneTimer) clearInterval(auditPruneTimer);
     sockets?.close();
     sessionsServer?.close();
     server.close();

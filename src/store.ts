@@ -222,6 +222,8 @@ export class Store {
     this.addColumn("agents", "guest", "INTEGER NOT NULL DEFAULT 0");
     this.addColumn("streams", "acl", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumn("audit", "policy_version", "TEXT");
+    this.addColumn("audit", "count", "INTEGER NOT NULL DEFAULT 1");
+    this.addColumn("audit", "last_at", "TEXT");
     this.addColumn("control_read_tokens", "email", "TEXT");
     this.addColumn("agents", "groups", "TEXT");
     this.addColumn("tokens", "expires_at", "INTEGER");
@@ -637,12 +639,101 @@ export class Store {
   /** Version of the policy in force, recorded on every audit row (set by the app). */
   policyVersion: () => string | null = () => null;
 
+  /** Audit retention and coalescing (docs/contract.md, "Audit"). Off until `configureAudit` is called. */
+  private auditOpts: Required<AuditOptions> = { coalesceSeconds: 0, retentionDays: 0, maxRows: 0 };
+  /** Open coalescing windows: key -> the row absorbing repeats, and when its window closes (epoch ms). */
+  private coalescing = new Map<string, { seq: number; until: number }>();
+  /** Audit writes that failed (a full disk, a locked database) since start. The decision itself was still enforced. */
+  auditWriteFailures = 0;
+  private lastAuditFailureLog = 0;
+
+  configureAudit(opts: AuditOptions): void {
+    this.auditOpts = { ...this.auditOpts, ...opts };
+    this.coalescing.clear();
+  }
+
+  /**
+   * Records a decision. Never throws: an audit write that fails (for example, a full volume) is counted and logged,
+   * and the request carries on with the decision already made. Allowed reads repeated by the same agent on the same
+   * resource for the same reason within `coalesceSeconds` add to one row (`count`, `last_at`) instead of a row per poll.
+   */
   audit(e: AuditEntry): void {
-    this.db
-      .prepare(
-        "INSERT INTO audit (at, agent_id, action, op, resource_kind, resource_id, decision, stage, reason, policy_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      )
-      .run(now(), e.agentId, e.action, e.op, e.resourceKind, e.resourceId, e.decision, e.stage, e.reason, e.policyVersion ?? this.policyVersion());
+    try {
+      const at = this.clock();
+      const policyVersion = e.policyVersion ?? this.policyVersion();
+      const window = this.auditOpts.coalesceSeconds * 1000;
+      const key =
+        window > 0 && e.op === "r" && e.decision === "allow"
+          ? JSON.stringify([e.agentId, e.action, e.resourceKind, e.resourceId, e.stage, e.reason, policyVersion])
+          : undefined;
+      if (key) {
+        const open = this.coalescing.get(key);
+        if (open && at < open.until) {
+          const r = this.db.prepare("UPDATE audit SET count = count + 1, last_at = ? WHERE seq = ?").run(iso(at), open.seq);
+          if (Number(r.changes) > 0) return;
+        }
+      }
+      const r = this.db
+        .prepare(
+          "INSERT INTO audit (at, agent_id, action, op, resource_kind, resource_id, decision, stage, reason, policy_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(iso(at), e.agentId, e.action, e.op, e.resourceKind, e.resourceId, e.decision, e.stage, e.reason, policyVersion);
+      if (key) {
+        if (this.coalescing.size >= COALESCE_KEYS_MAX) this.dropClosedWindows(at);
+        this.coalescing.set(key, { seq: Number(r.lastInsertRowid), until: at + window });
+      }
+    } catch (err) {
+      this.auditWriteFailures++;
+      const at = Date.now();
+      if (at - this.lastAuditFailureLog >= 60_000) {
+        this.lastAuditFailureLog = at;
+        console.error(JSON.stringify({ msg: "audit write failed", error: String((err as Error)?.message ?? err), failures: this.auditWriteFailures }));
+      }
+    }
+  }
+
+  private dropClosedWindows(at: number): void {
+    for (const [k, v] of this.coalescing) if (v.until <= at) this.coalescing.delete(k);
+    // Still full: every window is open. Start over rather than grow without bound; repeats then open new rows.
+    if (this.coalescing.size >= COALESCE_KEYS_MAX) this.coalescing.clear();
+  }
+
+  /**
+   * Deletes up to `batch` of the oldest audit rows that are past `retentionDays` or beyond the newest `maxRows`
+   * (by seq). Returns how many were deleted; call again while it returns `batch`. The immutable session access
+   * history (session_access_audit) is never pruned.
+   */
+  pruneAudit(batch = 1000): number {
+    const { retentionDays, maxRows } = this.auditOpts;
+    // Two scalar subqueries, so each is a primary-key endpoint lookup (one MIN, MAX pair would scan the table).
+    const bounds = this.db.prepare("SELECT (SELECT MIN(seq) FROM audit) AS lo, (SELECT MAX(seq) FROM audit) AS hi").get() as { lo: number | null; hi: number | null };
+    if (bounds.lo === null || bounds.hi === null) return 0;
+    // Rows beyond the cap: everything below capBelow, whatever its age.
+    const capBelow = maxRows > 0 ? Number(bounds.hi) - maxRows + 1 : 0;
+    // Expired rows: rows are appended in time order, so the first row inside the retention window is found by
+    // bisecting seq (primary-key lookups) rather than scanning the backlog. A row whose `at` went backwards (a host
+    // clock reset) could mislead the bisection, so the delete also checks each row's own `at` against the cutoff.
+    let ageBelow = 0;
+    let cutoff = "";
+    if (retentionDays > 0) {
+      cutoff = iso(this.clock() - retentionDays * 86_400_000);
+      const atOrAfter = this.db.prepare("SELECT seq, at FROM audit WHERE seq >= ? ORDER BY seq LIMIT 1");
+      let lo = Number(bounds.lo);
+      let hi = Number(bounds.hi) + 1;
+      while (lo < hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        const row = atOrAfter.get(mid) as { seq: number; at: string } | undefined;
+        if (row && row.at < cutoff) lo = Number(row.seq) + 1;
+        else hi = mid;
+      }
+      ageBelow = lo;
+    }
+    const below = Math.max(capBelow, ageBelow);
+    if (below <= Number(bounds.lo)) return 0;
+    const r = this.db
+      .prepare("DELETE FROM audit WHERE seq IN (SELECT seq FROM audit WHERE seq < ? AND (seq < ? OR at < ?) ORDER BY seq LIMIT ?)")
+      .run(below, capBelow, cutoff, batch);
+    return Number(r.changes);
   }
 
   /** Audit rows after `after` (a seq), oldest first, with the agent's name. Never contains message content. */
@@ -664,6 +755,18 @@ export class Store {
 }
 
 const now = () => new Date().toISOString();
+const iso = (ms: number) => new Date(ms).toISOString();
+/** Most coalescing windows held open at once; beyond it closed windows are dropped first. */
+const COALESCE_KEYS_MAX = 10_000;
+
+export interface AuditOptions {
+  /** Repeated allowed reads within this many seconds add to one row. 0 records every read. */
+  coalesceSeconds?: number;
+  /** Rows older than this many days are pruned. 0 keeps them. */
+  retentionDays?: number;
+  /** At most about this many of the newest rows are kept (by seq). 0 is no cap. */
+  maxRows?: number;
+}
 const NODE_TOKENS_KEPT = 5;
 
 function toAgent(row: Record<string, unknown>): Agent {
