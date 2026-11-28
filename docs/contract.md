@@ -1304,7 +1304,11 @@ Rows are pruned every `RELAYGATE_AUDIT_PRUNE_INTERVAL_SECONDS` (default 600,
 at most 86400) once they are older than `RELAYGATE_AUDIT_RETENTION_DAYS`
 (default 30, at most 36500) or beyond about the newest
 `RELAYGATE_AUDIT_MAX_ROWS` (default 1,000,000, by `seq`), oldest first, in
-batches. A row is pruned by age only if its own `at` is past the cutoff. Ship the log elsewhere if it must be kept
+batches. A row is pruned by age only if its own `at` is past the cutoff. Age
+pruning relies on rows being written in time order: after the host clock jumps
+forward, rows written in that time can hold back the age pruning of older rows
+until they age out themselves. Nothing within retention is lost, and the row
+cap still applies. Ship the log elsewhere if it must be kept
 longer. Pruned space is reused by new rows; the SQLite file does not shrink.
 The session access history (`.../access/history`) is never pruned.
 
