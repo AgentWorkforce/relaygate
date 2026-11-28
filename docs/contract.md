@@ -1290,24 +1290,29 @@ Rows come oldest first after `after`; `limit` is at most 1000.
 ### Volume and retention
 
 A polling client would otherwise write a row per poll. An agent's repeated
-**allowed reads** of the same resource, for the same action, reason and policy
-version, within `RELAYGATE_AUDIT_COALESCE_SECONDS` (default 60) add to one row:
-`count` is how many reads it stands for, `at` is the first and `last_at` the
-latest. Writes, denials and every other decision always get their own row. A
+**allowed reads** (`op: "r"`) of the same resource, with the same action,
+resource kind, stage, reason and policy version, within
+`RELAYGATE_AUDIT_COALESCE_SECONDS` (default 60, at most 86400) add to one row:
+`count` is how many it stands for, `at` is the first and `last_at` the latest.
+Decisions with `op: "w"` or no op, denials and `unavailable` always get their
+own row. Actions the gate decides as reads coalesce too, including
+`message.read` and `reaction.remove`. A
 reader paging by `seq` sees a coalesced row once, so it can see an earlier
 `count` than the row holds at the end of its window.
 
-Rows are pruned every `RELAYGATE_AUDIT_PRUNE_INTERVAL_SECONDS` (default 600)
-once they are older than `RELAYGATE_AUDIT_RETENTION_DAYS` (default 30) or
-beyond about the newest `RELAYGATE_AUDIT_MAX_ROWS` (default 1,000,000, by
-`seq`), oldest first, in batches. Ship the log elsewhere if it must be kept
+Rows are pruned every `RELAYGATE_AUDIT_PRUNE_INTERVAL_SECONDS` (default 600,
+at most 86400) once they are older than `RELAYGATE_AUDIT_RETENTION_DAYS`
+(default 30, at most 36500) or beyond about the newest
+`RELAYGATE_AUDIT_MAX_ROWS` (default 1,000,000, by `seq`), oldest first, in
+batches. A row is pruned by age only if its own `at` is past the cutoff. Ship the log elsewhere if it must be kept
 longer. Pruned space is reused by new rows; the SQLite file does not shrink.
 The session access history (`.../access/history`) is never pruned.
 
 An audit write that fails, for example on a full volume, does not fail the
 request: the decision is still enforced, the failure is logged (at most once a
 minute) and counted, and `GET /admin/v1/audit` reports the count since start
-as `audit_write_failures`.
+as `audit_write_failures`. A count that keeps rising means relaygate is no
+longer keeping its audit log (a full volume, or a damaged database); alert on it.
 
 ## Open questions
 

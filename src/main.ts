@@ -25,23 +25,23 @@ const dbPath = process.env.RELAYGATE_DB ?? "/data/relaygate.db";
 const port = Number(process.env.PORT ?? 8080);
 const reloadMs = Number(process.env.RELAYGATE_POLICY_RELOAD_MS ?? 5000);
 
-/** A non-negative integer from the environment, or the default; anything else stops startup. */
-function envCount(name: string, fallback: number): number {
+/** An integer from 0 to `max` from the environment, or the default; anything else stops startup. */
+function envCount(name: string, fallback: number, max: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
   const n = Number(raw);
-  if (!Number.isInteger(n) || n < 0) {
-    console.error(`${name} must be a non-negative integer (0 turns it off)`);
+  if (!Number.isInteger(n) || n < 0 || n > max) {
+    console.error(`${name} must be an integer from 0 (off) to ${max}`);
     process.exit(1);
   }
   return n;
 }
 const audit = {
-  coalesceSeconds: envCount("RELAYGATE_AUDIT_COALESCE_SECONDS", 60),
-  retentionDays: envCount("RELAYGATE_AUDIT_RETENTION_DAYS", 30),
-  maxRows: envCount("RELAYGATE_AUDIT_MAX_ROWS", 1_000_000),
+  coalesceSeconds: envCount("RELAYGATE_AUDIT_COALESCE_SECONDS", 60, 86_400),
+  retentionDays: envCount("RELAYGATE_AUDIT_RETENTION_DAYS", 30, 36_500),
+  maxRows: envCount("RELAYGATE_AUDIT_MAX_ROWS", 1_000_000, 1_000_000_000),
 };
-const auditPruneSeconds = envCount("RELAYGATE_AUDIT_PRUNE_INTERVAL_SECONDS", 600);
+const auditPruneSeconds = envCount("RELAYGATE_AUDIT_PRUNE_INTERVAL_SECONDS", 600, 86_400);
 
 const store = new Store(dbPath);
 store.configureAudit(audit);

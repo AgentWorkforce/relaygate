@@ -705,13 +705,17 @@ export class Store {
    */
   pruneAudit(batch = 1000): number {
     const { retentionDays, maxRows } = this.auditOpts;
-    let below = 0;
     const bounds = this.db.prepare("SELECT MIN(seq) AS lo, MAX(seq) AS hi FROM audit").get() as { lo: number | null; hi: number | null };
     if (bounds.lo === null || bounds.hi === null) return 0;
+    // Rows beyond the cap: everything below capBelow, whatever its age.
+    const capBelow = maxRows > 0 ? Number(bounds.hi) - maxRows + 1 : 0;
+    // Expired rows: rows are appended in time order, so the first row inside the retention window is found by
+    // bisecting seq (primary-key lookups) rather than scanning the backlog. A row whose `at` went backwards (a host
+    // clock reset) could mislead the bisection, so the delete also checks each row's own `at` against the cutoff.
+    let ageBelow = 0;
+    let cutoff = "";
     if (retentionDays > 0) {
-      // Rows are appended in time order, so the first row inside the retention window is found by bisecting seq
-      // (primary-key lookups) rather than scanning the expired backlog.
-      const cutoff = iso(this.clock() - retentionDays * 86_400_000);
+      cutoff = iso(this.clock() - retentionDays * 86_400_000);
       const atOrAfter = this.db.prepare("SELECT seq, at FROM audit WHERE seq >= ? ORDER BY seq LIMIT 1");
       let lo = Number(bounds.lo);
       let hi = Number(bounds.hi) + 1;
@@ -721,11 +725,13 @@ export class Store {
         if (row && row.at < cutoff) lo = Number(row.seq) + 1;
         else hi = mid;
       }
-      below = lo;
+      ageBelow = lo;
     }
-    if (maxRows > 0) below = Math.max(below, Number(bounds.hi) - maxRows + 1);
-    if (below <= 0) return 0;
-    const r = this.db.prepare("DELETE FROM audit WHERE seq IN (SELECT seq FROM audit WHERE seq < ? ORDER BY seq LIMIT ?)").run(below, batch);
+    const below = Math.max(capBelow, ageBelow);
+    if (below <= Number(bounds.lo)) return 0;
+    const r = this.db
+      .prepare("DELETE FROM audit WHERE seq IN (SELECT seq FROM audit WHERE seq < ? AND (seq < ? OR at < ?) ORDER BY seq LIMIT ?)")
+      .run(below, capBelow, cutoff, batch);
     return Number(r.changes);
   }
 

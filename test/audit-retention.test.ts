@@ -60,6 +60,20 @@ describe("audit coalescing", () => {
     expect(rows()[0]).toMatchObject({ count: 2 });
   });
 
+  it("opens a new row when the policy in force changes, for decisions stamped with the current version", () => {
+    const { store, rows } = clocked({ coalesceSeconds: 60 });
+    let version = "aaaaaaaaaaaa";
+    store.policyVersion = () => version;
+    store.audit(read({ policyVersion: undefined }));
+    store.audit(read({ policyVersion: undefined }));
+    version = "bbbbbbbbbbbb";
+    store.audit(read({ policyVersion: undefined }));
+    expect(rows().map((r) => [r.policy_version, r.count])).toEqual([
+      ["aaaaaaaaaaaa", 2],
+      ["bbbbbbbbbbbb", 1],
+    ]);
+  });
+
   it("writes every read when coalescing is off", () => {
     const { store, rows } = clocked({ coalesceSeconds: 0 });
     store.audit(read());
@@ -107,6 +121,26 @@ describe("audit retention", () => {
     for (let i = 0; i < 10; i++) store.audit(read({ op: "w", action: `a${i}` }));
     expect(store.pruneAudit()).toBe(7);
     expect(rows().map((r) => r.action)).toEqual(["a7", "a8", "a9"]);
+  });
+
+  it("keeps a recent row whose clock went backwards, even inside the expired range", () => {
+    const { store, advance, rows } = clocked({ retentionDays: 30 });
+    for (let i = 0; i < 5; i++) store.audit(read({ op: "w", action: `recent${i}` }));
+    advance(-60 * 86_400_000); // the host clock jumps back 60 days for one write
+    store.audit(read({ op: "w", action: "backwards" }));
+    advance(60 * 86_400_000);
+    for (let i = 0; i < 4; i++) store.audit(read({ op: "w", action: `later${i}` }));
+    while (store.pruneAudit() > 0);
+    expect(rows().map((r) => r.action)).toEqual(["recent0", "recent1", "recent2", "recent3", "recent4", "later0", "later1", "later2", "later3"]);
+  });
+
+  it("applies the age and the cap together", () => {
+    const { store, advance, rows } = clocked({ retentionDays: 30, maxRows: 4 });
+    for (let i = 0; i < 3; i++) store.audit(read({ op: "w", action: `old${i}` }));
+    advance(31 * 86_400_000);
+    for (let i = 0; i < 6; i++) store.audit(read({ op: "w", action: `new${i}` }));
+    while (store.pruneAudit() > 0);
+    expect(rows().map((r) => r.action)).toEqual(["new2", "new3", "new4", "new5"]);
   });
 
   it("prunes nothing with retention and the cap off", () => {
